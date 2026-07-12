@@ -38,6 +38,10 @@ class GuestyApiError(Exception):
     """Raised when a Guesty API request fails."""
 
 
+class GuestyPermissionError(GuestyApiError):
+    """Raised when credentials work but API access is denied."""
+
+
 class GuestyApiClient:
     """Async client for the Guesty Open API."""
 
@@ -86,17 +90,22 @@ class GuestyApiClient:
         return self._token_expires_at
 
     async def async_validate_credentials(self) -> str:
-        """Validate credentials and return the account id from listings."""
+        """Validate credentials and return the account id."""
         await self._async_ensure_token(force_refresh=True)
-        listings = await self._async_paginate(
-            "/listings",
-            params={
-                "fields": LISTING_FIELDS,
-                "limit": "1",
-            },
-        )
-        if not listings:
-            raise GuestyApiError("No listings found for this account")
+        try:
+            await self._async_paginate(
+                "/listings",
+                params={
+                    "fields": LISTING_FIELDS,
+                    "limit": "1",
+                },
+            )
+        except GuestyAuthError:
+            raise
+        except GuestyPermissionError as err:
+            _LOGGER.warning("Guesty token valid but listings access denied: %s", err)
+        except GuestyApiError as err:
+            _LOGGER.warning("Guesty listings check failed after auth: %s", err)
         return "guesty_account"
 
     async def async_get_listings(self) -> list[GuestyListing]:
@@ -189,8 +198,8 @@ class GuestyApiClient:
         payload = {
             "grant_type": "client_credentials",
             "scope": "open-api",
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
+            "client_id": self._client_id.strip(),
+            "client_secret": self._client_secret.strip(),
         }
         async with self._session.post(
             OAUTH_URL,
@@ -202,10 +211,26 @@ class GuestyApiClient:
         ) as response:
             body = await response.text()
             if response.status != 200:
-                _LOGGER.error("Guesty auth failed: %s", body)
-                raise GuestyAuthError(f"Authentication failed ({response.status})")
+                _LOGGER.error(
+                    "Guesty auth failed (%s): %s",
+                    response.status,
+                    body[:500],
+                )
+                if response.status in {400, 401, 403}:
+                    raise GuestyAuthError(
+                        f"Authentication failed ({response.status}): {body[:200]}"
+                    )
+                raise GuestyApiError(
+                    f"Token request failed ({response.status}): {body[:200]}"
+                )
 
-            data = json.loads(body)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as err:
+                raise GuestyApiError("Invalid token response from Guesty") from err
+
+            if "access_token" not in data:
+                raise GuestyAuthError(f"No access_token in response: {body[:200]}")
             self._access_token = data["access_token"]
             from homeassistant.util import dt as dt_util
 
@@ -227,16 +252,28 @@ class GuestyApiClient:
         while True:
             query["skip"] = str(skip)
             page = await self._async_request("GET", path, params=query)
-            if not page:
+            items = self._normalize_results(page)
+            if not items:
                 break
-            if not isinstance(page, list):
-                break
-            results.extend(page)
-            if len(page) < PAGE_LIMIT:
+            results.extend(items)
+            if len(items) < PAGE_LIMIT:
                 break
             skip += PAGE_LIMIT
 
         return results
+
+    @staticmethod
+    def _normalize_results(data: Any) -> list[dict[str, Any]]:
+        """Normalize Guesty paginated API responses."""
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            results = data.get("results")
+            if isinstance(results, list):
+                return results
+            if data.get("_id"):
+                return [data]
+        return []
 
     async def _async_request(
         self,
@@ -323,15 +360,30 @@ class GuestyApiClient:
                 ) as retry_response:
                     retry_body = await retry_response.text()
                     self._capture_rate_limit_headers(retry_response.headers)
-                    if retry_response.status in {401, 403}:
+                    if retry_response.status == 401:
                         raise GuestyAuthError(
-                            f"Authentication failed ({retry_response.status})"
+                            f"Authentication failed ({retry_response.status}): "
+                            f"{retry_body[:200]}"
+                        )
+                    if retry_response.status == 403:
+                        raise GuestyPermissionError(
+                            f"Permission denied ({retry_response.status}): "
+                            f"{retry_body[:200]}"
                         )
                     if retry_response.status >= 400:
                         raise GuestyApiError(
                             f"Request failed ({retry_response.status}): {retry_body}"
                         )
                     return self._parse_response_body(retry_body)
+
+            if response.status == 401:
+                raise GuestyAuthError(
+                    f"Authentication failed ({response.status}): {body[:200]}"
+                )
+            if response.status == 403:
+                raise GuestyPermissionError(
+                    f"Permission denied ({response.status}): {body[:200]}"
+                )
 
             if response.status in RETRYABLE_STATUS_CODES:
                 delay = self._retry_delay_from_response(response)
@@ -348,7 +400,7 @@ class GuestyApiClient:
     def _parse_response_body(body: str) -> Any:
         """Parse an API response body."""
         if not body:
-            return [] if body == "" else None
+            return []
         return json.loads(body)
 
     def _capture_rate_limit_headers(self, headers: Any) -> None:

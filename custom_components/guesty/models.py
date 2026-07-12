@@ -75,9 +75,12 @@ class GuestyListing:
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyListing:
         """Create a listing from API data."""
+        listing_id = data.get("_id") or data.get("id")
+        if not listing_id:
+            raise ValueError("Listing payload missing id")
         pms = data.get("pms") or {}
         return cls(
-            id=data["_id"],
+            id=listing_id,
             title=data.get("title") or data["_id"],
             nickname=data.get("nickname"),
             default_check_in_time=data.get("defaultCheckInTime")

@@ -12,7 +12,12 @@ from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
+from .api import (
+    GuestyApiClient,
+    GuestyApiError,
+    GuestyAuthError,
+    GuestyPermissionError,
+)
 from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -68,11 +73,12 @@ OPTIONS_SCHEMA = vol.Schema(
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, str]:
     """Validate the user input and return info for the config entry."""
-    client = GuestyApiClient.from_hass(
-        hass,
-        data[CONF_CLIENT_ID],
-        data[CONF_CLIENT_SECRET],
-    )
+    client_id = data[CONF_CLIENT_ID].strip()
+    client_secret = data[CONF_CLIENT_SECRET].strip()
+    if not client_id or not client_secret:
+        raise GuestyAuthError("Client ID and Client Secret are required")
+
+    client = GuestyApiClient.from_hass(hass, client_id, client_secret)
     account_id = await client.async_validate_credentials()
     return {"title": "Guesty", "unique_id": account_id}
 
@@ -91,9 +97,14 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 info = await validate_input(self.hass, user_input)
-            except GuestyAuthError:
+            except GuestyAuthError as err:
+                _LOGGER.error("Guesty authentication failed: %s", err)
                 errors["base"] = "invalid_auth"
-            except GuestyApiError:
+            except GuestyPermissionError as err:
+                _LOGGER.error("Guesty permission error: %s", err)
+                errors["base"] = "no_permissions"
+            except GuestyApiError as err:
+                _LOGGER.error("Guesty API error during setup: %s", err)
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected exception during Guesty setup")
@@ -104,8 +115,8 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title=info["title"],
                     data={
-                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID],
-                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET],
+                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
+                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
                         CONF_SCAN_INTERVAL: user_input.get(
                             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
                         ),

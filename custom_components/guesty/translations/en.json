@@ -12,7 +12,8 @@
       }
     },
     "error": {
-      "invalid_auth": "Invalid API credentials",
+      "invalid_auth": "Invalid API credentials (wrong Client ID or Secret)",
+      "no_permissions": "Token received but no listing access – check Open API permissions in Guesty",
       "cannot_connect": "Failed to connect to the Guesty API",
       "unknown": "Unknown error"
     },

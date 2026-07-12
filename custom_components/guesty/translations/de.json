@@ -12,7 +12,8 @@
       }
     },
     "error": {
-      "invalid_auth": "Ungültige API-Zugangsdaten",
+      "invalid_auth": "Ungültige API-Zugangsdaten (Client ID oder Secret falsch)",
+      "no_permissions": "Token erhalten, aber kein Zugriff auf Listings – Open API Berechtigungen in Guesty prüfen",
       "cannot_connect": "Verbindung zur Guesty API fehlgeschlagen",
       "unknown": "Unbekannter Fehler"
     },
