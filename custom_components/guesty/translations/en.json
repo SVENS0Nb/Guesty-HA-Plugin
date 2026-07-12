@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Guesty",
+        "description": "Enter your Guesty Open API credentials. You can find the Client ID and Client Secret in your Guesty account under Integrations > Open API.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Client Secret",
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid API credentials",
+      "cannot_connect": "Failed to connect to the Guesty API",
+      "unknown": "Unknown error"
+    },
+    "abort": {
+      "already_configured": "Guesty is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Guesty settings",
+        "description": "Adjust sync intervals, reservation window and stale threshold.",
+        "data": {
+          "scan_interval": "Reservation sync (seconds)",
+          "listing_sync_interval": "Listing sync (seconds)",
+          "reservation_days_past": "Past days for reservations",
+          "reservation_days_future": "Future days for reservations",
+          "stale_threshold_hours": "Stale threshold (hours)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "occupancy": {
+        "name": "Occupancy",
+        "state": {
+          "vacant": "Vacant",
+          "occupied": "Occupied"
+        }
+      },
+      "sync_status": {
+        "name": "Sync status",
+        "state": {
+          "ok": "OK",
+          "degraded": "Degraded",
+          "error": "Error"
+        }
+      }
+    },
+    "calendar": {
+      "reservations": {
+        "name": "Reservations"
+      }
+    }
+  }
+}

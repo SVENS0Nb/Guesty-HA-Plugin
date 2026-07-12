@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Guesty verbinden",
+        "description": "Gib deine Guesty Open API Zugangsdaten ein. Du findest Client ID und Client Secret in deinem Guesty-Konto unter Integrations > Open API.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Client Secret",
+          "scan_interval": "Aktualisierungsintervall (Sekunden)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Ungültige API-Zugangsdaten",
+      "cannot_connect": "Verbindung zur Guesty API fehlgeschlagen",
+      "unknown": "Unbekannter Fehler"
+    },
+    "abort": {
+      "already_configured": "Guesty ist bereits eingerichtet"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Guesty Einstellungen",
+        "description": "Passe Sync-Intervalle, Reservierungsfenster und Stale-Schwellenwert an.",
+        "data": {
+          "scan_interval": "Reservierungs-Sync (Sekunden)",
+          "listing_sync_interval": "Listing-Sync (Sekunden)",
+          "reservation_days_past": "Vergangene Tage für Reservierungen",
+          "reservation_days_future": "Zukünftige Tage für Reservierungen",
+          "stale_threshold_hours": "Stale-Schwellenwert (Stunden)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "occupancy": {
+        "name": "Belegung",
+        "state": {
+          "vacant": "Frei",
+          "occupied": "Vermietet"
+        }
+      },
+      "sync_status": {
+        "name": "Sync-Status",
+        "state": {
+          "ok": "OK",
+          "degraded": "Eingeschränkt",
+          "error": "Fehler"
+        }
+      }
+    },
+    "calendar": {
+      "reservations": {
+        "name": "Reservierungen"
+      }
+    }
+  }
+}
