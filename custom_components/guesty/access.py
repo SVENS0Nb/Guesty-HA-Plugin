@@ -111,7 +111,13 @@ class GuestyAccessManager:
         self._token_index: dict[str, str] = {}
         self._reconcile_lock = asyncio.Lock()
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._reconcile_pending = False
         self._unloaded = False
+        self._last_reconcile_at: str | None = None
+        self._last_reconcile_result = "never"
+        self._last_reconcile_error: str | None = None
+        self._last_eligible_count = 0
+        self._last_published_count = 0
         self._last_action: dict[tuple[str, int], float] = {}
         self._action_windows: defaultdict[tuple[str, int], deque[float]] = defaultdict(
             deque
@@ -148,6 +154,7 @@ class GuestyAccessManager:
         """Debounce coordinator updates into one access reconciliation."""
         if self._unloaded:
             return
+        self._reconcile_pending = True
         if self._reconcile_task and not self._reconcile_task.done():
             return
         self._reconcile_task = self.hass.async_create_task(
@@ -156,18 +163,35 @@ class GuestyAccessManager:
         )
 
     async def _async_delayed_reconcile(self) -> None:
-        """Let bursts of coordinator changes settle before writing to Guesty."""
-        await asyncio.sleep(0.5)
+        """Debounce bursts without losing updates arriving during a write."""
         try:
-            await self.async_reconcile()
-        except (GuestyApiError, GuestyAuthError) as err:
-            _LOGGER.warning("Guest access synchronization deferred: %s", err)
-        except Exception:
-            _LOGGER.exception("Unexpected guest access synchronization failure")
+            while self._reconcile_pending and not self._unloaded:
+                self._reconcile_pending = False
+                await asyncio.sleep(0.5)
+                try:
+                    await self.async_reconcile()
+                except (GuestyApiError, GuestyAuthError) as err:
+                    self._last_reconcile_result = "error"
+                    self._last_reconcile_error = str(err)[:500]
+                    _LOGGER.warning("Guest access synchronization deferred: %s", err)
+                except Exception as err:
+                    self._last_reconcile_result = "error"
+                    self._last_reconcile_error = type(err).__name__
+                    _LOGGER.exception("Unexpected guest access synchronization failure")
+        finally:
+            # Close the small race where a listener sets pending just as the
+            # loop finishes but still sees this task as running.
+            self._reconcile_task = None
+            if self._reconcile_pending and not self._unloaded:
+                self.async_schedule_reconcile()
 
     async def async_reconcile(self) -> None:
         """Synchronize active reservations and revoke obsolete access."""
         async with self._reconcile_lock:
+            self._last_reconcile_at = dt_util.utcnow().isoformat()
+            self._last_reconcile_result = "running"
+            self._last_reconcile_error = None
+            self._last_published_count = 0
             records = self._records
             mappings = self._mappings
             enabled = bool(self.entry.options.get(CONF_ACCESS_ENABLED, False))
@@ -193,6 +217,7 @@ class GuestyAccessManager:
                         continue
                     fingerprint = self._reservation_fingerprint(reservation)
                     eligible[reservation.id] = (reservation, fingerprint)
+            self._last_eligible_count = len(eligible)
 
             for reservation_id, record in list(records.items()):
                 if reservation_id not in eligible:
@@ -213,6 +238,7 @@ class GuestyAccessManager:
                             "listing_id": reservation.listing_id,
                             "url_hash": None,
                             "field_synced": False,
+                            "write_verified": False,
                         }
                     )
                 existing["revoked"] = False
@@ -224,6 +250,7 @@ class GuestyAccessManager:
 
             if not enabled:
                 await self._async_cleanup_revoked_records()
+                self._last_reconcile_result = "disabled"
                 return
 
             field_reference = str(
@@ -233,6 +260,7 @@ class GuestyAccessManager:
             ).strip()
             if not field_reference or not mappings:
                 await self._async_cleanup_revoked_records()
+                self._last_reconcile_result = "not_configured"
                 return
 
             field_id = await self._async_resolve_field(field_reference)
@@ -246,11 +274,15 @@ class GuestyAccessManager:
                 _LOGGER.warning(
                     "Guest access is enabled but Home Assistant has no external URL"
                 )
+                self._last_reconcile_result = "error"
+                self._last_reconcile_error = "external_url_missing"
                 return
             if urlsplit(base_url).scheme != "https":
                 _LOGGER.error(
                     "Guest access requires an external Home Assistant HTTPS URL"
                 )
+                self._last_reconcile_result = "error"
+                self._last_reconcile_error = "external_url_not_https"
                 return
 
             for reservation_id in sorted(eligible):
@@ -273,6 +305,7 @@ class GuestyAccessManager:
                             err,
                         )
                     record["field_synced"] = False
+                    record["write_verified"] = False
                     record["url_hash"] = None
 
                 record["field_id"] = field_id
@@ -281,7 +314,11 @@ class GuestyAccessManager:
                     f"{base_url}{ACCESS_URL_PATH}/{self.entry.entry_id}/{token}"
                 )
                 url_hash = hashlib.sha256(access_url.encode()).hexdigest()
-                if record.get("url_hash") == url_hash and record.get("field_synced"):
+                if (
+                    record.get("url_hash") == url_hash
+                    and record.get("field_synced")
+                    and record.get("write_verified")
+                ):
                     continue
                 try:
                     await self._client.async_update_reservation_custom_field(
@@ -295,12 +332,37 @@ class GuestyAccessManager:
                         reservation_id,
                         err,
                     )
+                    self._last_reconcile_result = "partial"
+                    self._last_reconcile_error = str(err)[:500]
                     continue
                 record["url_hash"] = url_hash
                 record["field_synced"] = True
+                record["write_verified"] = True
+                self._last_published_count += 1
 
             await self._async_cleanup_revoked_records()
             await self._storage.async_save(self._data)
+            if self._last_reconcile_result == "running":
+                self._last_reconcile_result = "ok"
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a privacy-preserving access synchronization summary."""
+        records = self._records
+        return {
+            "last_reconcile_at": self._last_reconcile_at,
+            "last_reconcile_result": self._last_reconcile_result,
+            "has_last_reconcile_error": self._last_reconcile_error is not None,
+            "last_reconcile_error": self._last_reconcile_error,
+            "eligible_reservations": self._last_eligible_count,
+            "published_during_last_reconcile": self._last_published_count,
+            "local_records": len(records),
+            "synced_records": sum(
+                1 for record in records.values() if record.get("field_synced")
+            ),
+            "verified_records": sum(
+                1 for record in records.values() if record.get("write_verified")
+            ),
+        }
 
     async def _async_resolve_field(self, reference: str) -> str:
         """Resolve and cache a configured Guesty custom field."""

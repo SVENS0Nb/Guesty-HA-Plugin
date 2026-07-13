@@ -61,6 +61,9 @@ async def async_get_config_entry_diagnostics(
             "rate_limit_remaining": client.last_rate_limit_remaining,
         },
     }
+    access_manager = getattr(entry.runtime_data, "access_manager", None)
+    if access_manager is not None:
+        diagnostics["guest_access"].update(access_manager.diagnostics())
 
     if data:
         diagnostics["sync"] = {

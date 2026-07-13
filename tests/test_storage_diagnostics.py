@@ -103,6 +103,14 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
             token_expires_at=1234,
             last_rate_limit_remaining=8,
         ),
+        access_manager=SimpleNamespace(
+            diagnostics=lambda: {
+                "eligible_reservations": 1,
+                "verified_records": 1,
+                "has_last_reconcile_error": False,
+                "last_reconcile_error": None,
+            }
+        ),
     )
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
@@ -117,3 +125,5 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "private-field-id" not in serialized
     assert "lock.private_door" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1
+    assert diagnostics["guest_access"]["eligible_reservations"] == 1
+    assert diagnostics["guest_access"]["verified_records"] == 1

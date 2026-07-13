@@ -251,14 +251,27 @@ class GuestyApiClient:
         field_id: str,
         value: str,
     ) -> None:
-        """Set a reservation custom field using the current v3 endpoint."""
+        """Set and verify a reservation custom field using the v3 endpoint."""
         self._validate_resource_id(reservation_id, "reservation")
         self._validate_resource_id(field_id, "custom field")
-        await self._async_request(
+        data = await self._async_request(
             "PUT",
             f"/reservations-v3/{reservation_id}/custom-fields",
             json_body={"customFields": [{"fieldId": field_id, "value": value}]},
         )
+        if not isinstance(data, dict) or data.get("reservationId") != reservation_id:
+            raise GuestyApiError("Guesty did not confirm the custom field update")
+        custom_fields = data.get("customFields")
+        if not isinstance(custom_fields, list):
+            raise GuestyApiError("Guesty returned an invalid custom field response")
+        for item in custom_fields:
+            if (
+                isinstance(item, dict)
+                and item.get("fieldId") == field_id
+                and item.get("value") == value
+            ):
+                return
+        raise GuestyApiError("Guesty did not persist the custom field value")
 
     async def async_delete_reservation_custom_field(
         self,
@@ -293,6 +306,57 @@ class GuestyApiClient:
         if not isinstance(data, dict) or not is_safe_resource_id(data.get("_id")):
             raise GuestyApiError("Unexpected webhook registration response")
         return data["_id"]
+
+    async def async_ensure_webhook(
+        self,
+        url: str,
+        existing_id: str | None = None,
+    ) -> str:
+        """Reuse or repair the integration webhook before creating a new one."""
+        await self._async_ensure_token()
+        data = await self._async_request("GET", "/webhooks")
+        webhooks = self._normalize_results(data)
+        desired_events = set(WEBHOOK_SUBSCRIPTION_EVENTS)
+
+        candidate: dict[str, Any] | None = None
+        if existing_id and is_safe_resource_id(existing_id):
+            candidate = next(
+                (
+                    item
+                    for item in webhooks
+                    if (item.get("_id") or item.get("id")) == existing_id
+                ),
+                None,
+            )
+        if candidate is None:
+            candidate = next(
+                (item for item in webhooks if item.get("url") == url),
+                None,
+            )
+
+        if candidate is None:
+            return await self.async_register_webhook(url)
+
+        webhook_id = candidate.get("_id") or candidate.get("id")
+        self._validate_resource_id(webhook_id, "webhook")
+        remote_events = candidate.get("events")
+        matches = (
+            candidate.get("url") == url
+            and isinstance(remote_events, list)
+            and desired_events.issubset(remote_events)
+            and candidate.get("active") is not False
+            and candidate.get("enabled") is not False
+        )
+        if not matches:
+            await self._async_request(
+                "PUT",
+                f"/webhooks/{webhook_id}",
+                json_body={
+                    "url": url,
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                },
+            )
+        return webhook_id
 
     async def async_webhook_matches(self, webhook_id: str, url: str) -> bool:
         """Return whether the stored remote webhook is still usable."""
@@ -585,14 +649,31 @@ class GuestyApiClient:
                     self._capture_rate_limit_headers(retry_response.headers)
                     if retry_response.status == 401:
                         raise GuestyAuthError(
-                            f"Authentication failed ({retry_response.status})"
+                            self._error_message(
+                                "Authentication failed",
+                                retry_response.status,
+                                retry_body,
+                                retry_response.headers,
+                            )
                         )
                     if retry_response.status == 403:
                         raise GuestyPermissionError(
-                            f"Permission denied ({retry_response.status})"
+                            self._error_message(
+                                "Permission denied",
+                                retry_response.status,
+                                retry_body,
+                                retry_response.headers,
+                            )
                         )
                     if retry_response.status == 404:
-                        raise GuestyNotFoundError("Resource not found (404)")
+                        raise GuestyNotFoundError(
+                            self._error_message(
+                                "Resource not found",
+                                retry_response.status,
+                                retry_body,
+                                retry_response.headers,
+                            )
+                        )
                     if retry_response.status in RETRYABLE_STATUS_CODES:
                         raise GuestyRetryableError(
                             f"Retryable error ({retry_response.status})",
@@ -600,16 +681,42 @@ class GuestyApiClient:
                         )
                     if retry_response.status >= 400:
                         raise GuestyApiError(
-                            f"Request failed ({retry_response.status})"
+                            self._error_message(
+                                "Request failed",
+                                retry_response.status,
+                                retry_body,
+                                retry_response.headers,
+                            )
                         )
                     return self._parse_response_body(retry_body)
 
             if response.status == 401:
-                raise GuestyAuthError(f"Authentication failed ({response.status})")
+                raise GuestyAuthError(
+                    self._error_message(
+                        "Authentication failed",
+                        response.status,
+                        body,
+                        response.headers,
+                    )
+                )
             if response.status == 403:
-                raise GuestyPermissionError(f"Permission denied ({response.status})")
+                raise GuestyPermissionError(
+                    self._error_message(
+                        "Permission denied",
+                        response.status,
+                        body,
+                        response.headers,
+                    )
+                )
             if response.status == 404:
-                raise GuestyNotFoundError("Resource not found (404)")
+                raise GuestyNotFoundError(
+                    self._error_message(
+                        "Resource not found",
+                        response.status,
+                        body,
+                        response.headers,
+                    )
+                )
 
             if response.status in RETRYABLE_STATUS_CODES:
                 delay = self._retry_delay_from_response(response)
@@ -619,7 +726,14 @@ class GuestyApiClient:
                 )
 
             if response.status >= 400:
-                raise GuestyApiError(f"Request failed ({response.status})")
+                raise GuestyApiError(
+                    self._error_message(
+                        "Request failed",
+                        response.status,
+                        body,
+                        response.headers,
+                    )
+                )
 
             return self._parse_response_body(body)
 
@@ -632,6 +746,60 @@ class GuestyApiClient:
             return json.loads(body)
         except json.JSONDecodeError as err:
             raise GuestyApiError("Invalid JSON response from Guesty") from err
+
+    @staticmethod
+    def _error_message(
+        prefix: str,
+        status: int,
+        body: str,
+        headers: Any,
+    ) -> str:
+        """Return bounded, non-secret Guesty error context for diagnostics."""
+        details: list[str] = []
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+
+        if isinstance(data, dict):
+            for key in ("message", "error", "error_description", "details"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    details.append(
+                        GuestyApiClient._redact_error_detail(value.strip())[:300]
+                    )
+                elif isinstance(value, list):
+                    safe_items = [
+                        GuestyApiClient._redact_error_detail(str(item))[:120]
+                        for item in value[:3]
+                        if isinstance(item, (str, int, float, bool))
+                    ]
+                    if safe_items:
+                        details.append(", ".join(safe_items))
+
+        request_id = None
+        for name in ("x-request-id", "X-Request-Id", "x-guesty-request-id"):
+            value = headers.get(name) if headers is not None else None
+            if isinstance(value, str) and value:
+                request_id = value[:100]
+                break
+
+        message = f"{prefix} ({status})"
+        if details:
+            message += f": {'; '.join(dict.fromkeys(details))}"
+        if request_id:
+            message += f" [request_id={request_id}]"
+        return message
+
+    @staticmethod
+    def _redact_error_detail(value: str) -> str:
+        """Redact bearer access links if an API echoes the submitted value."""
+        return re.sub(
+            r"(?:https?://[^\s\"']+)?/api/guesty/access/[^\s\"']+",
+            "[REDACTED_ACCESS_URL]",
+            value,
+            flags=re.IGNORECASE,
+        )
 
     @staticmethod
     def _retry_delay(error: GuestyApiError, attempt: int) -> float:

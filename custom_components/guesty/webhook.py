@@ -95,19 +95,11 @@ async def async_register_guesty_webhook(
 
     webhook_url = f"{base_url.rstrip('/')}/api/webhook/{webhook_id}"
     existing_id = entry.data.get(CONF_GUESTY_WEBHOOK_ID)
-    if existing_id:
-        try:
-            if await client.async_webhook_matches(existing_id, webhook_url):
-                return existing_id
-        except (GuestyApiError, GuestyAuthError) as err:
-            # Do not create duplicates during a temporary Guesty outage. The
-            # adaptive polling fallback keeps data current until verification
-            # succeeds on the next integration reload.
-            _LOGGER.warning("Could not verify the Guesty webhook: %s", err)
-            return None
-
     try:
-        guesty_webhook_id = await client.async_register_webhook(webhook_url)
+        guesty_webhook_id = await client.async_ensure_webhook(
+            webhook_url,
+            existing_id,
+        )
     except (GuestyApiError, GuestyAuthError) as err:
         _LOGGER.warning("Failed to register Guesty webhook: %s", err)
         return None

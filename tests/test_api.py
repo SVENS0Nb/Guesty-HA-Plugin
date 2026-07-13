@@ -283,7 +283,18 @@ async def test_custom_field_name_is_resolved_once_from_account(monkeypatch) -> N
 async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
     """Door links never use Guesty's retired reservation field endpoint."""
     client = _client()
-    request = AsyncMock(return_value={})
+    request = AsyncMock(
+        return_value={
+            "reservationId": "reservation-1",
+            "customFields": [
+                {
+                    "_id": "value-1",
+                    "fieldId": "65fab102a5284d73c6206db0",
+                    "value": "https://ha.test/access",
+                }
+            ],
+        }
+    )
     monkeypatch.setattr(client, "_async_request", request)
 
     await client.async_update_reservation_custom_field(
@@ -304,3 +315,96 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
             ]
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_reservation_custom_field_requires_persistence_confirmation(
+    monkeypatch,
+) -> None:
+    """A misleading 2xx response cannot permanently suppress retries."""
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_async_request",
+        AsyncMock(
+            return_value={
+                "reservationId": "reservation-1",
+                "customFields": [],
+            }
+        ),
+    )
+
+    with pytest.raises(GuestyApiError, match="did not persist"):
+        await client.async_update_reservation_custom_field(
+            "reservation-1",
+            "65fab102a5284d73c6206db0",
+            "https://ha.test/access",
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_webhook_is_found_by_url_and_reused(monkeypatch) -> None:
+    """Lost local metadata does not create a duplicate remote webhook."""
+    client = _client()
+    request = AsyncMock(
+        return_value=[
+            {
+                "_id": "webhook-1",
+                "url": "https://ha.example.test/hook",
+                "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                "active": True,
+            }
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    assert (
+        await client.async_ensure_webhook("https://ha.example.test/hook") == "webhook-1"
+    )
+    request.assert_awaited_once_with("GET", "/webhooks")
+
+
+@pytest.mark.asyncio
+async def test_existing_webhook_is_repaired_in_place(monkeypatch) -> None:
+    """An incomplete subscription is updated instead of duplicated."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": "webhook-1",
+                    "url": "https://ha.example.test/hook",
+                    "events": ["reservation.new"],
+                }
+            ],
+            {"_id": "webhook-1"},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    assert (
+        await client.async_ensure_webhook("https://ha.example.test/hook") == "webhook-1"
+    )
+    request.assert_any_await(
+        "PUT",
+        "/webhooks/webhook-1",
+        json_body={
+            "url": "https://ha.example.test/hook",
+            "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+        },
+    )
+
+
+def test_api_error_context_redacts_access_bearer_url() -> None:
+    """An upstream validation message cannot copy a guest token into logs."""
+    message = GuestyApiClient._error_message(
+        "Request failed",
+        422,
+        '{"message":"invalid https://ha.test/api/guesty/access/entry/secret"}',
+        {"x-request-id": "request-1"},
+    )
+
+    assert message == (
+        "Request failed (422): invalid [REDACTED_ACCESS_URL] [request_id=request-1]"
+    )
+    assert "secret" not in message

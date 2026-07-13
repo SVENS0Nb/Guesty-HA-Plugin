@@ -127,8 +127,7 @@ async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None
     )
     entry = _entry(hass, {CONF_GUESTY_WEBHOOK_ID: "remote-id"})
     client = SimpleNamespace(
-        async_webhook_matches=AsyncMock(return_value=True),
-        async_register_webhook=AsyncMock(),
+        async_ensure_webhook=AsyncMock(return_value="remote-id"),
     )
 
     result = await guesty_webhook.async_register_guesty_webhook(
@@ -136,11 +135,10 @@ async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None
     )
 
     assert result == "remote-id"
-    client.async_webhook_matches.assert_awaited_once_with(
-        "remote-id",
+    client.async_ensure_webhook.assert_awaited_once_with(
         "https://ha.example.test/api/webhook/local-id",
+        "remote-id",
     )
-    client.async_register_webhook.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -151,11 +149,11 @@ async def test_internal_url_is_not_registered_with_guesty(hass, monkeypatch) -> 
         lambda *args, **kwargs: (_ for _ in ()).throw(NoURLAvailableError()),
     )
     entry = _entry(hass)
-    client = SimpleNamespace(async_register_webhook=AsyncMock())
+    client = SimpleNamespace(async_ensure_webhook=AsyncMock())
 
     result = await guesty_webhook.async_register_guesty_webhook(
         hass, entry, client, "local-id"
     )
 
     assert result is None
-    client.async_register_webhook.assert_not_awaited()
+    client.async_ensure_webhook.assert_not_awaited()

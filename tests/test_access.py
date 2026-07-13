@@ -104,6 +104,44 @@ async def test_reconcile_writes_each_unchanged_link_only_once(
 
 
 @pytest.mark.asyncio
+async def test_unverified_v130_record_is_republished(hass, monkeypatch) -> None:
+    """Records created before response verification receive one safe retry."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record.pop("write_verified")
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    client.async_update_reservation_custom_field.assert_awaited_once()
+    assert record["write_verified"] is True
+    assert manager.diagnostics()["verified_records"] == 1
+
+
+@pytest.mark.asyncio
+async def test_update_during_reconcile_is_not_lost(hass, monkeypatch) -> None:
+    """A coordinator update arriving during a write triggers a second pass."""
+    manager, _client = await _manager(hass, monkeypatch)
+    manager._reconcile_task = None
+    reconcile = AsyncMock()
+
+    async def _reconcile() -> None:
+        await reconcile()
+        if reconcile.await_count == 1:
+            manager.async_schedule_reconcile()
+
+    monkeypatch.setattr(manager, "async_reconcile", _reconcile)
+    monkeypatch.setattr(access.asyncio, "sleep", AsyncMock())
+
+    manager.async_schedule_reconcile()
+    task = manager._reconcile_task
+    assert task is not None
+    await task
+
+    assert reconcile.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_get_never_unlocks_and_valid_post_uses_server_mapping(
     hass, monkeypatch
 ) -> None:
