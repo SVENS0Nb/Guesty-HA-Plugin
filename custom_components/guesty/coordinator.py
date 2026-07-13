@@ -10,10 +10,17 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
+from .api import (
+    GuestyApiClient,
+    GuestyApiError,
+    GuestyAuthError,
+    GuestyPermissionError,
+    is_safe_resource_id,
+)
 from .const import (
     CONF_LISTING_SYNC_INTERVAL,
     CONF_RESERVATION_DAYS_FUTURE,
@@ -30,6 +37,9 @@ from .const import (
     SYNC_STATUS_DEGRADED,
     SYNC_STATUS_ERROR,
     SYNC_STATUS_OK,
+    WEBHOOK_DEBOUNCE_SECONDS,
+    WEBHOOK_EVENTS,
+    WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL,
 )
 from .models import (
     GuestyListing,
@@ -41,6 +51,7 @@ from .models import (
 from .storage import GuestyStorage
 
 _LOGGER = logging.getLogger(__name__)
+INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=5)
 
 
 def _is_full_reservation_sync_due(last_full_sync: str | None) -> bool:
@@ -94,10 +105,14 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._previous_occupancy: dict[str, str] = {}
         self._refresh_lock = asyncio.Lock()
         self._webhook_active = False
+        self._pending_reservation_ids: set[str] = set()
+        self._pending_listing_payloads: dict[str, dict[str, Any]] = {}
+        self._webhook_batch_task: asyncio.Task[None] | None = None
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
+            config_entry=entry,
             update_interval=timedelta(
                 seconds=entry.options.get(
                     CONF_SCAN_INTERVAL,
@@ -160,6 +175,11 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         listing_interval = self.config_entry.options.get(
             CONF_LISTING_SYNC_INTERVAL, DEFAULT_LISTING_SYNC_INTERVAL
         )
+        if not self._webhook_active:
+            listing_interval = min(
+                listing_interval,
+                WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL,
+            )
         stale_threshold_hours = self.config_entry.options.get(
             CONF_STALE_THRESHOLD_HOURS, DEFAULT_STALE_THRESHOLD_HOURS
         )
@@ -194,7 +214,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         if not full_reservation_sync and last_incremental_sync:
             parsed = dt_util.parse_datetime(last_incremental_sync)
             if parsed:
-                updated_since = parsed
+                updated_since = parsed - INCREMENTAL_SYNC_OVERLAP
 
         try:
             if should_sync_listings:
@@ -259,10 +279,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             await self._storage.async_save(cache)
             api_success = True
 
-        except GuestyAuthError as err:
+        except (GuestyAuthError, GuestyPermissionError) as err:
             last_error = str(err)
             sync_status = SYNC_STATUS_ERROR
-            raise UpdateFailed(f"Authentication failed: {err}") from err
+            raise ConfigEntryAuthFailed(str(err)) from err
         except GuestyApiError as err:
             last_error = str(err)
             sync_status = SYNC_STATUS_DEGRADED
@@ -340,20 +360,204 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         )
 
     async def async_handle_webhook(self, payload: dict[str, Any]) -> None:
-        """Handle Guesty webhook notifications."""
+        """Queue a Guesty webhook for a traffic-efficient near-real-time update."""
         event = (payload.get("event") or payload.get("type") or "").lower()
-        reservation = payload.get("reservation") or {}
-        reservation_id = reservation.get("_id")
-
-        if event.startswith("reservation") and reservation_id:
-            await self._async_apply_reservation_webhook(reservation_id)
+        if event not in WEBHOOK_EVENTS:
+            _LOGGER.debug("Ignoring unsupported Guesty webhook event %r", event)
             return
 
-        if event.startswith("listing"):
-            await self.async_force_full_sync()
-            return
+        if event.startswith("reservation."):
+            reservation_id = self._reservation_id_from_webhook(payload)
+            if not is_safe_resource_id(reservation_id):
+                _LOGGER.warning(
+                    "Ignoring Guesty reservation webhook without a valid id"
+                )
+                return
+            self._pending_reservation_ids.add(reservation_id)
+        else:
+            listing_id = self._listing_id_from_webhook(payload)
+            key = listing_id if is_safe_resource_id(listing_id) else "unknown"
+            # Keep only the newest event for a listing during the debounce window.
+            self._pending_listing_payloads[key] = payload
 
-        await self.async_request_refresh()
+        task = self._webhook_batch_task
+        if task is None or task.done():
+            task = self.hass.async_create_task(
+                self._async_process_webhook_batches(),
+                "guesty_process_webhook_batch",
+            )
+            self._webhook_batch_task = task
+        await asyncio.shield(task)
+
+    async def _async_process_webhook_batches(self) -> None:
+        """Collapse webhook bursts without losing changes that arrive mid-sync."""
+        while self._pending_reservation_ids or self._pending_listing_payloads:
+            await asyncio.sleep(WEBHOOK_DEBOUNCE_SECONDS)
+            reservation_ids = set(self._pending_reservation_ids)
+            listing_payloads = list(self._pending_listing_payloads.values())
+            self._pending_reservation_ids.clear()
+            self._pending_listing_payloads.clear()
+
+            if listing_payloads:
+                try:
+                    await self._async_apply_listing_webhooks(listing_payloads)
+                except (GuestyApiError, GuestyAuthError) as err:
+                    _LOGGER.warning(
+                        "Listing webhook refresh failed; using polling fallback: %s",
+                        err,
+                    )
+                    await self.async_refresh()
+
+            if len(reservation_ids) == 1:
+                await self._async_apply_reservation_webhook(reservation_ids.pop())
+            elif reservation_ids:
+                # One filtered incremental query is cheaper than one request per
+                # reservation during bulk edits or Guesty retry bursts.
+                await self.async_refresh()
+
+    @staticmethod
+    def _reservation_id_from_webhook(payload: dict[str, Any]) -> str | None:
+        """Extract a reservation id from supported Guesty payload shapes."""
+        reservation = payload.get("reservation")
+        if isinstance(reservation, dict):
+            value = reservation.get("_id") or reservation.get("id")
+            if isinstance(value, str):
+                return value
+
+        direct_id = payload.get("reservationId") or payload.get("reservation_id")
+        if isinstance(direct_id, str):
+            return direct_id
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            nested = data.get("reservation")
+            if isinstance(nested, dict):
+                value = nested.get("_id") or nested.get("id")
+                if isinstance(value, str):
+                    return value
+            value = data.get("reservationId") or data.get("_id") or data.get("id")
+            if isinstance(value, str):
+                return value
+        return None
+
+    @staticmethod
+    def _listing_data_from_webhook(payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract listing data from supported Guesty payload shapes."""
+        listing = payload.get("listing")
+        if isinstance(listing, dict):
+            return listing
+        data = payload.get("data")
+        if isinstance(data, dict):
+            nested = data.get("listing")
+            if isinstance(nested, dict):
+                return nested
+            if data.get("_id") or data.get("id"):
+                return data
+        return None
+
+    @classmethod
+    def _listing_id_from_webhook(cls, payload: dict[str, Any]) -> str | None:
+        """Extract a listing id from a Guesty webhook."""
+        listing = cls._listing_data_from_webhook(payload)
+        if listing:
+            value = listing.get("_id") or listing.get("id")
+            if isinstance(value, str):
+                return value
+        value = payload.get("listingId") or payload.get("listing_id")
+        return value if isinstance(value, str) else None
+
+    async def _async_apply_listing_webhooks(
+        self,
+        payloads: list[dict[str, Any]],
+    ) -> None:
+        """Apply listing payloads directly and fetch only data that is missing."""
+        async with self._refresh_lock:
+            cache = await self._storage.async_load()
+            listings = GuestyStorage.listings_from_cache(cache)
+            reservations = GuestyStorage.reservations_from_cache(cache)
+            previous_listing_ids = set(listings)
+            use_api_fallback = False
+
+            for payload in payloads:
+                event = (payload.get("event") or payload.get("type") or "").lower()
+                listing_data = self._listing_data_from_webhook(payload)
+                listing_id = self._listing_id_from_webhook(payload)
+                if not is_safe_resource_id(listing_id):
+                    use_api_fallback = True
+                    continue
+
+                if event == "listing.removed":
+                    listings.pop(listing_id, None)
+                    continue
+
+                if listing_data is None:
+                    use_api_fallback = True
+                    continue
+                try:
+                    listings[listing_id] = GuestyListing.from_api(
+                        listing_data,
+                        fallback=listings.get(listing_id),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    use_api_fallback = True
+
+            if use_api_fallback:
+                listing_results = await self._client.async_get_listings()
+                listings = {listing.id: listing for listing in listing_results}
+
+            added_listing_ids = set(listings) - previous_listing_ids
+            if added_listing_ids:
+                days_past = self.config_entry.options.get(
+                    CONF_RESERVATION_DAYS_PAST, DEFAULT_RESERVATION_DAYS_PAST
+                )
+                days_future = self.config_entry.options.get(
+                    CONF_RESERVATION_DAYS_FUTURE, DEFAULT_RESERVATION_DAYS_FUTURE
+                )
+                try:
+                    listing_reservations = await self._client.async_get_reservations(
+                        days_past,
+                        days_future,
+                        listing_ids=added_listing_ids,
+                    )
+                except (GuestyApiError, GuestyAuthError) as err:
+                    _LOGGER.warning(
+                        "Could not immediately load reservations for new listings: %s",
+                        err,
+                    )
+                else:
+                    reservations = merge_reservations(
+                        reservations,
+                        listing_reservations,
+                        days_past=days_past,
+                        days_future=days_future,
+                    )
+
+            # Removed listings must disappear from occupancy and calendar data
+            # immediately, including their cached reservations.
+            reservations = [
+                reservation
+                for reservation in reservations
+                if reservation.listing_id in listings
+            ]
+            now = dt_util.utcnow().isoformat()
+            cache.update(
+                {
+                    "listings": {
+                        listing_id: listing.to_dict()
+                        for listing_id, listing in listings.items()
+                    },
+                    "reservations": [
+                        reservation.to_dict() for reservation in reservations
+                    ],
+                    "access_token": self._client.access_token,
+                    "token_expires_at": self._client.token_expires_at,
+                    "last_sync": now,
+                    "last_listing_sync": now,
+                    "last_error": None,
+                }
+            )
+            await self._storage.async_save(cache)
+            self._async_set_fresh_data_from_cache(cache)
 
     async def _async_apply_reservation_webhook(self, reservation_id: str) -> None:
         """Refresh a single reservation from a webhook event."""
@@ -361,13 +565,17 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             reservation = await self._client.async_get_reservation(reservation_id)
         except (GuestyApiError, GuestyAuthError) as err:
             _LOGGER.warning(
-                "Webhook reservation refresh failed, running full sync: %s", err
+                "Webhook reservation refresh failed; running incremental sync: %s",
+                err,
             )
-            await self.async_request_refresh()
+            await self.async_refresh()
             return
 
         if reservation is None:
-            await self.async_request_refresh()
+            await self._async_remove_reservation_from_cache(reservation_id)
+            # A 404 can mean a deletion or a short Guesty consistency delay.
+            # An immediate incremental pass safely covers both cases.
+            await self.async_refresh()
             return
 
         async with self._refresh_lock:
@@ -385,34 +593,61 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 days_past=days_past,
                 days_future=days_future,
             )
-            listings = GuestyStorage.listings_from_cache(cache)
             now = dt_util.utcnow().isoformat()
             cache["reservations"] = [item.to_dict() for item in reservations]
             cache["last_sync"] = now
             cache["last_reservation_sync"] = now
-            cache["last_incremental_sync"] = now
             cache["last_error"] = None
             await self._storage.async_save(cache)
+            self._async_set_fresh_data_from_cache(cache)
 
-            occupancy = self._calculate_occupancy(listings, reservations)
-            self._fire_occupancy_events(occupancy)
-            self.async_set_updated_data(
-                GuestyCoordinatorData(
-                    listings=listings,
-                    reservations=reservations,
-                    occupancy=occupancy,
-                    last_sync=now,
-                    last_listing_sync=cache.get("last_listing_sync"),
-                    last_reservation_sync=now,
-                    last_full_reservation_sync=cache.get("last_full_reservation_sync"),
-                    last_incremental_sync=now,
-                    data_stale=False,
-                    cache_age_minutes=0.0,
-                    sync_status=SYNC_STATUS_OK,
-                    last_error=None,
-                    webhook_active=self._webhook_active,
-                )
+    async def _async_remove_reservation_from_cache(self, reservation_id: str) -> None:
+        """Remove a reservation Guesty reports as no longer existing."""
+        async with self._refresh_lock:
+            cache = await self._storage.async_load()
+            reservations = GuestyStorage.reservations_from_cache(cache)
+            remaining = [
+                reservation
+                for reservation in reservations
+                if reservation.id != reservation_id
+            ]
+            if len(remaining) == len(reservations):
+                return
+            now = dt_util.utcnow().isoformat()
+            cache.update(
+                {
+                    "reservations": [item.to_dict() for item in remaining],
+                    "last_sync": now,
+                    "last_reservation_sync": now,
+                    "last_error": None,
+                }
             )
+            await self._storage.async_save(cache)
+            self._async_set_fresh_data_from_cache(cache)
+
+    def _async_set_fresh_data_from_cache(self, cache: dict[str, Any]) -> None:
+        """Publish a successful targeted cache update to all entities."""
+        listings = GuestyStorage.listings_from_cache(cache)
+        reservations = GuestyStorage.reservations_from_cache(cache)
+        occupancy = self._calculate_occupancy(listings, reservations)
+        self._fire_occupancy_events(occupancy)
+        self.async_set_updated_data(
+            GuestyCoordinatorData(
+                listings=listings,
+                reservations=reservations,
+                occupancy=occupancy,
+                last_sync=cache.get("last_sync"),
+                last_listing_sync=cache.get("last_listing_sync"),
+                last_reservation_sync=cache.get("last_reservation_sync"),
+                last_full_reservation_sync=cache.get("last_full_reservation_sync"),
+                last_incremental_sync=cache.get("last_incremental_sync"),
+                data_stale=False,
+                cache_age_minutes=0.0,
+                sync_status=SYNC_STATUS_OK,
+                last_error=None,
+                webhook_active=self._webhook_active,
+            )
+        )
 
     async def async_recalculate_occupancy(self) -> None:
         """Recalculate occupancy locally without an API call."""
@@ -476,6 +711,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
 
     def _fire_occupancy_events(self, occupancy: dict[str, ListingOccupancy]) -> None:
         """Fire events when occupancy changes."""
+        for removed_listing_id in set(self._previous_occupancy) - set(occupancy):
+            self._previous_occupancy.pop(removed_listing_id, None)
         for listing_id, state in occupancy.items():
             previous = self._previous_occupancy.get(listing_id)
             current = state.status

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import logging
@@ -79,22 +80,49 @@ class GuestyListing:
         return self.nickname or self.title or self.id
 
     @classmethod
-    def from_api(cls, data: dict[str, Any]) -> GuestyListing:
+    def from_api(
+        cls,
+        data: dict[str, Any],
+        fallback: GuestyListing | None = None,
+    ) -> GuestyListing:
         """Create a listing from API data."""
         listing_id = data.get("_id") or data.get("id")
         if not listing_id:
             raise ValueError("Listing payload missing id")
         pms = data.get("pms") or {}
+        if not isinstance(pms, dict):
+            pms = {}
+        if "active" in pms:
+            active = bool(pms["active"])
+        elif "active" in data:
+            active = bool(data["active"])
+        else:
+            active = fallback.active if fallback else True
         return cls(
-            id=listing_id,
-            title=data.get("title") or data["_id"],
-            nickname=data.get("nickname"),
+            id=str(listing_id),
+            title=data.get("title")
+            or (fallback.title if fallback else str(listing_id)),
+            nickname=(
+                data.get("nickname")
+                if "nickname" in data
+                else fallback.nickname
+                if fallback
+                else None
+            ),
             default_check_in_time=data.get("defaultCheckInTime")
+            or (fallback.default_check_in_time if fallback else None)
             or DEFAULT_CHECK_IN_TIME,
             default_check_out_time=data.get("defaultCheckOutTime")
+            or (fallback.default_check_out_time if fallback else None)
             or DEFAULT_CHECK_OUT_TIME,
-            timezone=data.get("timezone"),
-            active=bool(pms.get("active", True)),
+            timezone=(
+                data.get("timezone")
+                if "timezone" in data
+                else fallback.timezone
+                if fallback
+                else None
+            ),
+            active=active,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,8 +175,9 @@ class GuestyReservation:
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
         """Create a reservation from API data."""
+        reservation_id = data.get("_id") or data.get("id")
         listing_id = data.get("listingId") or (data.get("listing") or {}).get("_id")
-        if not listing_id:
+        if not reservation_id or not listing_id:
             return None
 
         check_in = data.get("checkInDateLocalized")
@@ -162,8 +191,8 @@ class GuestyReservation:
         listing = data.get("listing") or {}
         guest = data.get("guest") or {}
         return cls(
-            id=data["_id"],
-            listing_id=listing_id,
+            id=str(reservation_id),
+            listing_id=str(listing_id),
             status=(data.get("status") or "").lower(),
             confirmation_code=data.get("confirmationCode"),
             check_in_date=check_in,
@@ -232,9 +261,16 @@ class GuestyReservation:
         """Return whether the listing is occupied at a given moment."""
         if not self.is_active_status():
             return False
-        return (
-            self.check_in_datetime(listing) <= moment < self.check_out_datetime(listing)
-        )
+        check_in, check_out = self.stay_datetimes(listing)
+        return check_in <= moment < check_out
+
+    def stay_datetimes(self, listing: GuestyListing) -> tuple[datetime, datetime]:
+        """Return and validate the reservation interval."""
+        check_in = self.check_in_datetime(listing)
+        check_out = self.check_out_datetime(listing)
+        if check_out <= check_in:
+            raise ValueError(f"Reservation {self.id} has an invalid date range")
+        return check_in, check_out
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize reservation for storage."""
@@ -306,21 +342,28 @@ def calculate_listing_occupancy(
         if reservation.listing_id == listing.id and reservation.is_active_status()
     ]
 
-    current: GuestyReservation | None = None
+    current_candidates: list[tuple[datetime, datetime, str, GuestyReservation]] = []
     upcoming: list[tuple[datetime, GuestyReservation]] = []
 
     for reservation in listing_reservations:
         try:
-            check_in = reservation.check_in_datetime(listing)
-            check_out = reservation.check_out_datetime(listing)
+            check_in, check_out = reservation.stay_datetimes(listing)
         except (TypeError, ValueError):
             _LOGGER.debug("Skipping invalid reservation %s", reservation.id)
             continue
 
         if check_in <= now < check_out:
-            current = reservation
+            current_candidates.append(
+                (check_in, check_out, reservation.id, reservation)
+            )
         elif check_in > now:
             upcoming.append((check_in, reservation))
+
+    current = (
+        min(current_candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+        if current_candidates
+        else None
+    )
 
     next_reservation: GuestyReservation | None = None
     next_check_in: datetime | None = None
@@ -375,11 +418,10 @@ def reservation_overlaps_range(
 ) -> bool:
     """Return whether a reservation overlaps a datetime range."""
     try:
-        check_in = reservation.check_in_datetime(listing)
-        check_out = reservation.check_out_datetime(listing)
+        check_in, check_out = reservation.stay_datetimes(listing)
     except (TypeError, ValueError):
         return False
-    return check_in < end and check_out > start
+    return start < end and check_in < end and check_out > start
 
 
 def build_reservation_filters(
@@ -387,6 +429,7 @@ def build_reservation_filters(
     days_future: int,
     *,
     updated_since: datetime | None = None,
+    listing_ids: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build Guesty reservation API filters for the sync window."""
     today = dt_util.now().date()
@@ -404,6 +447,15 @@ def build_reservation_filters(
             "value": end_date,
         },
     ]
+
+    if listing_ids:
+        filters.append(
+            {
+                "operator": "$in",
+                "field": "listingId",
+                "value": sorted(set(listing_ids)),
+            }
+        )
 
     if updated_since is None:
         filters.insert(
@@ -449,22 +501,34 @@ def merge_reservations(
 
     pruned: list[GuestyReservation] = []
     for reservation in by_id.values():
-        if not reservation.check_out_date:
-            pruned.append(reservation)
-            continue
-        try:
-            checkout_day = date.fromisoformat(reservation.check_out_date)
-            checkin_day = (
-                date.fromisoformat(reservation.check_in_date)
-                if reservation.check_in_date
-                else None
+        checkout_day = _reservation_day(
+            reservation.check_out_date,
+            reservation.check_out_utc,
+        )
+        checkin_day = _reservation_day(
+            reservation.check_in_date,
+            reservation.check_in_utc,
+        )
+        if checkout_day is None:
+            _LOGGER.debug(
+                "Dropping reservation %s with no valid checkout date",
+                reservation.id,
             )
-        except (TypeError, ValueError):
-            pruned.append(reservation)
             continue
         if checkout_day >= window_start and (
             checkin_day is None or checkin_day <= window_end
         ):
             pruned.append(reservation)
 
-    return pruned
+    return sorted(pruned, key=lambda reservation: reservation.id)
+
+
+def _reservation_day(localized: str | None, utc_value: str | None) -> date | None:
+    """Return a reservation day from localized or UTC input."""
+    if localized:
+        try:
+            return date.fromisoformat(localized)
+        except (TypeError, ValueError):
+            pass
+    parsed = _parse_utc_datetime(utc_value)
+    return parsed.date() if parsed else None

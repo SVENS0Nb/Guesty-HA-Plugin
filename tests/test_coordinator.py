@@ -1,115 +1,71 @@
-"""Unit tests for Guesty coordinator sync decisions."""
+"""Tests for Guesty coordinator decisions and webhook deduplication."""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-import importlib.util
-from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from homeassistant.exceptions import ConfigEntryAuthFailed
 import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-ROOT = Path(__file__).resolve().parents[1]
-GUESTY_PATH = ROOT / "custom_components" / "guesty"
+from custom_components.guesty.api import GuestyAuthError
+from custom_components.guesty.const import (
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
+from custom_components.guesty.coordinator import (
+    GuestyDataUpdateCoordinator,
+    _is_full_reservation_sync_due,
+)
+from custom_components.guesty.models import GuestyListing, GuestyReservation
+
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 
 
-def _load_module(name: str, path: Path, package: str) -> ModuleType:
-    """Load a module from the integration without importing its package."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    module.__package__ = package
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_coordinator() -> ModuleType:
-    """Load coordinator.py with minimal Home Assistant dependencies."""
-    config_entries = ModuleType("homeassistant.config_entries")
-    config_entries.ConfigEntry = object
-    core = ModuleType("homeassistant.core")
-    core.HomeAssistant = object
-
-    update_coordinator = ModuleType("homeassistant.helpers.update_coordinator")
-
-    class DataUpdateCoordinator:
-        def __init__(self, *args, **kwargs) -> None:
-            self.update_interval = kwargs["update_interval"]
-            self.data = None
-
-        @classmethod
-        def __class_getitem__(cls, item):
-            return cls
-
-    update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
-    update_coordinator.UpdateFailed = RuntimeError
-
-    dt_util = ModuleType("homeassistant.util.dt")
-    dt_util.utcnow = lambda: NOW
-    dt_util.parse_datetime = lambda value: (
-        None if value == "invalid" else datetime.fromisoformat(value)
-    )
-
-    sys.modules["homeassistant"] = ModuleType("homeassistant")
-    sys.modules["homeassistant.config_entries"] = config_entries
-    sys.modules["homeassistant.core"] = core
-    sys.modules["homeassistant.helpers"] = ModuleType("homeassistant.helpers")
-    sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
-    sys.modules["homeassistant.util"] = ModuleType("homeassistant.util")
-    sys.modules["homeassistant.util.dt"] = dt_util
-
-    package = ModuleType("custom_components.guesty")
-    package.__path__ = [str(GUESTY_PATH)]
-    sys.modules["custom_components.guesty"] = package
-    _load_module(
-        "custom_components.guesty.const",
-        GUESTY_PATH / "const.py",
-        "custom_components.guesty",
-    )
-
-    api = ModuleType("custom_components.guesty.api")
-    api.GuestyApiClient = object
-    api.GuestyApiError = type("GuestyApiError", (Exception,), {})
-    api.GuestyAuthError = type("GuestyAuthError", (Exception,), {})
-    sys.modules["custom_components.guesty.api"] = api
-
-    models = ModuleType("custom_components.guesty.models")
-    models.GuestyListing = object
-    models.GuestyReservation = object
-    models.ListingOccupancy = object
-    models.calculate_listing_occupancy = lambda *args: None
-    models.merge_reservations = lambda existing, updates, **kwargs: updates
-    sys.modules["custom_components.guesty.models"] = models
-
-    storage = ModuleType("custom_components.guesty.storage")
-    storage.GuestyStorage = object
-    sys.modules["custom_components.guesty.storage"] = storage
-
-    return _load_module(
-        "custom_components.guesty.coordinator",
-        GUESTY_PATH / "coordinator.py",
-        "custom_components.guesty",
+def _entry() -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={},
     )
 
 
-coordinator = _load_coordinator()
+def _empty_cache() -> dict:
+    return {
+        "listings": {},
+        "reservations": [],
+        "access_token": None,
+        "token_expires_at": None,
+        "last_sync": None,
+        "last_listing_sync": None,
+        "last_reservation_sync": None,
+        "last_full_reservation_sync": None,
+        "last_incremental_sync": None,
+        "last_error": None,
+    }
 
 
-def test_coordinator_uses_stdlib_timedelta() -> None:
-    """Coordinator setup does not rely on a Home Assistant timedelta helper."""
-    entry = SimpleNamespace(options={}, data={})
-
-    instance = coordinator.GuestyDataUpdateCoordinator(
-        object(), entry, object(), object()
+def _coordinator(hass, client=None, storage=None) -> GuestyDataUpdateCoordinator:
+    entry = _entry()
+    entry.add_to_hass(hass)
+    return GuestyDataUpdateCoordinator(
+        hass,
+        entry,
+        client or SimpleNamespace(),
+        storage or SimpleNamespace(),
     )
 
-    assert instance.update_interval == timedelta(
-        seconds=coordinator.DEFAULT_SCAN_INTERVAL
-    )
+
+@pytest.mark.asyncio
+async def test_coordinator_uses_stdlib_timedelta(hass) -> None:
+    """Coordinator setup uses a real timedelta accepted by Home Assistant."""
+    instance = _coordinator(hass)
+    assert instance.update_interval == timedelta(seconds=DEFAULT_SCAN_INTERVAL)
 
 
 @pytest.mark.parametrize(
@@ -121,18 +77,320 @@ def test_coordinator_uses_stdlib_timedelta() -> None:
         ((NOW - timedelta(hours=24)).isoformat(), True),
     ],
 )
-def test_full_sync_uses_dedicated_timestamp(last_full_sync, expected) -> None:
-    """Daily full sync decisions do not depend on incremental cursors."""
-    assert coordinator._is_full_reservation_sync_due(last_full_sync) is expected
+def test_full_sync_uses_dedicated_timestamp(
+    monkeypatch, last_full_sync, expected
+) -> None:
+    """Daily full-sync decisions do not depend on incremental cursors."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    assert _is_full_reservation_sync_due(last_full_sync) is expected
 
 
 @pytest.mark.asyncio
-async def test_listing_webhook_forces_full_sync(monkeypatch) -> None:
-    """Listing events bypass the normal listing polling interval."""
-    instance = object.__new__(coordinator.GuestyDataUpdateCoordinator)
-    force_full_sync = AsyncMock()
-    monkeypatch.setattr(instance, "async_force_full_sync", force_full_sync)
+async def test_auth_failure_starts_reauthentication(hass) -> None:
+    """Rejected credentials are surfaced as ConfigEntryAuthFailed."""
+    client = SimpleNamespace(
+        async_get_listings=AsyncMock(side_effect=GuestyAuthError("invalid")),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await instance._async_fetch_data(full_reservation_sync=True)
+
+
+@pytest.mark.asyncio
+async def test_sparse_listing_webhook_uses_listing_only_api_fallback(
+    hass, monkeypatch
+) -> None:
+    """An incomplete listing event never triggers a full reservation scan."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
+    )
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(return_value=[]),
+        async_get_reservations=AsyncMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
 
     await instance.async_handle_webhook({"event": "listing.updated"})
 
-    force_full_sync.assert_awaited_once_with()
+    client.async_get_listings.assert_awaited_once_with()
+    client.async_get_reservations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_reservation_webhooks_are_coalesced(hass, monkeypatch) -> None:
+    """Guesty's duplicate notifications cannot trigger duplicate API calls."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
+    )
+    instance = _coordinator(hass)
+    instance._async_apply_reservation_webhook = AsyncMock()
+    payload = {
+        "event": "reservation.updated",
+        "reservation": {"_id": "65f19af19824d7e6ff848f11"},
+    }
+    await asyncio.gather(
+        instance.async_handle_webhook(payload),
+        instance.async_handle_webhook(payload),
+    )
+
+    instance._async_apply_reservation_webhook.assert_awaited_once_with(
+        "65f19af19824d7e6ff848f11"
+    )
+
+
+@pytest.mark.asyncio
+async def test_webhook_arriving_mid_fetch_is_replayed(hass, monkeypatch) -> None:
+    """A later change to the same reservation cannot be lost during an API call."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
+    )
+    instance = _coordinator(hass)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def apply_reservation(reservation_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+
+    instance._async_apply_reservation_webhook = apply_reservation
+    payload = {
+        "event": "reservation.updated",
+        "reservation": {"_id": "65f19af19824d7e6ff848f11"},
+    }
+    first = asyncio.create_task(instance.async_handle_webhook(payload))
+    await started.wait()
+    second = asyncio.create_task(instance.async_handle_webhook(payload))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reservation_burst_uses_one_incremental_refresh(
+    hass, monkeypatch
+) -> None:
+    """Bulk edits use one filtered sync instead of one API call per reservation."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
+    )
+    instance = _coordinator(hass)
+    instance.async_refresh = AsyncMock()
+    instance._async_apply_reservation_webhook = AsyncMock()
+
+    await asyncio.gather(
+        instance.async_handle_webhook(
+            {"event": "reservation.updated", "reservation": {"_id": "res-1"}}
+        ),
+        instance.async_handle_webhook(
+            {"event": "reservation.updated", "reservation": {"_id": "res-2"}}
+        ),
+    )
+
+    instance.async_refresh.assert_awaited_once_with()
+    instance._async_apply_reservation_webhook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_unsafe_webhook_is_ignored(hass) -> None:
+    """Untrusted webhook payloads cannot trigger arbitrary API refreshes."""
+    instance = _coordinator(hass)
+    instance.async_request_refresh = AsyncMock()
+    instance._async_apply_reservation_webhook = AsyncMock()
+
+    await instance.async_handle_webhook({"event": "unknown.event"})
+    await instance.async_handle_webhook(
+        {
+            "event": "reservation.updated",
+            "reservation": {"_id": "../unsafe"},
+        }
+    )
+
+    instance.async_request_refresh.assert_not_awaited()
+    instance._async_apply_reservation_webhook.assert_not_awaited()
+
+
+def test_v2_webhook_id_is_extracted() -> None:
+    """The newer nested Guesty payload shape is supported."""
+    assert (
+        GuestyDataUpdateCoordinator._reservation_id_from_webhook(
+            {
+                "event": "reservation.updated.v2",
+                "data": {"reservation": {"id": "65f19af19824d7e6ff848f11"}},
+            }
+        )
+        == "65f19af19824d7e6ff848f11"
+    )
+
+
+def _listing(listing_id: str = "listing-1") -> GuestyListing:
+    return GuestyListing(
+        id=listing_id,
+        title="Apartment",
+        nickname=None,
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+
+
+def _reservation(reservation_id: str = "reservation-1") -> GuestyReservation:
+    return GuestyReservation(
+        id=reservation_id,
+        listing_id="listing-1",
+        status="confirmed",
+        confirmation_code=None,
+        check_in_date="2026-07-14",
+        check_out_date="2026-07-16",
+        check_in_utc=None,
+        check_out_utc=None,
+        planned_arrival=None,
+        planned_departure=None,
+        listing_default_check_in=None,
+        listing_default_check_out=None,
+        guest_name=None,
+        last_updated_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_listing_webhook_uses_payload_and_targeted_reservations(hass) -> None:
+    """A new listing appears immediately without a complete account scan."""
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_listing_webhooks(
+        [
+            {
+                "event": "listing.new",
+                "listing": {
+                    "_id": "listing-1",
+                    "title": "New Apartment",
+                    "timezone": "Europe/Berlin",
+                },
+            }
+        ]
+    )
+
+    assert set(instance.data.listings) == {"listing-1"}
+    assert instance.data.listings["listing-1"].title == "New Apartment"
+    client.async_get_listings.assert_not_awaited()
+    client.async_get_reservations.assert_awaited_once_with(
+        30,
+        365,
+        listing_ids={"listing-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_removed_listing_webhook_prunes_listing_and_reservations(hass) -> None:
+    """Removed listings become unavailable immediately with no API request."""
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    cache["reservations"] = [_reservation().to_dict()]
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(),
+        async_get_reservations=AsyncMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_listing_webhooks(
+        [{"event": "listing.removed", "listing": {"_id": "listing-1"}}]
+    )
+
+    assert instance.data.listings == {}
+    assert instance.data.reservations == []
+    client.async_get_listings.assert_not_awaited()
+    client.async_get_reservations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_targeted_reservation_does_not_advance_global_cursor(hass) -> None:
+    """A single webhook fetch cannot hide other changes from the next poll."""
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    cache["last_incremental_sync"] = "2026-07-13T11:55:00+00:00"
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(return_value=_reservation())
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    saved_cache = storage.async_save.await_args.args[0]
+    assert saved_cache["last_incremental_sync"] == "2026-07-13T11:55:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_missing_webhook_uses_faster_listing_poll_fallback(
+    hass, monkeypatch
+) -> None:
+    """A lost webhook subscription cannot hide listing changes for a day."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_sync": (NOW - timedelta(minutes=5)).isoformat(),
+            "last_listing_sync": (NOW - timedelta(minutes=16)).isoformat(),
+            "last_reservation_sync": (NOW - timedelta(minutes=5)).isoformat(),
+            "last_full_reservation_sync": (NOW - timedelta(hours=1)).isoformat(),
+            "last_incremental_sync": (NOW - timedelta(minutes=5)).isoformat(),
+        }
+    )
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(return_value=[_listing()]),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_fetch_data(full_reservation_sync=False)
+
+    client.async_get_listings.assert_awaited_once_with()

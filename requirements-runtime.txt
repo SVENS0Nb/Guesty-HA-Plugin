@@ -1,0 +1,2 @@
+# The integration has no third-party runtime dependencies.
+# aiohttp and voluptuous are provided and pinned by Home Assistant.

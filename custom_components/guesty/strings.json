@@ -2,36 +2,46 @@
   "config": {
     "step": {
       "user": {
-        "title": "Guesty verbinden",
-        "description": "Gib deine Guesty Open API Zugangsdaten ein. Du findest Client ID und Client Secret in deinem Guesty-Konto unter Integrations > Open API.",
+        "title": "Connect Guesty",
+        "description": "Enter your Guesty Open API credentials. You can find the Client ID and Client Secret in your Guesty account under Integrations > API & Webhooks.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret",
-          "scan_interval": "Aktualisierungsintervall (Sekunden)"
+          "scan_interval": "Update interval (seconds)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Guesty",
+        "description": "The Guesty credentials are no longer valid. Enter a new Client ID and Client Secret.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Client Secret"
         }
       }
     },
     "error": {
-      "invalid_auth": "Ungültige API-Zugangsdaten (Client ID oder Secret falsch)",
-      "no_permissions": "Token erhalten, aber kein Zugriff auf Listings – Open API Berechtigungen in Guesty prüfen",
-      "cannot_connect": "Verbindung zur Guesty API fehlgeschlagen",
-      "unknown": "Unbekannter Fehler"
+      "invalid_auth": "Invalid API credentials (wrong Client ID or Secret)",
+      "no_permissions": "Token received but no listing access – check Open API permissions in Guesty",
+      "cannot_connect": "Failed to connect to the Guesty API",
+      "unknown": "Unknown error"
     },
     "abort": {
-      "already_configured": "Guesty ist bereits eingerichtet"
+      "already_configured": "Guesty is already configured",
+      "reauth_successful": "Guesty was reconnected successfully"
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Guesty Einstellungen",
-        "description": "Passe Sync-Intervalle, Reservierungsfenster und Stale-Schwellenwert an.",
+        "title": "Guesty settings",
+        "description": "Adjust sync intervals, reservation window and stale threshold.",
         "data": {
-          "scan_interval": "Reservierungs-Sync (Sekunden)",
-          "listing_sync_interval": "Listing-Sync (Sekunden)",
-          "reservation_days_past": "Vergangene Tage für Reservierungen",
-          "reservation_days_future": "Zukünftige Tage für Reservierungen",
-          "stale_threshold_hours": "Stale-Schwellenwert (Stunden)"
+          "scan_interval": "Reservation sync (seconds)",
+          "listing_sync_interval": "Listing sync (seconds)",
+          "reservation_days_past": "Past days for reservations",
+          "reservation_days_future": "Future days for reservations",
+          "stale_threshold_hours": "Stale threshold (hours)",
+          "expose_guest_details": "Show guest names and confirmation codes in entities"
         }
       }
     }
@@ -39,24 +49,24 @@
   "entity": {
     "sensor": {
       "occupancy": {
-        "name": "Belegung",
+        "name": "Occupancy",
         "state": {
-          "vacant": "Frei",
-          "occupied": "Vermietet"
+          "vacant": "Vacant",
+          "occupied": "Occupied"
         }
       },
       "sync_status": {
-        "name": "Sync-Status",
+        "name": "Sync status",
         "state": {
           "ok": "OK",
-          "degraded": "Eingeschränkt",
-          "error": "Fehler"
+          "degraded": "Degraded",
+          "error": "Error"
         }
       }
     },
     "calendar": {
       "reservations": {
-        "name": "Reservierungen"
+        "name": "Reservations"
       }
     }
   }

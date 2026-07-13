@@ -19,12 +19,16 @@ from .api import (
     GuestyPermissionError,
 )
 from .const import (
+    CONF_ACCESS_TOKEN,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_EXPOSE_GUEST_DETAILS,
     CONF_LISTING_SYNC_INTERVAL,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_STALE_THRESHOLD_HOURS,
+    CONF_TOKEN_EXPIRES_AT,
+    DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
@@ -67,11 +71,21 @@ OPTIONS_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_STALE_THRESHOLD_HOURS, default=DEFAULT_STALE_THRESHOLD_HOURS
         ): vol.All(vol.Coerce(int), vol.Range(min=1, max=48)),
+        vol.Optional(
+            CONF_EXPOSE_GUEST_DETAILS, default=DEFAULT_EXPOSE_GUEST_DETAILS
+        ): bool,
+    }
+)
+
+REAUTH_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_CLIENT_ID): str,
+        vol.Required(CONF_CLIENT_SECRET): str,
     }
 )
 
 
-async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, str]:
+async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate the user input and return info for the config entry."""
     client_id = data[CONF_CLIENT_ID].strip()
     client_secret = data[CONF_CLIENT_SECRET].strip()
@@ -80,7 +94,12 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     client = GuestyApiClient.from_hass(hass, client_id, client_secret)
     account_id = await client.async_validate_credentials()
-    return {"title": "Guesty", "unique_id": account_id}
+    return {
+        "title": "Guesty",
+        "unique_id": account_id,
+        CONF_ACCESS_TOKEN: client.access_token,
+        CONF_TOKEN_EXPIRES_AT: client.token_expires_at,
+    }
 
 
 class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -117,6 +136,8 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                     data={
                         CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
                         CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
+                        CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
+                        CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
                         CONF_SCAN_INTERVAL: user_input.get(
                             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
                         ),
@@ -129,6 +150,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_RESERVATION_DAYS_PAST: DEFAULT_RESERVATION_DAYS_PAST,
                         CONF_RESERVATION_DAYS_FUTURE: DEFAULT_RESERVATION_DAYS_FUTURE,
                         CONF_STALE_THRESHOLD_HOURS: DEFAULT_STALE_THRESHOLD_HOURS,
+                        CONF_EXPOSE_GUEST_DETAILS: DEFAULT_EXPOSE_GUEST_DETAILS,
                     },
                 )
 
@@ -138,19 +160,53 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
+        """Start reauthentication after Guesty rejects the credentials."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Validate and store replacement Guesty credentials."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                info = await validate_input(self.hass, user_input)
+            except GuestyAuthError:
+                errors["base"] = "invalid_auth"
+            except GuestyPermissionError:
+                errors["base"] = "no_permissions"
+            except GuestyApiError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception during Guesty reauthentication")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={
+                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
+                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
+                        CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
+                        CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=REAUTH_SCHEMA,
+            errors=errors,
+        )
+
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> GuestyOptionsFlow:
         """Get the options flow for this handler."""
-        return GuestyOptionsFlow(config_entry)
+        return GuestyOptionsFlow()
 
 
 class GuestyOptionsFlow(OptionsFlow):
     """Handle Guesty options."""
-
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize options flow."""
-        self._config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -159,7 +215,7 @@ class GuestyOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        options = self._config_entry.options
+        options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
@@ -180,6 +236,9 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                     CONF_STALE_THRESHOLD_HOURS: options.get(
                         CONF_STALE_THRESHOLD_HOURS, DEFAULT_STALE_THRESHOLD_HOURS
+                    ),
+                    CONF_EXPOSE_GUEST_DETAILS: options.get(
+                        CONF_EXPOSE_GUEST_DETAILS, DEFAULT_EXPOSE_GUEST_DETAILS
                     ),
                 },
             ),
