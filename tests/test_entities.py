@@ -21,6 +21,7 @@ from custom_components.guesty.models import (
     calculate_listing_occupancy,
 )
 from custom_components.guesty.sensor import (
+    GuestyCurrentGuestSensor,
     GuestyOccupancySensor,
     _add_listing_entities as add_sensor_entities,
 )
@@ -59,13 +60,17 @@ def _reservation() -> GuestyReservation:
     )
 
 
-def _coordinator(*, expose_details: bool = False):
+def _coordinator(
+    *,
+    expose_details: bool = False,
+    moment: datetime | None = None,
+):
     listing = _listing()
     reservation = _reservation()
     occupancy = calculate_listing_occupancy(
         listing,
         [reservation],
-        datetime(2026, 7, 12, 12, 0, tzinfo=TZ),
+        moment or datetime(2026, 7, 12, 12, 0, tzinfo=TZ),
     )
     data = SimpleNamespace(
         listings={listing.id: listing},
@@ -156,6 +161,39 @@ def test_sensor_exposes_unrecorded_details_only_after_opt_in() -> None:
     assert "next_guest" in entity._unrecorded_attributes
 
 
+def test_current_guest_sensor_requires_explicit_privacy_opt_ins() -> None:
+    """The guest name state is disabled and unavailable without consent."""
+    entity = GuestyCurrentGuestSensor(
+        _coordinator(
+            moment=datetime(2026, 7, 14, 12, 0, tzinfo=TZ),
+        ),
+        "listing-1",
+    )
+
+    assert entity.native_value is None
+    assert not entity.available
+    assert entity.entity_registry_enabled_default is False
+
+
+def test_current_guest_sensor_exposes_only_the_active_guest() -> None:
+    """An opted-in sensor shows the current guest but not a future guest."""
+    current = GuestyCurrentGuestSensor(
+        _coordinator(
+            expose_details=True,
+            moment=datetime(2026, 7, 14, 12, 0, tzinfo=TZ),
+        ),
+        "listing-1",
+    )
+    upcoming = GuestyCurrentGuestSensor(
+        _coordinator(expose_details=True),
+        "listing-1",
+    )
+
+    assert current.native_value == "Private Guest"
+    assert current.available
+    assert upcoming.native_value is None
+
+
 def test_new_listings_create_entities_once_during_runtime() -> None:
     """Coordinator updates add new sensors and calendars without a reload."""
     coordinator = _coordinator()
@@ -175,6 +213,7 @@ def test_new_listings_create_entities_once_during_runtime() -> None:
 
     add_sensors.assert_called_once()
     add_calendars.assert_called_once()
+    assert len(add_sensors.call_args.args[0]) == 2
     assert entry.runtime_data.sensor_listing_ids == {"listing-1"}
     assert entry.runtime_data.calendar_listing_ids == {"listing-1"}
 
@@ -183,10 +222,12 @@ def test_removed_listing_entities_become_unavailable() -> None:
     """A removed listing is recognized immediately without stale states."""
     coordinator = _coordinator()
     sensor = GuestyOccupancySensor(coordinator, "listing-1")
+    guest_sensor = GuestyCurrentGuestSensor(coordinator, "listing-1")
     calendar = GuestyReservationCalendar(coordinator, "listing-1")
 
     coordinator.data.listings.clear()
     coordinator.data.occupancy.clear()
 
     assert not sensor.available
+    assert not guest_sensor.available
     assert not calendar.available

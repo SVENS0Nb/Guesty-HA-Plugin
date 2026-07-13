@@ -55,6 +55,9 @@
           "occupied": "Vermietet"
         }
       },
+      "current_guest": {
+        "name": "Aktueller Gast"
+      },
       "sync_status": {
         "name": "Sync-Status",
         "state": {

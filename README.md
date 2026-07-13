@@ -66,7 +66,7 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Vergangene Tage | 30 | Reservierungsfenster in die Vergangenheit |
 | Zukünftige Tage | 365 | Reservierungsfenster in die Zukunft |
 | Stale-Schwellenwert | 6 h | Ab wann Daten als veraltet gelten |
-| Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Sensoren und Kalendern anzeigen; diese Attribute werden nicht im Recorder gespeichert |
+| Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Entitäten anzeigen; sensible Attribute werden nicht im Recorder gespeichert |
 
 ## Entitäten
 
@@ -75,9 +75,12 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Entität | Beispiel | Beschreibung |
 |---------|----------|--------------|
 | Sensor | `sensor.ferienwohnung_belegung` | `vacant` oder `occupied` |
+| Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_aktueller_gast` | Name des Gastes der aktuell laufenden Reservierung |
 | Kalender | `calendar.ferienwohnung_reservierungen` | Alle Reservierungen |
 
 Kalendereinträge zeigen standardmäßig nur „Reserviert“ und den Reservierungsstatus. Gastnamen und Bestätigungscodes können in den Integrationsoptionen aktiviert werden.
+
+Der Sensor „Aktueller Gast“ benötigt ebenfalls die Option „Gastdetails anzeigen“ und ist zusätzlich standardmäßig deaktiviert. Nach dem manuellen Aktivieren wird sein Zustand vom Home-Assistant-Recorder gespeichert, sofern die Entität nicht in der Recorder-Konfiguration ausgeschlossen wird.
 
 Zusätzlich ein Integrations-Sensor:
 
