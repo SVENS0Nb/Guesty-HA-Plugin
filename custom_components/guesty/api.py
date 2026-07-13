@@ -38,6 +38,15 @@ class GuestyApiError(Exception):
     """Raised when a Guesty API request fails."""
 
 
+class GuestyRetryableError(GuestyApiError):
+    """Raised when a Guesty API request can be retried."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        """Initialize a retryable API error."""
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class GuestyPermissionError(GuestyApiError):
     """Raised when credentials work but API access is denied."""
 
@@ -59,6 +68,7 @@ class GuestyApiClient:
         self._client_secret = client_secret
         self._access_token = token
         self._token_expires_at = token_expires_at
+        self._token_lock = asyncio.Lock()
         self.last_rate_limit_remaining: int | None = None
 
     @classmethod
@@ -92,20 +102,13 @@ class GuestyApiClient:
     async def async_validate_credentials(self) -> str:
         """Validate credentials and return the account id."""
         await self._async_ensure_token(force_refresh=True)
-        try:
-            await self._async_paginate(
-                "/listings",
-                params={
-                    "fields": LISTING_FIELDS,
-                    "limit": "1",
-                },
-            )
-        except GuestyAuthError:
-            raise
-        except GuestyPermissionError as err:
-            _LOGGER.warning("Guesty token valid but listings access denied: %s", err)
-        except GuestyApiError as err:
-            _LOGGER.warning("Guesty listings check failed after auth: %s", err)
+        await self._async_paginate(
+            "/listings",
+            params={
+                "fields": LISTING_FIELDS,
+                "limit": "1",
+            },
+        )
         return "guesty_account"
 
     async def async_get_listings(self) -> list[GuestyListing]:
@@ -147,7 +150,9 @@ class GuestyApiClient:
                 reservations.append(reservation)
         return reservations
 
-    async def async_get_reservation(self, reservation_id: str) -> GuestyReservation | None:
+    async def async_get_reservation(
+        self, reservation_id: str
+    ) -> GuestyReservation | None:
         """Fetch a single reservation by id."""
         await self._async_ensure_token()
         data = await self._async_request(
@@ -195,6 +200,34 @@ class GuestyApiClient:
 
     async def _async_refresh_token(self) -> None:
         """Request a new OAuth access token."""
+        async with self._token_lock:
+            last_error: GuestyApiError | None = None
+            for attempt in range(API_MAX_RETRIES + 1):
+                try:
+                    await self._async_refresh_token_once()
+                    return
+                except GuestyAuthError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    last_error = GuestyApiError(
+                        f"Token request connection failed: {err}"
+                    )
+                except GuestyRetryableError as err:
+                    last_error = err
+                except GuestyApiError:
+                    raise
+
+                if attempt >= API_MAX_RETRIES:
+                    break
+                delay = self._retry_delay(last_error, attempt)
+                _LOGGER.debug("Retrying Guesty token request in %.1fs", delay)
+                await asyncio.sleep(delay)
+
+            assert last_error is not None
+            raise last_error
+
+    async def _async_refresh_token_once(self) -> None:
+        """Perform one OAuth token request."""
         payload = {
             "grant_type": "client_credentials",
             "scope": "open-api",
@@ -220,6 +253,11 @@ class GuestyApiClient:
                     raise GuestyAuthError(
                         f"Authentication failed ({response.status}): {body[:200]}"
                     )
+                if response.status in RETRYABLE_STATUS_CODES:
+                    raise GuestyRetryableError(
+                        f"Token request failed ({response.status}): {body[:200]}",
+                        self._retry_delay_from_response(response),
+                    )
                 raise GuestyApiError(
                     f"Token request failed ({response.status}): {body[:200]}"
                 )
@@ -234,8 +272,8 @@ class GuestyApiClient:
             self._access_token = data["access_token"]
             from homeassistant.util import dt as dt_util
 
-            self._token_expires_at = (
-                dt_util.utcnow().timestamp() + int(data.get("expires_in", 86400))
+            self._token_expires_at = dt_util.utcnow().timestamp() + int(
+                data.get("expires_in", 86400)
             )
 
     async def _async_paginate(
@@ -288,7 +326,7 @@ class GuestyApiClient:
         if not self._access_token:
             await self._async_ensure_token()
 
-        last_error: Exception | None = None
+        last_error: GuestyApiError | None = None
         for attempt in range(API_MAX_RETRIES + 1):
             try:
                 return await self._async_request_once(
@@ -298,24 +336,26 @@ class GuestyApiClient:
                     json_body=json_body,
                     retry_auth=retry_auth,
                 )
-            except GuestyAuthError:
+            except (GuestyAuthError, GuestyPermissionError):
                 raise
-            except GuestyApiError as err:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                last_error = GuestyApiError(f"Request connection failed: {err}")
+            except GuestyRetryableError as err:
                 last_error = err
-                if attempt >= API_MAX_RETRIES:
-                    break
-                delay = min(
-                    API_RETRY_BASE_DELAY * (2**attempt),
-                    API_RETRY_MAX_DELAY,
-                )
-                _LOGGER.debug(
-                    "Retrying Guesty request %s %s in %.1fs (%s)",
-                    method,
-                    path,
-                    delay,
-                    err,
-                )
-                await asyncio.sleep(delay)
+            except GuestyApiError:
+                raise
+
+            if attempt >= API_MAX_RETRIES:
+                break
+            delay = self._retry_delay(last_error, attempt)
+            _LOGGER.debug(
+                "Retrying Guesty request %s %s in %.1fs (%s)",
+                method,
+                path,
+                delay,
+                last_error,
+            )
+            await asyncio.sleep(delay)
 
         assert last_error is not None
         raise last_error
@@ -370,6 +410,11 @@ class GuestyApiClient:
                             f"Permission denied ({retry_response.status}): "
                             f"{retry_body[:200]}"
                         )
+                    if retry_response.status in RETRYABLE_STATUS_CODES:
+                        raise GuestyRetryableError(
+                            f"Retryable error ({retry_response.status}): {retry_body}",
+                            self._retry_delay_from_response(retry_response),
+                        )
                     if retry_response.status >= 400:
                         raise GuestyApiError(
                             f"Request failed ({retry_response.status}): {retry_body}"
@@ -387,8 +432,9 @@ class GuestyApiClient:
 
             if response.status in RETRYABLE_STATUS_CODES:
                 delay = self._retry_delay_from_response(response)
-                raise GuestyApiError(
-                    f"Retryable error ({response.status}), retry in {delay:.1f}s: {body}"
+                raise GuestyRetryableError(
+                    f"Retryable error ({response.status}): {body}",
+                    delay,
                 )
 
             if response.status >= 400:
@@ -401,7 +447,20 @@ class GuestyApiClient:
         """Parse an API response body."""
         if not body:
             return []
-        return json.loads(body)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as err:
+            raise GuestyApiError("Invalid JSON response from Guesty") from err
+
+    @staticmethod
+    def _retry_delay(error: GuestyApiError, attempt: int) -> float:
+        """Return the delay for a retryable request failure."""
+        if isinstance(error, GuestyRetryableError) and error.retry_after is not None:
+            return min(max(error.retry_after, 0.0), API_RETRY_MAX_DELAY)
+        return min(
+            API_RETRY_BASE_DELAY * (2**attempt),
+            API_RETRY_MAX_DELAY,
+        )
 
     def _capture_rate_limit_headers(self, headers: Any) -> None:
         """Store rate limit headers for diagnostics."""

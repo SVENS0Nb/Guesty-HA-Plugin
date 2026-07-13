@@ -42,6 +42,19 @@ from .storage import GuestyStorage
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_full_reservation_sync_due(last_full_sync: str | None) -> bool:
+    """Return whether the daily full reservation sync is due."""
+    if not last_full_sync:
+        return True
+    parsed = dt_util.parse_datetime(last_full_sync)
+    if not parsed:
+        return True
+    try:
+        return (dt_util.utcnow() - parsed).total_seconds() >= 86400
+    except TypeError:
+        return True
+
+
 @dataclass(slots=True)
 class GuestyCoordinatorData:
     """Coordinator data container."""
@@ -52,6 +65,7 @@ class GuestyCoordinatorData:
     last_sync: str | None
     last_listing_sync: str | None
     last_reservation_sync: str | None
+    last_full_reservation_sync: str | None
     last_incremental_sync: str | None
     data_stale: bool
     cache_age_minutes: float | None
@@ -109,6 +123,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 last_sync=self.data.last_sync,
                 last_listing_sync=self.data.last_listing_sync,
                 last_reservation_sync=self.data.last_reservation_sync,
+                last_full_reservation_sync=self.data.last_full_reservation_sync,
                 last_incremental_sync=self.data.last_incremental_sync,
                 data_stale=self.data.data_stale,
                 cache_age_minutes=self.data.cache_age_minutes,
@@ -122,14 +137,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         """Fetch data from Guesty and merge with cache."""
         async with self._refresh_lock:
             cache = await self._storage.async_load()
-            last_incremental_sync = cache.get("last_incremental_sync")
-            full_reservation_sync = not last_incremental_sync
-            if last_incremental_sync and not full_reservation_sync:
-                parsed = dt_util.parse_datetime(last_incremental_sync)
-                if parsed and (
-                    dt_util.utcnow() - parsed
-                ).total_seconds() >= 86400:
-                    full_reservation_sync = True
+            last_full_sync = cache.get("last_full_reservation_sync")
+            full_reservation_sync = _is_full_reservation_sync_due(last_full_sync)
             return await self._async_fetch_data(
                 full_reservation_sync=full_reservation_sync
             )
@@ -161,6 +170,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         last_sync = cache.get("last_sync")
         last_listing_sync = cache.get("last_listing_sync")
         last_reservation_sync = cache.get("last_reservation_sync")
+        last_full_reservation_sync = cache.get("last_full_reservation_sync")
         last_incremental_sync = cache.get("last_incremental_sync")
         last_error: str | None = None
         sync_status = SYNC_STATUS_OK
@@ -171,9 +181,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         if last_listing_sync and not should_sync_listings:
             try:
                 last_listing_dt = dt_util.parse_datetime(last_listing_sync)
-                if last_listing_dt and (
-                    now - last_listing_dt
-                ).total_seconds() >= listing_interval:
+                if (
+                    last_listing_dt
+                    and (now - last_listing_dt).total_seconds() >= listing_interval
+                ):
                     should_sync_listings = True
             except (ValueError, TypeError):
                 should_sync_listings = True
@@ -191,9 +202,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     self._client.async_get_reservations(
                         days_past,
                         days_future,
-                        updated_since=None
-                        if full_reservation_sync
-                        else updated_since,
+                        updated_since=None if full_reservation_sync else updated_since,
                     ),
                 )
             else:
@@ -220,6 +229,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
 
             last_sync = now.isoformat()
             last_reservation_sync = now.isoformat()
+            if full_reservation_sync:
+                last_full_reservation_sync = now.isoformat()
             if updated_since is not None and not full_reservation_sync:
                 last_incremental_sync = now.isoformat()
             elif full_reservation_sync or not last_incremental_sync:
@@ -239,6 +250,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     "last_sync": last_sync,
                     "last_listing_sync": last_listing_sync,
                     "last_reservation_sync": last_reservation_sync,
+                    "last_full_reservation_sync": last_full_reservation_sync,
                     "last_incremental_sync": last_incremental_sync,
                     "last_error": None,
                 }
@@ -283,6 +295,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             last_sync=last_sync,
             last_listing_sync=last_listing_sync,
             last_reservation_sync=last_reservation_sync,
+            last_full_reservation_sync=last_full_reservation_sync,
             last_incremental_sync=last_incremental_sync,
             data_stale=data_stale,
             cache_age_minutes=cache_age_minutes,
@@ -316,6 +329,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             last_sync=cache.get("last_sync"),
             last_listing_sync=cache.get("last_listing_sync"),
             last_reservation_sync=cache.get("last_reservation_sync"),
+            last_full_reservation_sync=cache.get("last_full_reservation_sync"),
             last_incremental_sync=cache.get("last_incremental_sync"),
             data_stale=data_stale,
             cache_age_minutes=cache_age_minutes,
@@ -335,7 +349,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             return
 
         if event.startswith("listing"):
-            await self.async_request_refresh()
+            await self.async_force_full_sync()
             return
 
         await self.async_request_refresh()
@@ -389,6 +403,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     last_sync=now,
                     last_listing_sync=cache.get("last_listing_sync"),
                     last_reservation_sync=now,
+                    last_full_reservation_sync=cache.get("last_full_reservation_sync"),
                     last_incremental_sync=now,
                     data_stale=False,
                     cache_age_minutes=0.0,
@@ -416,9 +431,12 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 last_sync=self.data.last_sync,
                 last_listing_sync=self.data.last_listing_sync,
                 last_reservation_sync=self.data.last_reservation_sync,
+                last_full_reservation_sync=self.data.last_full_reservation_sync,
                 last_incremental_sync=self.data.last_incremental_sync,
                 data_stale=self.data.data_stale,
-                cache_age_minutes=self._calculate_cache_age_minutes(self.data.last_sync),
+                cache_age_minutes=self._calculate_cache_age_minutes(
+                    self.data.last_sync
+                ),
                 sync_status=self.data.sync_status,
                 last_error=self.data.last_error,
                 webhook_active=self._webhook_active,
@@ -441,8 +459,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         return [
             reservation
             for reservation in self.data.reservations
-            if reservation.listing_id == listing_id
-            and reservation.is_active_status()
+            if reservation.listing_id == listing_id and reservation.is_active_status()
         ]
 
     def _calculate_occupancy(
@@ -456,9 +473,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             for listing_id, listing in listings.items()
         }
 
-    def _fire_occupancy_events(
-        self, occupancy: dict[str, ListingOccupancy]
-    ) -> None:
+    def _fire_occupancy_events(self, occupancy: dict[str, ListingOccupancy]) -> None:
         """Fire events when occupancy changes."""
         for listing_id, state in occupancy.items():
             previous = self._previous_occupancy.get(listing_id)

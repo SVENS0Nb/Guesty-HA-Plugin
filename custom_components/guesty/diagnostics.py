@@ -8,9 +8,21 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_CLIENT_ID, CONF_CLIENT_SECRET, DOMAIN
+from .const import (
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    CONF_GUESTY_WEBHOOK_ID,
+    CONF_WEBHOOK_ID,
+    DOMAIN,
+)
 
-TO_REDACT = {CONF_CLIENT_ID, CONF_CLIENT_SECRET, "access_token"}
+TO_REDACT = {
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    CONF_GUESTY_WEBHOOK_ID,
+    CONF_WEBHOOK_ID,
+    "access_token",
+}
 
 
 async def async_get_config_entry_diagnostics(
@@ -38,6 +50,7 @@ async def async_get_config_entry_diagnostics(
             "last_sync": data.last_sync,
             "last_listing_sync": data.last_listing_sync,
             "last_reservation_sync": data.last_reservation_sync,
+            "last_full_reservation_sync": data.last_full_reservation_sync,
             "last_incremental_sync": data.last_incremental_sync,
             "last_error": data.last_error,
             "webhook_active": data.webhook_active,

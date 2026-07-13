@@ -10,7 +10,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.util import dt as dt_util
 
-from .models import GuestyListing, GuestyReservation, get_next_transition
+from .models import get_next_transition
 
 if TYPE_CHECKING:
     from .coordinator import GuestyDataUpdateCoordinator

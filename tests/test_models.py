@@ -10,8 +10,6 @@ from types import ModuleType
 from unittest.mock import MagicMock
 import zoneinfo
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 GUESTY_PATH = ROOT / "custom_components" / "guesty"
 TZ = zoneinfo.ZoneInfo("Europe/Berlin")
@@ -206,3 +204,28 @@ def test_next_transition_returns_check_in() -> None:
         datetime(2026, 7, 10, 10, 0, tzinfo=TZ),
     )
     assert transition == datetime(2026, 7, 13, 15, 0, tzinfo=TZ)
+
+
+def test_unknown_timezone_uses_home_assistant_timezone(monkeypatch) -> None:
+    """Unknown Guesty timezone names retain aware datetime values."""
+    listing = _listing()
+    listing.timezone = "Invalid/Timezone"
+    monkeypatch.setattr(models.dt_util, "get_time_zone", lambda value: None)
+
+    check_in = _reservation().check_in_datetime(listing)
+
+    assert check_in.tzinfo == TZ
+
+
+def test_merge_tolerates_invalid_localized_dates() -> None:
+    """Malformed API dates do not crash incremental cache pruning."""
+    reservation = _reservation(check_in_date="invalid")
+
+    merged = models.merge_reservations(
+        [reservation],
+        [],
+        days_past=30,
+        days_future=365,
+    )
+
+    assert merged == [reservation]
