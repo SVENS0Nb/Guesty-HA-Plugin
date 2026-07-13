@@ -40,6 +40,7 @@ class GuestyStorage:
             "last_sync": None,
             "last_listing_sync": None,
             "last_reservation_sync": None,
+            "last_full_reservation_sync": None,
             "last_incremental_sync": None,
             "last_error": None,
         }
@@ -60,6 +61,5 @@ class GuestyStorage:
     def reservations_from_cache(data: dict[str, Any]) -> list[GuestyReservation]:
         """Deserialize reservations from cache."""
         return [
-            GuestyReservation.from_dict(item)
-            for item in data.get("reservations") or []
+            GuestyReservation.from_dict(item) for item in data.get("reservations") or []
         ]

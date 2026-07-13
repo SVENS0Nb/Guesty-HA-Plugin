@@ -37,6 +37,12 @@ def _combine_date_time(
 ) -> datetime:
     """Combine localized date and time in the listing timezone."""
     tz = dt_util.get_time_zone(timezone) if timezone else dt_util.DEFAULT_TIME_ZONE
+    if tz is None:
+        _LOGGER.warning(
+            "Unknown Guesty listing timezone %r; using Home Assistant timezone",
+            timezone,
+        )
+        tz = dt_util.DEFAULT_TIME_ZONE
     return datetime.combine(day, clock, tzinfo=tz)
 
 
@@ -226,8 +232,8 @@ class GuestyReservation:
         """Return whether the listing is occupied at a given moment."""
         if not self.is_active_status():
             return False
-        return self.check_in_datetime(listing) <= moment < self.check_out_datetime(
-            listing
+        return (
+            self.check_in_datetime(listing) <= moment < self.check_out_datetime(listing)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -307,7 +313,7 @@ def calculate_listing_occupancy(
         try:
             check_in = reservation.check_in_datetime(listing)
             check_out = reservation.check_out_datetime(listing)
-        except ValueError:
+        except (TypeError, ValueError):
             _LOGGER.debug("Skipping invalid reservation %s", reservation.id)
             continue
 
@@ -351,7 +357,7 @@ def get_next_transition(
             transitions.append(
                 occupancy.current_reservation.check_out_datetime(listing)
             )
-        except ValueError:
+        except (TypeError, ValueError):
             pass
 
     if occupancy.next_check_in:
@@ -371,7 +377,7 @@ def reservation_overlaps_range(
     try:
         check_in = reservation.check_in_datetime(listing)
         check_out = reservation.check_out_datetime(listing)
-    except ValueError:
+    except (TypeError, ValueError):
         return False
     return check_in < end and check_out > start
 
@@ -448,12 +454,16 @@ def merge_reservations(
             continue
         try:
             checkout_day = date.fromisoformat(reservation.check_out_date)
-        except ValueError:
+            checkin_day = (
+                date.fromisoformat(reservation.check_in_date)
+                if reservation.check_in_date
+                else None
+            )
+        except (TypeError, ValueError):
             pruned.append(reservation)
             continue
         if checkout_day >= window_start and (
-            not reservation.check_in_date
-            or date.fromisoformat(reservation.check_in_date) <= window_end
+            checkin_day is None or checkin_day <= window_end
         ):
             pruned.append(reservation)
 

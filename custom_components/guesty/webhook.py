@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+
 async def async_setup_webhook(
     hass: Any,
     entry: Any,
@@ -29,28 +30,37 @@ async def async_setup_webhook(
             payload = await request.json()
         except Exception:
             _LOGGER.warning("Guesty webhook received invalid JSON")
-            return webhook.Response(status=400, body="invalid json")
+            return web.Response(status=400, body="invalid json")
+
+        if not isinstance(payload, dict):
+            _LOGGER.warning("Guesty webhook received a non-object JSON payload")
+            return web.Response(status=400, body="invalid payload")
 
         _LOGGER.debug(
             "Guesty webhook received: %s",
             payload.get("event") or payload.get("type"),
         )
         await coordinator.async_handle_webhook(payload)
-        return webhook.Response(status=200)
+        return web.Response(status=200)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
     if not webhook_id:
-        webhook_id = webhook.async_register(
-            hass,
-            DOMAIN,
-            f"Guesty {entry.title}",
-            handle_webhook,
-            allowed_methods=("POST",),
-        )
+        webhook_id = webhook.async_generate_id()
         hass.config_entries.async_update_entry(
             entry,
             data={**entry.data, CONF_WEBHOOK_ID: webhook_id},
         )
+
+    # Ensure reloads always bind the stable URL to the current coordinator.
+    webhook.async_unregister(hass, webhook_id)
+    webhook.async_register(
+        hass,
+        DOMAIN,
+        f"Guesty {entry.title}",
+        webhook_id,
+        handle_webhook,
+        allowed_methods=("POST",),
+    )
 
     return webhook_id
 
@@ -69,13 +79,10 @@ async def async_register_guesty_webhook(
     try:
         base_url = get_url(hass, prefer_external=True, allow_internal=False)
     except NoURLAvailableError:
-        try:
-            base_url = get_url(hass, prefer_external=False, allow_internal=True)
-        except NoURLAvailableError:
-            _LOGGER.warning(
-                "No Home Assistant URL available; Guesty webhooks not registered"
-            )
-            return None
+        _LOGGER.warning(
+            "No external Home Assistant URL available; Guesty webhooks not registered"
+        )
+        return None
 
     webhook_url = f"{base_url.rstrip('/')}/api/webhook/{webhook_id}"
     existing_id = entry.data.get(CONF_GUESTY_WEBHOOK_ID)
@@ -96,5 +103,5 @@ async def async_register_guesty_webhook(
         entry,
         data={**entry.data, CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id},
     )
-    _LOGGER.info("Guesty webhook registered at %s", webhook_url)
+    _LOGGER.info("Guesty webhook registered successfully")
     return guesty_webhook_id

@@ -37,7 +37,7 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 
 1. HACS installieren (falls noch nicht vorhanden)
 2. **HACS** → **Integrations** → **⋮** → **Custom repositories**
-3. Repository-URL hinzufügen: `https://github.com/svenbeck/guesty-homeassistant`
+3. Repository-URL hinzufügen: `https://github.com/SVENS0Nb/Guesty-HA-Plugin`
 4. Kategorie: **Integration**
 5. **Guesty** suchen und installieren
 6. Home Assistant neu starten

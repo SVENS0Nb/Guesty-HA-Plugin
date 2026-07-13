@@ -36,7 +36,9 @@ def _add_listing_entities(
     if not new_ids:
         return
 
-    entities = [GuestyOccupancySensor(coordinator, listing_id) for listing_id in new_ids]
+    entities = [
+        GuestyOccupancySensor(coordinator, listing_id) for listing_id in new_ids
+    ]
     async_add_entities(entities)
     known_ids.update(new_ids)
 
@@ -64,7 +66,9 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(_handle_coordinator_update))
 
 
-class GuestyOccupancySensor(CoordinatorEntity[GuestyDataUpdateCoordinator], SensorEntity):
+class GuestyOccupancySensor(
+    CoordinatorEntity[GuestyDataUpdateCoordinator], SensorEntity
+):
     """Representation of a Guesty listing occupancy sensor."""
 
     _attr_device_class = SensorDeviceClass.ENUM
@@ -218,6 +222,7 @@ class GuestySyncStatusSensor(
             "last_sync": data.last_sync,
             "last_listing_sync": data.last_listing_sync,
             "last_reservation_sync": data.last_reservation_sync,
+            "last_full_reservation_sync": data.last_full_reservation_sync,
             "last_incremental_sync": data.last_incremental_sync,
             "cache_age_minutes": data.cache_age_minutes,
             "data_stale": data.data_stale,
