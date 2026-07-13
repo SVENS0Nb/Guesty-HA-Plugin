@@ -1,7 +1,4 @@
-# Guesty brand asset
+# Guesty Sync brand asset
 
-`icon.png` is the official Guesty site icon published at:
-
-https://www.guesty.com/wp-content/uploads/2025/06/cropped-guesty-favicon-270x270.png
-
-The image is included unchanged for product identification in Home Assistant and HACS.
+`icon.png` is the custom Guesty Sync logo designed and supplied by the repository
+owner for this Home Assistant integration. The image is included unchanged.
