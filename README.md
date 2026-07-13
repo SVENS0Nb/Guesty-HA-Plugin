@@ -18,12 +18,16 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Diagnostics** – exportierbar über Home Assistant
 - **API Retries** – exponentielles Backoff bei temporären Fehlern
 - **Datenschutzmodus** – Gastnamen und Bestätigungscodes sind standardmäßig verborgen
+- **Sicherer Gast-Türzugang** – ein zeitlich begrenzter Link pro Reservierung mit
+  bis zu zwei serverseitig zugeordneten Home-Assistant-Schlössern
 
 ## Voraussetzungen
 
 - Home Assistant 2025.12 oder neuer
 - Guesty Open API Zugang (Client ID + Client Secret)
 - Für Webhooks: erreichbare externe Home Assistant URL (z. B. Nabu Casa)
+- Für Gast-Türzugang: eine in Home Assistant eingetragene externe **HTTPS**-URL;
+  HTTP wird aus Sicherheitsgründen abgelehnt
 
 ### API-Schlüssel erstellen
 
@@ -67,6 +71,69 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Zukünftige Tage | 365 | Reservierungsfenster in die Zukunft |
 | Stale-Schwellenwert | 6 h | Ab wann Daten als veraltet gelten |
 | Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Entitäten anzeigen; sensible Attribute werden nicht im Recorder gespeichert |
+| Sicherer Gast-Türzugang | Aus | Erst nach weiterer Konfiguration werden Reservierungslinks erzeugt |
+
+## Zeitlich begrenzter Gast-Türzugang
+
+Die Integration kann pro Guesty-Listing ein oder zwei vorhandene
+Home-Assistant-Entitäten aus der Domain `lock` zuordnen. Für jede aktive
+Reservierung wird **ein** geschützter Link erzeugt. Auf der Seite erscheinen
+Schaltflächen wie „Haustür öffnen“ oder „Wohnungstür öffnen“.
+
+Ein Aufruf des Links per `GET` öffnet niemals eine Tür. Erst eine kleine,
+CSRF-geschützte `POST`-Anfrage nach einem bewussten Tastendruck kann
+`lock.unlock` auslösen. Dabei werden Reservierungsstatus, Listing-Zuordnung,
+Zeitfenster und Schlosszuordnung erneut serverseitig geprüft. Der Browser kann
+keine beliebige Entity-ID übergeben.
+
+### Einrichtung
+
+1. In Guesty unter **Operations → Portfolio → Custom fields → Reservations**
+   ein Feld vom Typ **Text** anlegen, zum Beispiel `Door access link`.
+2. Der Guesty-API-Anwendung Leserechte für Account-Custom-Fields sowie
+   Schreibrechte für Reservierungs-Custom-Fields geben.
+3. In Home Assistant bei der Guesty-Integration **Konfigurieren** öffnen und
+   **Sicheren Gast-Türzugang** aktivieren.
+4. Name oder ID des Custom Fields angeben. Der Standardname
+   `Door access link` wird automatisch über die Guesty API aufgelöst.
+5. Listings auswählen und jedem Listing ein oder zwei `lock.*`-Entitäten sowie
+   gastfreundliche Türnamen zuordnen.
+6. Optional eine Freigabe vor Check-in oder nach Check-out einstellen.
+7. In Guesty die erzeugte Custom-Field-Variable, zum Beispiel
+   `{{door_access_link}}`, im Guest-App-Check-in-Text oder in einer
+   automatisierten Nachricht verwenden.
+
+Das Custom Field enthält ausschließlich die URL, damit Guesty sie als Link
+darstellen kann. Die Integration verwendet dafür den aktuellen Guesty-v3-
+Endpunkt für Reservierungs-Custom-Fields.
+
+### Lebenszyklus und Ausfallsicherheit
+
+- Bestätigte Reservierung: Token und Guesty-Link werden erzeugt.
+- Datum, Listing oder Schlosszuordnung geändert: Der alte Token wird sofort
+  ungültig und ein neuer Link wird veröffentlicht.
+- Stornierung, Löschung, Check-out oder deaktivierte Funktion: Der Zugriff wird
+  zuerst lokal gesperrt; anschließend wird das Guesty-Feld gelöscht.
+- Veraltete Guesty-Daten: Der Türzugang arbeitet „fail closed“ und verweigert
+  die Öffnung, bis wieder aktuelle Reservierungsdaten vorliegen.
+- Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
+
+### Reverse-Proxy-Sicherheit
+
+- `/api/guesty/access/` muss `GET` und `POST` unverändert an Home Assistant
+  weiterleiten und darf nicht gecacht werden.
+- Für diesen Pfad keine zusätzliche Login-Seite des Reverse Proxys erzwingen;
+  der lange Zufallstoken, das kurze Aktions-Nonce und die Zeitprüfung übernehmen
+  die Gastautorisierung.
+- Der Reservierungstoken steht in der URL. Access-Logs des Reverse Proxys für
+  `/api/guesty/access/` deshalb deaktivieren oder den Pfad redigieren.
+- TLS, korrekte `X-Forwarded-Proto`-/Host-Header und Home Assistants
+  `trusted_proxies` korrekt konfigurieren.
+
+Zusätzliche Schutzmaßnahmen sind ein 5-Sekunden-Cooldown, maximal zehn gültige
+Aktionen pro Minute und Schloss, restriktive Browser-Header sowie das lokale
+Event `guesty_door_access`. Das Event enthält Reservierungs-ID, Listing-ID,
+Schloss-Entity und Ergebnis, aber weder Gastnamen noch Zugriffstoken.
 
 ## Entitäten
 

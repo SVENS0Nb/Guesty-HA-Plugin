@@ -17,6 +17,16 @@ CONF_RESERVATION_DAYS_PAST: Final = "reservation_days_past"
 CONF_RESERVATION_DAYS_FUTURE: Final = "reservation_days_future"
 CONF_STALE_THRESHOLD_HOURS: Final = "stale_threshold_hours"
 CONF_EXPOSE_GUEST_DETAILS: Final = "expose_guest_details"
+CONF_ACCESS_ENABLED: Final = "access_enabled"
+CONF_ACCESS_CUSTOM_FIELD: Final = "access_custom_field"
+CONF_ACCESS_EARLY_MINUTES: Final = "access_early_minutes"
+CONF_ACCESS_LATE_MINUTES: Final = "access_late_minutes"
+CONF_ACCESS_LISTINGS: Final = "access_listings"
+CONF_ACCESS_LOCK_MAPPINGS: Final = "access_lock_mappings"
+CONF_ACCESS_LOCK_1: Final = "access_lock_1"
+CONF_ACCESS_LOCK_1_NAME: Final = "access_lock_1_name"
+CONF_ACCESS_LOCK_2: Final = "access_lock_2"
+CONF_ACCESS_LOCK_2_NAME: Final = "access_lock_2_name"
 CONF_WEBHOOK_ID: Final = "webhook_id"
 CONF_GUESTY_WEBHOOK_ID: Final = "guesty_webhook_id"
 
@@ -26,6 +36,10 @@ DEFAULT_RESERVATION_DAYS_PAST: Final = 30
 DEFAULT_RESERVATION_DAYS_FUTURE: Final = 365
 DEFAULT_STALE_THRESHOLD_HOURS: Final = 6
 DEFAULT_EXPOSE_GUEST_DETAILS: Final = False
+DEFAULT_ACCESS_ENABLED: Final = False
+DEFAULT_ACCESS_CUSTOM_FIELD: Final = "Door access link"
+DEFAULT_ACCESS_EARLY_MINUTES: Final = 0
+DEFAULT_ACCESS_LATE_MINUTES: Final = 0
 
 # Use a quicker listing fallback only while push updates are unavailable.
 WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL: Final = 900
@@ -101,6 +115,15 @@ WEBHOOK_EVENTS: Final = (
 )
 
 EVENT_OCCUPANCY_CHANGED: Final = "guesty_occupancy_changed"
+EVENT_DOOR_ACCESS: Final = "guesty_door_access"
+
+ACCESS_URL_PATH: Final = "/api/guesty/access"
+ACCESS_TOKEN_BYTES: Final = 32
+ACCESS_ACTION_NONCE_SECONDS: Final = 120
+ACCESS_UNLOCK_COOLDOWN_SECONDS: Final = 5
+ACCESS_RATE_LIMIT_WINDOW_SECONDS: Final = 60
+ACCESS_RATE_LIMIT_MAX_ACTIONS: Final = 10
+ACCESS_MAX_REQUEST_BYTES: Final = 4096
 
 SENSOR_OCCUPANCY: Final = "occupancy"
 SENSOR_CURRENT_GUEST: Final = "current_guest"

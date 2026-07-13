@@ -9,6 +9,9 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty.const import (
+    CONF_ACCESS_CUSTOM_FIELD,
+    CONF_ACCESS_ENABLED,
+    CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     DOMAIN,
@@ -59,6 +62,15 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_CLIENT_ID: "private-client", CONF_CLIENT_SECRET: "private-secret"},
+        options={
+            CONF_ACCESS_ENABLED: True,
+            CONF_ACCESS_CUSTOM_FIELD: "private-field-id",
+            CONF_ACCESS_LOCK_MAPPINGS: {
+                "private-listing-id": [
+                    {"entity_id": "lock.private_door", "name": "Private door"}
+                ]
+            },
+        },
     )
     entry.add_to_hass(hass)
     listing = GuestyListing(
@@ -102,3 +114,6 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "Private nickname" not in serialized
     assert "legacy response body" not in serialized
     assert "private-secret" not in serialized
+    assert "private-field-id" not in serialized
+    assert "lock.private_door" not in serialized
+    assert diagnostics["guest_access"]["mapped_locks"] == 1

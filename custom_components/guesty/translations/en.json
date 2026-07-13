@@ -34,16 +34,44 @@
     "step": {
       "init": {
         "title": "Guesty settings",
-        "description": "Adjust sync intervals, reservation window and stale threshold.",
+        "description": "Adjust synchronization and optionally enable secure, reservation-scoped door access.",
         "data": {
           "scan_interval": "Reservation sync (seconds)",
           "listing_sync_interval": "Listing sync (seconds)",
           "reservation_days_past": "Past days for reservations",
           "reservation_days_future": "Future days for reservations",
           "stale_threshold_hours": "Stale threshold (hours)",
-          "expose_guest_details": "Show guest names and confirmation codes in entities"
+          "expose_guest_details": "Show guest names and confirmation codes in entities",
+          "access_enabled": "Enable secure guest door access"
+        }
+      },
+      "access": {
+        "title": "Guest door access",
+        "description": "Create a Guesty reservation custom field of type Text first. The integration writes one protected access link per active reservation. The link never unlocks a door directly.",
+        "data": {
+          "access_custom_field": "Guesty custom field name or ID",
+          "access_early_minutes": "Enable access before check-in (minutes)",
+          "access_late_minutes": "Keep access after check-out (minutes)",
+          "access_listings": "Listings with guest door access"
+        }
+      },
+      "listing": {
+        "title": "Locks for {listing}",
+        "description": "Select one or two Home Assistant lock entities. These server-side assignments cannot be changed by a guest link.",
+        "data": {
+          "access_lock_1": "First lock",
+          "access_lock_1_name": "First door label",
+          "access_lock_2": "Second lock (optional)",
+          "access_lock_2_name": "Second door label"
         }
       }
+    },
+    "error": {
+      "select_listing": "Select at least one listing",
+      "same_lock": "The same lock cannot be assigned twice"
+    },
+    "abort": {
+      "no_listings": "No Guesty listings are currently available"
     }
   },
   "entity": {

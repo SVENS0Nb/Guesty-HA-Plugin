@@ -34,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 PAGE_LIMIT = 100
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+OBJECT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 
 
 def is_safe_resource_id(value: Any) -> bool:
@@ -196,6 +197,89 @@ class GuestyApiClient:
         if isinstance(data, dict):
             return GuestyReservation.from_api(data)
         return None
+
+    async def async_resolve_custom_field(self, reference: str) -> str:
+        """Resolve a Guesty custom field name, variable, or id."""
+        value = reference.strip()
+        if OBJECT_ID_PATTERN.fullmatch(value):
+            return value
+
+        await self._async_ensure_token()
+        account = await self._async_request("GET", "/accounts/me")
+        if not isinstance(account, dict):
+            raise GuestyApiError("Unexpected Guesty account response")
+        account_id = account.get("_id") or account.get("id")
+        self._validate_resource_id(account_id, "account")
+
+        data = await self._async_request("GET", f"/accounts/{account_id}/custom-fields")
+        fields = self._normalize_results(data)
+        if isinstance(data, dict) and not fields:
+            for key in ("customFields", "fields"):
+                items = data.get(key)
+                if isinstance(items, list):
+                    fields = [item for item in items if isinstance(item, dict)]
+                    break
+
+        normalized_reference = self._normalize_custom_field_name(value)
+        matches: list[str] = []
+        for field in fields:
+            field_id = field.get("_id") or field.get("id") or field.get("fieldId")
+            if not is_safe_resource_id(field_id):
+                continue
+            candidates = (
+                field.get("displayName"),
+                field.get("name"),
+                field.get("variable"),
+                field.get("key"),
+            )
+            if any(
+                self._normalize_custom_field_name(candidate) == normalized_reference
+                for candidate in candidates
+                if isinstance(candidate, str)
+            ):
+                matches.append(field_id)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise GuestyApiError("Guesty custom field name is not unique")
+        raise GuestyNotFoundError("Guesty custom field not found")
+
+    async def async_update_reservation_custom_field(
+        self,
+        reservation_id: str,
+        field_id: str,
+        value: str,
+    ) -> None:
+        """Set a reservation custom field using the current v3 endpoint."""
+        self._validate_resource_id(reservation_id, "reservation")
+        self._validate_resource_id(field_id, "custom field")
+        await self._async_request(
+            "PUT",
+            f"/reservations-v3/{reservation_id}/custom-fields",
+            json_body={"customFields": [{"fieldId": field_id, "value": value}]},
+        )
+
+    async def async_delete_reservation_custom_field(
+        self,
+        reservation_id: str,
+        field_id: str,
+    ) -> None:
+        """Delete a reservation custom field, ignoring already absent values."""
+        self._validate_resource_id(reservation_id, "reservation")
+        self._validate_resource_id(field_id, "custom field")
+        try:
+            await self._async_request(
+                "DELETE",
+                f"/reservations-v3/{reservation_id}/custom-fields/{field_id}",
+            )
+        except GuestyNotFoundError:
+            return
+
+    @staticmethod
+    def _normalize_custom_field_name(value: str) -> str:
+        """Normalize Guesty display names and {{variables}} for matching."""
+        return re.sub(r"[^a-z0-9]", "", value.lower())
 
     async def async_register_webhook(self, url: str) -> str:
         """Register Guesty webhooks and return the webhook id."""
