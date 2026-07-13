@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -37,6 +37,10 @@ def _load_coordinator() -> ModuleType:
     update_coordinator = ModuleType("homeassistant.helpers.update_coordinator")
 
     class DataUpdateCoordinator:
+        def __init__(self, *args, **kwargs) -> None:
+            self.update_interval = kwargs["update_interval"]
+            self.data = None
+
         @classmethod
         def __class_getitem__(cls, item):
             return cls
@@ -45,7 +49,6 @@ def _load_coordinator() -> ModuleType:
     update_coordinator.UpdateFailed = RuntimeError
 
     dt_util = ModuleType("homeassistant.util.dt")
-    dt_util.timedelta = timedelta
     dt_util.utcnow = lambda: NOW
     dt_util.parse_datetime = lambda value: (
         None if value == "invalid" else datetime.fromisoformat(value)
@@ -94,6 +97,19 @@ def _load_coordinator() -> ModuleType:
 
 
 coordinator = _load_coordinator()
+
+
+def test_coordinator_uses_stdlib_timedelta() -> None:
+    """Coordinator setup does not rely on a Home Assistant timedelta helper."""
+    entry = SimpleNamespace(options={}, data={})
+
+    instance = coordinator.GuestyDataUpdateCoordinator(
+        object(), entry, object(), object()
+    )
+
+    assert instance.update_interval == timedelta(
+        seconds=coordinator.DEFAULT_SCAN_INTERVAL
+    )
 
 
 @pytest.mark.parametrize(

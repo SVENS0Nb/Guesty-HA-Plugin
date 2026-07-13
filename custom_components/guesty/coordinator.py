@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -97,7 +98,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=dt_util.timedelta(
+            update_interval=timedelta(
                 seconds=entry.options.get(
                     CONF_SCAN_INTERVAL,
                     entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
