@@ -9,6 +9,9 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_ACCESS_CUSTOM_FIELD,
+    CONF_ACCESS_ENABLED,
+    CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_ACCESS_TOKEN,
@@ -34,10 +37,25 @@ async def async_get_config_entry_diagnostics(
     coordinator = entry.runtime_data.coordinator
     client = entry.runtime_data.client
     data = coordinator.data
+    options = dict(entry.options)
+    mappings = options.pop(CONF_ACCESS_LOCK_MAPPINGS, {})
+    options.pop(CONF_ACCESS_CUSTOM_FIELD, None)
+    mapped_listings = len(mappings) if isinstance(mappings, dict) else 0
+    mapped_locks = (
+        sum(len(value) for value in mappings.values() if isinstance(value, list))
+        if isinstance(mappings, dict)
+        else 0
+    )
 
     diagnostics: dict[str, Any] = {
         "config_entry": async_redact_data(entry.data, TO_REDACT),
-        "options": dict(entry.options),
+        "options": options,
+        "guest_access": {
+            "enabled": bool(entry.options.get(CONF_ACCESS_ENABLED, False)),
+            "custom_field_configured": CONF_ACCESS_CUSTOM_FIELD in entry.options,
+            "mapped_listings": mapped_listings,
+            "mapped_locks": mapped_locks,
+        },
         "api": {
             "token_expires_at": client.token_expires_at,
             "rate_limit_remaining": client.last_rate_limit_remaining,

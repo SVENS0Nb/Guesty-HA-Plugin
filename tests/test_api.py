@@ -254,3 +254,53 @@ async def test_deleted_reservation_returns_none(monkeypatch) -> None:
     )
 
     assert await client.async_get_reservation("reservation-1") is None
+
+
+@pytest.mark.asyncio
+async def test_custom_field_name_is_resolved_once_from_account(monkeypatch) -> None:
+    """Users can configure the Guesty display name instead of an opaque id."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {"_id": "account-1"},
+            [
+                {
+                    "_id": "65fab102a5284d73c6206db0",
+                    "displayName": "Door access link",
+                    "variable": "door_access_link",
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    assert await client.async_resolve_custom_field("{{door_access_link}}") == (
+        "65fab102a5284d73c6206db0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
+    """Door links never use Guesty's retired reservation field endpoint."""
+    client = _client()
+    request = AsyncMock(return_value={})
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_custom_field(
+        "reservation-1",
+        "65fab102a5284d73c6206db0",
+        "https://ha.test/access",
+    )
+
+    request.assert_awaited_once_with(
+        "PUT",
+        "/reservations-v3/reservation-1/custom-fields",
+        json_body={
+            "customFields": [
+                {
+                    "fieldId": "65fab102a5284d73c6206db0",
+                    "value": "https://ha.test/access",
+                }
+            ]
+        },
+    )

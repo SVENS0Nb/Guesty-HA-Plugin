@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 
 from .api import (
     GuestyApiClient,
@@ -20,6 +21,16 @@ from .api import (
 )
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_ACCESS_CUSTOM_FIELD,
+    CONF_ACCESS_EARLY_MINUTES,
+    CONF_ACCESS_ENABLED,
+    CONF_ACCESS_LATE_MINUTES,
+    CONF_ACCESS_LISTINGS,
+    CONF_ACCESS_LOCK_1,
+    CONF_ACCESS_LOCK_1_NAME,
+    CONF_ACCESS_LOCK_2,
+    CONF_ACCESS_LOCK_2_NAME,
+    CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
@@ -29,6 +40,10 @@ from .const import (
     CONF_STALE_THRESHOLD_HOURS,
     CONF_TOKEN_EXPIRES_AT,
     DEFAULT_EXPOSE_GUEST_DETAILS,
+    DEFAULT_ACCESS_CUSTOM_FIELD,
+    DEFAULT_ACCESS_EARLY_MINUTES,
+    DEFAULT_ACCESS_ENABLED,
+    DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
@@ -74,6 +89,7 @@ OPTIONS_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_EXPOSE_GUEST_DETAILS, default=DEFAULT_EXPOSE_GUEST_DETAILS
         ): bool,
+        vol.Optional(CONF_ACCESS_ENABLED, default=DEFAULT_ACCESS_ENABLED): bool,
     }
 )
 
@@ -151,6 +167,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_RESERVATION_DAYS_FUTURE: DEFAULT_RESERVATION_DAYS_FUTURE,
                         CONF_STALE_THRESHOLD_HOURS: DEFAULT_STALE_THRESHOLD_HOURS,
                         CONF_EXPOSE_GUEST_DETAILS: DEFAULT_EXPOSE_GUEST_DETAILS,
+                        CONF_ACCESS_ENABLED: DEFAULT_ACCESS_ENABLED,
                     },
                 )
 
@@ -208,12 +225,19 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
 class GuestyOptionsFlow(OptionsFlow):
     """Handle Guesty options."""
 
+    _pending_options: dict[str, Any]
+    _pending_mappings: dict[str, list[dict[str, str]]]
+    _listing_queue: list[str]
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage Guesty options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            self._pending_options = {**self.config_entry.options, **user_input}
+            if not user_input.get(CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED):
+                return self.async_create_entry(title="", data=self._pending_options)
+            return await self.async_step_access()
 
         options = self.config_entry.options
         return self.async_show_form(
@@ -240,6 +264,171 @@ class GuestyOptionsFlow(OptionsFlow):
                     CONF_EXPOSE_GUEST_DETAILS: options.get(
                         CONF_EXPOSE_GUEST_DETAILS, DEFAULT_EXPOSE_GUEST_DETAILS
                     ),
+                    CONF_ACCESS_ENABLED: options.get(
+                        CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED
+                    ),
                 },
             ),
+        )
+
+    async def async_step_access(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure global guest access settings and mapped listings."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        listings = coordinator.data.listings if coordinator.data else {}
+        choices = [
+            selector.SelectOptionDict(value=listing_id, label=listing.display_name)
+            for listing_id, listing in sorted(
+                listings.items(), key=lambda item: item[1].display_name.lower()
+            )
+        ]
+        if not choices:
+            return self.async_abort(reason="no_listings")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            selected = user_input.get(CONF_ACCESS_LISTINGS)
+            if not isinstance(selected, list) or not selected:
+                errors["base"] = "select_listing"
+            else:
+                self._pending_options.update(
+                    {
+                        CONF_ACCESS_CUSTOM_FIELD: str(
+                            user_input[CONF_ACCESS_CUSTOM_FIELD]
+                        ).strip(),
+                        CONF_ACCESS_EARLY_MINUTES: int(
+                            user_input[CONF_ACCESS_EARLY_MINUTES]
+                        ),
+                        CONF_ACCESS_LATE_MINUTES: int(
+                            user_input[CONF_ACCESS_LATE_MINUTES]
+                        ),
+                    }
+                )
+                self._listing_queue = list(
+                    dict.fromkeys(
+                        listing_id for listing_id in selected if listing_id in listings
+                    )
+                )
+                if not self._listing_queue:
+                    errors["base"] = "select_listing"
+                else:
+                    self._pending_mappings = {}
+                    return await self.async_step_listing()
+
+        current_mappings = self.config_entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
+        selected_listings = (
+            [listing_id for listing_id in current_mappings if listing_id in listings]
+            if isinstance(current_mappings, dict)
+            else []
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_ACCESS_CUSTOM_FIELD): vol.All(
+                    str, vol.Length(min=1, max=128)
+                ),
+                vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=180)
+                ),
+                vol.Required(CONF_ACCESS_LATE_MINUTES): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=180)
+                ),
+                vol.Required(CONF_ACCESS_LISTINGS): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=choices,
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="access",
+            data_schema=self.add_suggested_values_to_schema(
+                schema,
+                {
+                    CONF_ACCESS_CUSTOM_FIELD: self.config_entry.options.get(
+                        CONF_ACCESS_CUSTOM_FIELD, DEFAULT_ACCESS_CUSTOM_FIELD
+                    ),
+                    CONF_ACCESS_EARLY_MINUTES: self.config_entry.options.get(
+                        CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                    ),
+                    CONF_ACCESS_LATE_MINUTES: self.config_entry.options.get(
+                        CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                    ),
+                    CONF_ACCESS_LISTINGS: selected_listings,
+                },
+            ),
+            errors=errors,
+        )
+
+    async def async_step_listing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Assign one or two lock entities to one selected listing."""
+        listing_id = self._listing_queue[0]
+        coordinator = self.config_entry.runtime_data.coordinator
+        listing = coordinator.data.listings[listing_id]
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            lock_1 = user_input[CONF_ACCESS_LOCK_1]
+            lock_2 = user_input.get(CONF_ACCESS_LOCK_2)
+            if lock_2 and lock_1 == lock_2:
+                errors["base"] = "same_lock"
+            else:
+                doors = [
+                    {
+                        "entity_id": lock_1,
+                        "name": str(
+                            user_input.get(CONF_ACCESS_LOCK_1_NAME) or "Tür 1"
+                        ).strip()[:80],
+                    }
+                ]
+                if lock_2:
+                    doors.append(
+                        {
+                            "entity_id": lock_2,
+                            "name": str(
+                                user_input.get(CONF_ACCESS_LOCK_2_NAME) or "Tür 2"
+                            ).strip()[:80],
+                        }
+                    )
+                self._pending_mappings[listing_id] = doors
+                self._listing_queue.pop(0)
+                if self._listing_queue:
+                    return await self.async_step_listing()
+                self._pending_options[CONF_ACCESS_LOCK_MAPPINGS] = (
+                    self._pending_mappings
+                )
+                return self.async_create_entry(title="", data=self._pending_options)
+
+        current = self.config_entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
+        existing = current.get(listing_id, []) if isinstance(current, dict) else []
+        first = existing[0] if len(existing) > 0 else {}
+        second = existing[1] if len(existing) > 1 else {}
+        lock_selector = selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="lock")
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_ACCESS_LOCK_1): lock_selector,
+                vol.Required(CONF_ACCESS_LOCK_1_NAME): str,
+                vol.Optional(CONF_ACCESS_LOCK_2): lock_selector,
+                vol.Optional(CONF_ACCESS_LOCK_2_NAME): str,
+            }
+        )
+        return self.async_show_form(
+            step_id="listing",
+            data_schema=self.add_suggested_values_to_schema(
+                schema,
+                {
+                    CONF_ACCESS_LOCK_1: first.get("entity_id"),
+                    CONF_ACCESS_LOCK_1_NAME: first.get("name", "Haustür"),
+                    CONF_ACCESS_LOCK_2: second.get("entity_id"),
+                    CONF_ACCESS_LOCK_2_NAME: second.get("name", "Wohnungstür"),
+                },
+            ),
+            errors=errors,
+            description_placeholders={"listing": listing.display_name},
         )

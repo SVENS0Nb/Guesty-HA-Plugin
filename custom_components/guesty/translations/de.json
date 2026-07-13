@@ -34,16 +34,44 @@
     "step": {
       "init": {
         "title": "Guesty Einstellungen",
-        "description": "Passe Sync-Intervalle, Reservierungsfenster und Stale-Schwellenwert an.",
+        "description": "Passe die Synchronisierung an und aktiviere optional einen sicheren, reservierungsbezogenen Türzugang.",
         "data": {
           "scan_interval": "Reservierungs-Sync (Sekunden)",
           "listing_sync_interval": "Listing-Sync (Sekunden)",
           "reservation_days_past": "Vergangene Tage für Reservierungen",
           "reservation_days_future": "Zukünftige Tage für Reservierungen",
           "stale_threshold_hours": "Stale-Schwellenwert (Stunden)",
-          "expose_guest_details": "Gastnamen und Bestätigungscodes in Entitäten anzeigen"
+          "expose_guest_details": "Gastnamen und Bestätigungscodes in Entitäten anzeigen",
+          "access_enabled": "Sicheren Gast-Türzugang aktivieren"
+        }
+      },
+      "access": {
+        "title": "Gast-Türzugang",
+        "description": "Lege zuerst in Guesty ein Reservierungs-Custom-Field vom Typ Text an. Die Integration schreibt pro aktiver Reservierung einen geschützten Zugangslink. Der Link öffnet niemals direkt eine Tür.",
+        "data": {
+          "access_custom_field": "Name oder ID des Guesty-Custom-Fields",
+          "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
+          "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
+          "access_listings": "Listings mit Gast-Türzugang"
+        }
+      },
+      "listing": {
+        "title": "Schlösser für {listing}",
+        "description": "Wähle ein oder zwei Home-Assistant-Schlösser. Diese serverseitige Zuordnung kann durch einen Gastlink nicht verändert werden.",
+        "data": {
+          "access_lock_1": "Erstes Schloss",
+          "access_lock_1_name": "Bezeichnung der ersten Tür",
+          "access_lock_2": "Zweites Schloss (optional)",
+          "access_lock_2_name": "Bezeichnung der zweiten Tür"
         }
       }
+    },
+    "error": {
+      "select_listing": "Wähle mindestens ein Listing aus",
+      "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden"
+    },
+    "abort": {
+      "no_listings": "Derzeit sind keine Guesty-Listings verfügbar"
     }
   },
   "entity": {

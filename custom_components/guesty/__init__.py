@@ -8,6 +8,12 @@ from homeassistant.components import webhook as ha_webhook
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
+from .access import (
+    GuestyAccessManager,
+    GuestyAccessStorage,
+    async_register_access_manager,
+    async_unregister_access_manager,
+)
 from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
 from .const import (
     CONF_ACCESS_TOKEN,
@@ -65,7 +71,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
     scheduler = GuestyTransitionScheduler(hass, coordinator, _on_transition)
     scheduler.async_schedule()
 
-    entry.runtime_data = GuestyRuntimeData(coordinator, client, scheduler)
+    access_manager = GuestyAccessManager(hass, entry, client, coordinator)
+    async_register_access_manager(hass, access_manager)
+    await access_manager.async_setup()
+
+    entry.runtime_data = GuestyRuntimeData(
+        coordinator, client, scheduler, access_manager
+    )
 
     webhook_id = await async_setup_webhook(hass, entry, coordinator)
     if webhook_id:
@@ -76,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
     def _on_coordinator_update() -> None:
         scheduler.async_schedule()
+        access_manager.async_schedule_reconcile()
 
     entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -86,6 +99,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 async def async_unload_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bool:
     """Unload a config entry."""
     entry.runtime_data.scheduler.async_unschedule()
+    access_manager = getattr(entry.runtime_data, "access_manager", None)
+    if access_manager is not None:
+        await access_manager.async_unload()
+    async_unregister_access_manager(hass, entry.entry_id)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
     if webhook_id:
@@ -99,8 +116,19 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> N
     """Remove the remote Guesty webhook when the config entry is deleted."""
     guesty_webhook_id = entry.data.get(CONF_GUESTY_WEBHOOK_ID)
     storage = GuestyStorage(hass, entry.entry_id)
-    if guesty_webhook_id:
-        cached = await storage.async_load()
+    access_storage = GuestyAccessStorage(hass, entry.entry_id)
+    cached = await storage.async_load()
+    access_data = await access_storage.async_load()
+    access_records = access_data.get("records", {})
+    synced_access_records = [
+        (reservation_id, record.get("field_id"))
+        for reservation_id, record in access_records.items()
+        if isinstance(record, dict)
+        and record.get("field_synced")
+        and isinstance(record.get("field_id"), str)
+    ]
+
+    if guesty_webhook_id or synced_access_records:
         client = GuestyApiClient.from_hass(
             hass,
             entry.data[CONF_CLIENT_ID],
@@ -108,11 +136,18 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> N
             cached.get("access_token"),
             cached.get("token_expires_at"),
         )
+    if guesty_webhook_id:
         try:
             await client.async_unregister_webhook(guesty_webhook_id)
         except (GuestyApiError, GuestyAuthError):
             _LOGGER.warning("Could not remove the Guesty webhook subscription")
+    for reservation_id, field_id in synced_access_records:
+        try:
+            await client.async_delete_reservation_custom_field(reservation_id, field_id)
+        except (GuestyApiError, GuestyAuthError):
+            _LOGGER.warning("Could not clear a Guesty door access field during removal")
     await storage.async_remove()
+    await access_storage.async_remove()
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: GuestyConfigEntry) -> None:
