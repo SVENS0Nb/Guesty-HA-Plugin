@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_ACCESS_TOKEN,
     CONF_GUESTY_WEBHOOK_ID,
     CONF_WEBHOOK_ID,
-    DOMAIN,
 )
+from .data import GuestyConfigEntry
 
 TO_REDACT = {
     CONF_CLIENT_ID,
@@ -22,15 +23,16 @@ TO_REDACT = {
     CONF_GUESTY_WEBHOOK_ID,
     CONF_WEBHOOK_ID,
     "access_token",
+    CONF_ACCESS_TOKEN,
 }
 
 
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry
+    hass: HomeAssistant, entry: GuestyConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    client = hass.data[DOMAIN][entry.entry_id]["client"]
+    coordinator = entry.runtime_data.coordinator
+    client = entry.runtime_data.client
     data = coordinator.data
 
     diagnostics: dict[str, Any] = {
@@ -52,16 +54,14 @@ async def async_get_config_entry_diagnostics(
             "last_reservation_sync": data.last_reservation_sync,
             "last_full_reservation_sync": data.last_full_reservation_sync,
             "last_incremental_sync": data.last_incremental_sync,
-            "last_error": data.last_error,
+            "has_last_error": data.last_error is not None,
             "webhook_active": data.webhook_active,
             "listings_count": len(data.listings),
             "reservations_count": len(data.reservations),
         }
         diagnostics["listings"] = [
             {
-                "id": listing.id,
-                "title": listing.title,
-                "nickname": listing.nickname,
+                "id_hash": hashlib.sha256(listing.id.encode()).hexdigest()[:12],
                 "active": listing.active,
                 "occupancy": data.occupancy[listing.id].status
                 if listing.id in data.occupancy

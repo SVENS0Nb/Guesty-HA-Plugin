@@ -7,9 +7,9 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Automatischer Import aller Listings** – jedes Listing wird als Sensor und Kalender angelegt
 - **Belegungs-Sensor pro Listing** – Status `vacant` (frei) oder `occupied` (vermietet)
 - **Punktgenaue Check-in/out Updates** – zeitgesteuerte Neuberechnung ohne API-Polling
-- **Guesty Webhooks** – Echtzeit-Updates bei Reservierungs- und Listing-Änderungen
+- **Guesty Webhooks** – gebündelte Echtzeit-Updates bei Reservierungs- und Listing-Änderungen
 - **Inkrementeller Sync** – nur geänderte Reservierungen + täglicher Vollabgleich
-- **Zweistufiger Sync** – Reservierungen häufig, Listings seltener (parallel)
+- **Traffic-sparsame Listing-Synchronisierung** – Listing-Payloads werden direkt verarbeitet; neue Listings laden nur ihre eigenen Reservierungen
 - **Individuelle Check-in/Check-out Zeiten** – inkl. UTC-Fallback
 - **Kalender pro Listing** – nutzbar in Automationen
 - **Lokaler Cache mit Staleness-Erkennung** – transparent bei API-Ausfällen
@@ -17,17 +17,18 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Custom Event** – `guesty_occupancy_changed` für Automationen
 - **Diagnostics** – exportierbar über Home Assistant
 - **API Retries** – exponentielles Backoff bei temporären Fehlern
+- **Datenschutzmodus** – Gastnamen und Bestätigungscodes sind standardmäßig verborgen
 
 ## Voraussetzungen
 
-- Home Assistant 2024.1 oder neuer
+- Home Assistant 2025.12 oder neuer
 - Guesty Open API Zugang (Client ID + Client Secret)
 - Für Webhooks: erreichbare externe Home Assistant URL (z. B. Nabu Casa)
 
 ### API-Schlüssel erstellen
 
 1. In Guesty einloggen
-2. **Integrations** → **Open API**
+2. **Integrations** → **API & Webhooks**
 3. Neue Application erstellen
 4. **Client ID** und **Client Secret** sichern (Secret wird nur einmal angezeigt)
 
@@ -61,10 +62,11 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Option | Standard | Beschreibung |
 |--------|----------|--------------|
 | Reservierungs-Sync | 300 s | Wie oft Reservierungen abgeglichen werden |
-| Listing-Sync | 86400 s | Wie oft Listings abgefragt werden |
+| Listing-Sync | 86400 s | Sicherheitsabgleich bei aktiven Webhooks; ohne Webhook automatisch spätestens alle 15 Minuten |
 | Vergangene Tage | 30 | Reservierungsfenster in die Vergangenheit |
 | Zukünftige Tage | 365 | Reservierungsfenster in die Zukunft |
 | Stale-Schwellenwert | 6 h | Ab wann Daten als veraltet gelten |
+| Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Sensoren und Kalendern anzeigen; diese Attribute werden nicht im Recorder gespeichert |
 
 ## Entitäten
 
@@ -74,6 +76,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 |---------|----------|--------------|
 | Sensor | `sensor.ferienwohnung_belegung` | `vacant` oder `occupied` |
 | Kalender | `calendar.ferienwohnung_reservierungen` | Alle Reservierungen |
+
+Kalendereinträge zeigen standardmäßig nur „Reserviert“ und den Reservierungsstatus. Gastnamen und Bestätigungscodes können in den Integrationsoptionen aktiviert werden.
 
 Zusätzlich ein Integrations-Sensor:
 
@@ -146,8 +150,8 @@ flowchart TD
     G[Transition Scheduler] -->|Check-in/out Zeit| B
 ```
 
-1. **Polling** – inkrementeller Reservierungsabgleich alle 5 Minuten
-2. **Webhooks** – sofortiger Sync bei Änderungen (wenn externe URL verfügbar)
+1. **Polling** – inkrementeller Reservierungsabgleich alle 5 Minuten; verpasste Listing-Events werden ohne aktiven Webhook spätestens nach 15 Minuten erkannt
+2. **Webhooks** – Änderungen werden nach einer kurzen 0,75-s-Sammelphase verarbeitet; Duplikate und Ereignis-Bursts erzeugen dadurch möglichst wenige API-Aufrufe
 3. **Scheduler** – Belegung wechselt punktgenau bei Check-in/out
 4. **Täglicher Vollsync** – verhindert Drift im Cache
 
@@ -163,8 +167,8 @@ Check-in/out Zeiten in dieser Priorität:
 ## Tests
 
 ```bash
-pip install pytest
-pytest tests/
+python -m pip install -r requirements-test.txt
+python -m pytest
 ```
 
 ## Fehlerbehebung

@@ -8,10 +8,13 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from homeassistant.components import webhook
 
+from .api import GuestyApiError, GuestyAuthError
+
 if TYPE_CHECKING:
     from .coordinator import GuestyDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+MAX_WEBHOOK_BODY_BYTES = 1_000_000
 
 
 async def async_setup_webhook(
@@ -20,15 +23,17 @@ async def async_setup_webhook(
     coordinator: GuestyDataUpdateCoordinator,
 ) -> str | None:
     """Register the Home Assistant webhook endpoint."""
-    from .const import CONF_WEBHOOK_ID, DOMAIN
+    from .const import CONF_WEBHOOK_ID, DOMAIN, WEBHOOK_EVENTS
 
     async def handle_webhook(
         hass: Any, webhook_id: str, request: web.Request
     ) -> web.Response:
         """Handle incoming Guesty webhook payloads."""
+        if (getattr(request, "content_length", None) or 0) > MAX_WEBHOOK_BODY_BYTES:
+            return web.Response(status=413, body="payload too large")
         try:
             payload = await request.json()
-        except Exception:
+        except (ValueError, TypeError):
             _LOGGER.warning("Guesty webhook received invalid JSON")
             return web.Response(status=400, body="invalid json")
 
@@ -36,12 +41,16 @@ async def async_setup_webhook(
             _LOGGER.warning("Guesty webhook received a non-object JSON payload")
             return web.Response(status=400, body="invalid payload")
 
-        _LOGGER.debug(
-            "Guesty webhook received: %s",
-            payload.get("event") or payload.get("type"),
+        event = (payload.get("event") or payload.get("type") or "").lower()
+        if event not in WEBHOOK_EVENTS:
+            _LOGGER.debug("Ignoring unsupported Guesty webhook event %r", event)
+            return web.Response(status=202)
+
+        hass.async_create_task(
+            coordinator.async_handle_webhook(payload),
+            f"guesty_webhook_{event}",
         )
-        await coordinator.async_handle_webhook(payload)
-        return web.Response(status=200)
+        return web.Response(status=202)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
     if not webhook_id:
@@ -86,18 +95,28 @@ async def async_register_guesty_webhook(
 
     webhook_url = f"{base_url.rstrip('/')}/api/webhook/{webhook_id}"
     existing_id = entry.data.get(CONF_GUESTY_WEBHOOK_ID)
-
     if existing_id:
         try:
-            await client.async_unregister_webhook(existing_id)
-        except Exception:
-            _LOGGER.debug("Could not unregister previous Guesty webhook")
+            if await client.async_webhook_matches(existing_id, webhook_url):
+                return existing_id
+        except (GuestyApiError, GuestyAuthError) as err:
+            # Do not create duplicates during a temporary Guesty outage. The
+            # adaptive polling fallback keeps data current until verification
+            # succeeds on the next integration reload.
+            _LOGGER.warning("Could not verify the Guesty webhook: %s", err)
+            return None
 
     try:
         guesty_webhook_id = await client.async_register_webhook(webhook_url)
-    except Exception as err:
+    except (GuestyApiError, GuestyAuthError) as err:
         _LOGGER.warning("Failed to register Guesty webhook: %s", err)
         return None
+
+    if existing_id and existing_id != guesty_webhook_id:
+        try:
+            await client.async_unregister_webhook(existing_id)
+        except (GuestyApiError, GuestyAuthError):
+            _LOGGER.debug("Could not remove the obsolete Guesty webhook")
 
     hass.config_entries.async_update_entry(
         entry,

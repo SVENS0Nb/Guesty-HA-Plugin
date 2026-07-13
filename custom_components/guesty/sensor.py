@@ -3,35 +3,34 @@
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_EXPOSE_GUEST_DETAILS,
     CONF_STALE_THRESHOLD_HOURS,
+    DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
     SENSOR_OCCUPANCY,
     SENSOR_SYNC_STATUS,
 )
 from .coordinator import GuestyDataUpdateCoordinator
+from .data import GuestyConfigEntry
 from .models import ListingOccupancy
 
 
 def _add_listing_entities(
     coordinator: GuestyDataUpdateCoordinator,
-    entry: ConfigEntry,
-    hass: HomeAssistant,
+    entry: GuestyConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create sensors for all listings not yet registered."""
     if not coordinator.data:
         return
 
-    known_ids: set[str] = hass.data[DOMAIN][entry.entry_id].setdefault(
-        "sensor_listing_ids", set()
-    )
+    known_ids = entry.runtime_data.sensor_listing_ids
     new_ids = set(coordinator.data.listings) - known_ids
     if not new_ids:
         return
@@ -45,23 +44,21 @@ def _add_listing_entities(
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: GuestyConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Guesty occupancy sensors for every listing."""
-    coordinator: GuestyDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
+    coordinator = entry.runtime_data.coordinator
 
     entities: list[SensorEntity] = [GuestySyncStatusSensor(coordinator)]
     async_add_entities(entities)
 
-    _add_listing_entities(coordinator, entry, hass, async_add_entities)
+    _add_listing_entities(coordinator, entry, async_add_entities)
 
     @callback
     def _handle_coordinator_update() -> None:
         """Add sensors when Guesty returns new listings."""
-        _add_listing_entities(coordinator, entry, hass, async_add_entities)
+        _add_listing_entities(coordinator, entry, async_add_entities)
 
     entry.async_on_unload(coordinator.async_add_listener(_handle_coordinator_update))
 
@@ -76,6 +73,14 @@ class GuestyOccupancySensor(
     _attr_has_entity_name = True
     _attr_translation_key = SENSOR_OCCUPANCY
     _attr_entity_registry_enabled_default = True
+    _unrecorded_attributes = frozenset(
+        {
+            "current_guest",
+            "current_confirmation_code",
+            "next_guest",
+            "next_confirmation_code",
+        }
+    )
 
     def __init__(
         self,
@@ -106,7 +111,6 @@ class GuestyOccupancySensor(
         data = self.coordinator.data
         occupancy = self.occupancy
         attributes: dict = {
-            "listing_id": self._listing_id,
             "data_stale": data.data_stale if data else None,
             "cache_age_minutes": data.cache_age_minutes if data else None,
             "last_sync": data.last_sync if data else None,
@@ -118,8 +122,6 @@ class GuestyOccupancySensor(
         listing = occupancy.listing
         attributes.update(
             {
-                "listing_title": listing.title,
-                "listing_nickname": listing.nickname,
                 "listing_active": listing.active,
             }
         )
@@ -128,8 +130,6 @@ class GuestyOccupancySensor(
             reservation = occupancy.current_reservation
             attributes.update(
                 {
-                    "current_guest": reservation.guest_name,
-                    "current_confirmation_code": reservation.confirmation_code,
                     "current_check_in": reservation.check_in_datetime(
                         listing
                     ).isoformat(),
@@ -138,12 +138,17 @@ class GuestyOccupancySensor(
                     ).isoformat(),
                 }
             )
+            if self._expose_guest_details:
+                attributes.update(
+                    {
+                        "current_guest": reservation.guest_name,
+                        "current_confirmation_code": reservation.confirmation_code,
+                    }
+                )
 
         if occupancy.next_reservation and occupancy.next_check_in:
             attributes.update(
                 {
-                    "next_guest": occupancy.next_reservation.guest_name,
-                    "next_confirmation_code": occupancy.next_reservation.confirmation_code,
                     "next_check_in": occupancy.next_check_in.isoformat(),
                     "next_check_out": (
                         occupancy.next_check_out.isoformat()
@@ -152,8 +157,25 @@ class GuestyOccupancySensor(
                     ),
                 }
             )
+            if self._expose_guest_details:
+                attributes.update(
+                    {
+                        "next_guest": occupancy.next_reservation.guest_name,
+                        "next_confirmation_code": (
+                            occupancy.next_reservation.confirmation_code
+                        ),
+                    }
+                )
 
         return attributes
+
+    @property
+    def _expose_guest_details(self) -> bool:
+        """Return whether guest details may be exposed in entity state."""
+        return self.coordinator.config_entry.options.get(
+            CONF_EXPOSE_GUEST_DETAILS,
+            DEFAULT_EXPOSE_GUEST_DETAILS,
+        )
 
     @property
     def device_info(self) -> dict:
@@ -226,7 +248,7 @@ class GuestySyncStatusSensor(
             "last_incremental_sync": data.last_incremental_sync,
             "cache_age_minutes": data.cache_age_minutes,
             "data_stale": data.data_stale,
-            "last_error": data.last_error,
+            "has_last_error": data.last_error is not None,
             "webhook_active": data.webhook_active,
             "listings_count": len(data.listings),
             "reservations_count": len(data.reservations),

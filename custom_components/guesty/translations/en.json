@@ -3,11 +3,19 @@
     "step": {
       "user": {
         "title": "Connect Guesty",
-        "description": "Enter your Guesty Open API credentials. You can find the Client ID and Client Secret in your Guesty account under Integrations > Open API.",
+        "description": "Enter your Guesty Open API credentials. You can find the Client ID and Client Secret in your Guesty account under Integrations > API & Webhooks.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret",
           "scan_interval": "Update interval (seconds)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Guesty",
+        "description": "The Guesty credentials are no longer valid. Enter a new Client ID and Client Secret.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Client Secret"
         }
       }
     },
@@ -18,7 +26,8 @@
       "unknown": "Unknown error"
     },
     "abort": {
-      "already_configured": "Guesty is already configured"
+      "already_configured": "Guesty is already configured",
+      "reauth_successful": "Guesty was reconnected successfully"
     }
   },
   "options": {
@@ -31,7 +40,8 @@
           "listing_sync_interval": "Listing sync (seconds)",
           "reservation_days_past": "Past days for reservations",
           "reservation_days_future": "Future days for reservations",
-          "stale_threshold_hours": "Stale threshold (hours)"
+          "stale_threshold_hours": "Stale threshold (hours)",
+          "expose_guest_details": "Show guest names and confirmation codes in entities"
         }
       }
     }

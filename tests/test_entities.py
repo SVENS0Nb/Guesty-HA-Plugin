@@ -1,0 +1,192 @@
+"""Tests for Guesty calendar and sensor entities."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+import zoneinfo
+
+import pytest
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from custom_components.guesty.calendar import (
+    GuestyReservationCalendar,
+    _add_listing_entities as add_calendar_entities,
+)
+from custom_components.guesty.const import CONF_EXPOSE_GUEST_DETAILS
+from custom_components.guesty.models import (
+    GuestyListing,
+    GuestyReservation,
+    calculate_listing_occupancy,
+)
+from custom_components.guesty.sensor import (
+    GuestyOccupancySensor,
+    _add_listing_entities as add_sensor_entities,
+)
+
+TZ = zoneinfo.ZoneInfo("Europe/Berlin")
+
+
+def _listing() -> GuestyListing:
+    return GuestyListing(
+        id="listing-1",
+        title="Private address",
+        nickname="Private nickname",
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+
+
+def _reservation() -> GuestyReservation:
+    return GuestyReservation(
+        id="reservation-1",
+        listing_id="listing-1",
+        status="confirmed",
+        confirmation_code="SECRET-CODE",
+        check_in_date="2026-07-13",
+        check_out_date="2026-07-16",
+        check_in_utc=None,
+        check_out_utc=None,
+        planned_arrival=None,
+        planned_departure=None,
+        listing_default_check_in=None,
+        listing_default_check_out=None,
+        guest_name="Private Guest",
+        last_updated_at=None,
+    )
+
+
+def _coordinator(*, expose_details: bool = False):
+    listing = _listing()
+    reservation = _reservation()
+    occupancy = calculate_listing_occupancy(
+        listing,
+        [reservation],
+        datetime(2026, 7, 12, 12, 0, tzinfo=TZ),
+    )
+    data = SimpleNamespace(
+        listings={listing.id: listing},
+        reservations=[reservation],
+        occupancy={listing.id: occupancy},
+        data_stale=False,
+        cache_age_minutes=0.0,
+        last_sync="2026-07-13T12:00:00+00:00",
+    )
+    entry = SimpleNamespace(
+        entry_id="entry-id",
+        options={CONF_EXPOSE_GUEST_DETAILS: expose_details},
+    )
+    return SimpleNamespace(
+        data=data,
+        config_entry=entry,
+        last_update_success=True,
+        async_add_listener=lambda listener, context=None: lambda: None,
+        get_listing_reservations=lambda listing_id: [reservation],
+    )
+
+
+@pytest.mark.asyncio
+async def test_calendar_hides_guest_details_by_default(hass) -> None:
+    """Calendar event text is privacy-safe unless the user opts in."""
+    entity = GuestyReservationCalendar(_coordinator(), "listing-1")
+    event = entity.event
+    events = await entity.async_get_events(
+        hass,
+        datetime(2026, 7, 1, tzinfo=TZ),
+        datetime(2026, 8, 1, tzinfo=TZ),
+    )
+
+    assert event is not None
+    assert event.summary == "Reserved"
+    assert "Private Guest" not in (event.description or "")
+    assert "SECRET-CODE" not in (event.description or "")
+    assert len(events) == 1
+
+
+def test_calendar_can_expose_guest_details_explicitly() -> None:
+    """The privacy option restores useful live calendar details."""
+    entity = GuestyReservationCalendar(_coordinator(expose_details=True), "listing-1")
+    event = entity.event
+    assert event is not None
+    assert event.summary == "Private Guest"
+    assert "SECRET-CODE" in (event.description or "")
+
+
+def test_calendar_notifies_event_listeners(monkeypatch) -> None:
+    """Future-event subscribers are refreshed after coordinator updates."""
+    entity = GuestyReservationCalendar(_coordinator(), "listing-1")
+    listener_update = MagicMock()
+    state_update = MagicMock()
+    monkeypatch.setattr(
+        entity,
+        "async_update_event_listeners",
+        listener_update,
+        raising=False,
+    )
+    monkeypatch.setattr(CoordinatorEntity, "_handle_coordinator_update", state_update)
+
+    entity._handle_coordinator_update()
+
+    listener_update.assert_called_once_with()
+    state_update.assert_called_once_with()
+
+
+def test_sensor_hides_and_does_not_record_guest_details_by_default() -> None:
+    """Guest PII is neither exposed nor included in recorder attributes."""
+    entity = GuestyOccupancySensor(_coordinator(), "listing-1")
+    attributes = entity.extra_state_attributes
+
+    assert "current_guest" not in attributes
+    assert "current_confirmation_code" not in attributes
+    assert "listing_title" not in attributes
+    assert "listing_nickname" not in attributes
+    assert "current_guest" in entity._unrecorded_attributes
+
+
+def test_sensor_exposes_unrecorded_details_only_after_opt_in() -> None:
+    """Opted-in guest details remain excluded from recorder history."""
+    entity = GuestyOccupancySensor(_coordinator(expose_details=True), "listing-1")
+    attributes = entity.extra_state_attributes
+
+    assert attributes["next_guest"] == "Private Guest"
+    assert attributes["next_confirmation_code"] == "SECRET-CODE"
+    assert "next_guest" in entity._unrecorded_attributes
+
+
+def test_new_listings_create_entities_once_during_runtime() -> None:
+    """Coordinator updates add new sensors and calendars without a reload."""
+    coordinator = _coordinator()
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(
+            sensor_listing_ids=set(),
+            calendar_listing_ids=set(),
+        )
+    )
+    add_sensors = MagicMock()
+    add_calendars = MagicMock()
+
+    add_sensor_entities(coordinator, entry, add_sensors)
+    add_calendar_entities(coordinator, entry, add_calendars)
+    add_sensor_entities(coordinator, entry, add_sensors)
+    add_calendar_entities(coordinator, entry, add_calendars)
+
+    add_sensors.assert_called_once()
+    add_calendars.assert_called_once()
+    assert entry.runtime_data.sensor_listing_ids == {"listing-1"}
+    assert entry.runtime_data.calendar_listing_ids == {"listing-1"}
+
+
+def test_removed_listing_entities_become_unavailable() -> None:
+    """A removed listing is recognized immediately without stale states."""
+    coordinator = _coordinator()
+    sensor = GuestyOccupancySensor(coordinator, "listing-1")
+    calendar = GuestyReservationCalendar(coordinator, "listing-1")
+
+    coordinator.data.listings.clear()
+    coordinator.data.occupancy.clear()
+
+    assert not sensor.available
+    assert not calendar.available

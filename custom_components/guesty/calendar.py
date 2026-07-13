@@ -6,13 +6,17 @@ from datetime import datetime
 import logging
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import (
+    CONF_EXPOSE_GUEST_DETAILS,
+    DEFAULT_EXPOSE_GUEST_DETAILS,
+    DOMAIN,
+)
 from .coordinator import GuestyDataUpdateCoordinator
+from .data import GuestyConfigEntry
 from .models import GuestyListing, GuestyReservation, reservation_overlaps_range
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,17 +24,14 @@ _LOGGER = logging.getLogger(__name__)
 
 def _add_listing_entities(
     coordinator: GuestyDataUpdateCoordinator,
-    entry: ConfigEntry,
-    hass: HomeAssistant,
+    entry: GuestyConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create calendars for all listings not yet registered."""
     if not coordinator.data:
         return
 
-    known_ids: set[str] = hass.data[DOMAIN][entry.entry_id].setdefault(
-        "calendar_listing_ids", set()
-    )
+    known_ids = entry.runtime_data.calendar_listing_ids
     new_ids = set(coordinator.data.listings) - known_ids
     if not new_ids:
         return
@@ -44,20 +45,18 @@ def _add_listing_entities(
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: GuestyConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Guesty calendars for every listing."""
-    coordinator: GuestyDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
+    coordinator = entry.runtime_data.coordinator
 
-    _add_listing_entities(coordinator, entry, hass, async_add_entities)
+    _add_listing_entities(coordinator, entry, async_add_entities)
 
     @callback
     def _handle_coordinator_update() -> None:
         """Add calendars when Guesty returns new listings."""
-        _add_listing_entities(coordinator, entry, hass, async_add_entities)
+        _add_listing_entities(coordinator, entry, async_add_entities)
 
     entry.async_on_unload(coordinator.async_add_listener(_handle_coordinator_update))
 
@@ -132,7 +131,7 @@ class GuestyReservationCalendar(
             ):
                 try:
                     events.append(self._reservation_to_event(reservation, listing))
-                except ValueError:
+                except (TypeError, ValueError):
                     _LOGGER.debug(
                         "Skipping invalid reservation %s for calendar",
                         reservation.id,
@@ -147,23 +146,48 @@ class GuestyReservationCalendar(
         listing: GuestyListing,
     ) -> CalendarEvent:
         """Convert a reservation into a calendar event."""
-        summary = reservation.guest_name or reservation.confirmation_code or "Gast"
-        description_parts = []
-        if reservation.confirmation_code:
-            description_parts.append(
-                f"Bestätigung: {reservation.confirmation_code}"
-            )
-        if reservation.guest_name:
-            description_parts.append(f"Gast: {reservation.guest_name}")
-        description_parts.append(f"Status: {reservation.status}")
+        language = getattr(getattr(self, "_hass", None), "config", None)
+        is_german = getattr(language, "language", "en") == "de"
+        summary = "Reserviert" if is_german else "Reserved"
+        confirmation_label = "Bestätigung" if is_german else "Confirmation"
+        guest_label = "Gast" if is_german else "Guest"
+        status_label = "Status"
+        description_parts: list[str] = []
+        if self._expose_guest_details:
+            summary = reservation.guest_name or reservation.confirmation_code or summary
+            if reservation.confirmation_code:
+                description_parts.append(
+                    f"{confirmation_label}: {reservation.confirmation_code}"
+                )
+            if reservation.guest_name:
+                description_parts.append(f"{guest_label}: {reservation.guest_name}")
+        description_parts.append(f"{status_label}: {reservation.status}")
+        check_in, check_out = reservation.stay_datetimes(listing)
 
         return CalendarEvent(
-            start=reservation.check_in_datetime(listing),
-            end=reservation.check_out_datetime(listing),
+            start=check_in,
+            end=check_out,
             summary=summary,
             description="\n".join(description_parts),
             uid=reservation.id,
         )
+
+    @property
+    def _expose_guest_details(self) -> bool:
+        """Return whether calendar events may include guest details."""
+        return self.coordinator.config_entry.options.get(
+            CONF_EXPOSE_GUEST_DETAILS,
+            DEFAULT_EXPOSE_GUEST_DETAILS,
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Notify calendar listeners and write the updated entity state."""
+        if update_event_listeners := getattr(
+            self, "async_update_event_listeners", None
+        ):
+            update_event_listeners()
+        super()._handle_coordinator_update()
 
     @property
     def device_info(self) -> dict:

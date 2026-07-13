@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -9,6 +10,8 @@ from homeassistant.helpers.storage import Store
 
 from .const import STORAGE_KEY, STORAGE_VERSION
 from .models import GuestyListing, GuestyReservation
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class GuestyStorage:
@@ -25,9 +28,15 @@ class GuestyStorage:
     async def async_load(self) -> dict[str, Any]:
         """Load cached data from disk."""
         data = await self._store.async_load()
-        if not data:
+        if not isinstance(data, dict):
             return self._empty_cache()
-        return data
+        cache = self._empty_cache()
+        cache.update(data)
+        if not isinstance(cache.get("listings"), dict):
+            cache["listings"] = {}
+        if not isinstance(cache.get("reservations"), list):
+            cache["reservations"] = []
+        return cache
 
     @staticmethod
     def _empty_cache() -> dict[str, Any]:
@@ -49,17 +58,40 @@ class GuestyStorage:
         """Persist cached data to disk."""
         await self._store.async_save(cache)
 
+    async def async_remove(self) -> None:
+        """Delete cached Guesty data from disk."""
+        await self._store.async_remove()
+
     @staticmethod
     def listings_from_cache(data: dict[str, Any]) -> dict[str, GuestyListing]:
         """Deserialize listings from cache."""
-        return {
-            listing_id: GuestyListing.from_dict(listing_data)
-            for listing_id, listing_data in (data.get("listings") or {}).items()
-        }
+        listings: dict[str, GuestyListing] = {}
+        raw_listings = data.get("listings")
+        if not isinstance(raw_listings, dict):
+            return listings
+        for listing_id, listing_data in raw_listings.items():
+            if not isinstance(listing_data, dict):
+                continue
+            try:
+                listing = GuestyListing.from_dict(listing_data)
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring an invalid cached Guesty listing")
+                continue
+            listings[str(listing_id)] = listing
+        return listings
 
     @staticmethod
     def reservations_from_cache(data: dict[str, Any]) -> list[GuestyReservation]:
         """Deserialize reservations from cache."""
-        return [
-            GuestyReservation.from_dict(item) for item in data.get("reservations") or []
-        ]
+        reservations: list[GuestyReservation] = []
+        raw_reservations = data.get("reservations")
+        if not isinstance(raw_reservations, list):
+            return reservations
+        for item in raw_reservations:
+            if not isinstance(item, dict):
+                continue
+            try:
+                reservations.append(GuestyReservation.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring an invalid cached Guesty reservation")
+        return reservations
