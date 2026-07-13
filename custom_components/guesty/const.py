@@ -103,6 +103,7 @@ WEBHOOK_EVENTS: Final = (
 EVENT_OCCUPANCY_CHANGED: Final = "guesty_occupancy_changed"
 
 SENSOR_OCCUPANCY: Final = "occupancy"
+SENSOR_CURRENT_GUEST: Final = "current_guest"
 SENSOR_SYNC_STATUS: Final = "sync_status"
 
 SYNC_STATUS_OK: Final = "ok"

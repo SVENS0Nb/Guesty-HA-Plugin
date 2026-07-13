@@ -13,6 +13,7 @@ from .const import (
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
+    SENSOR_CURRENT_GUEST,
     SENSOR_OCCUPANCY,
     SENSOR_SYNC_STATUS,
 )
@@ -36,7 +37,12 @@ def _add_listing_entities(
         return
 
     entities = [
-        GuestyOccupancySensor(coordinator, listing_id) for listing_id in new_ids
+        entity
+        for listing_id in new_ids
+        for entity in (
+            GuestyOccupancySensor(coordinator, listing_id),
+            GuestyCurrentGuestSensor(coordinator, listing_id),
+        )
     ]
     async_add_entities(entities)
     known_ids.update(new_ids)
@@ -199,6 +205,83 @@ class GuestyOccupancySensor(
         """Return whether the entity is available."""
         if not (
             super().available
+            and self.coordinator.data is not None
+            and self._listing_id in self.coordinator.data.listings
+        ):
+            return False
+        if self.coordinator.data.data_stale:
+            stale_threshold = self.coordinator.config_entry.options.get(
+                CONF_STALE_THRESHOLD_HOURS, DEFAULT_STALE_THRESHOLD_HOURS
+            )
+            cache_age = self.coordinator.data.cache_age_minutes
+            if cache_age is not None and cache_age > stale_threshold * 60 * 2:
+                return False
+        return True
+
+
+class GuestyCurrentGuestSensor(
+    CoordinatorEntity[GuestyDataUpdateCoordinator], SensorEntity
+):
+    """Sensor exposing the current guest name after an explicit privacy opt-in."""
+
+    _attr_entity_registry_enabled_default = False
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:account"
+    _attr_translation_key = SENSOR_CURRENT_GUEST
+
+    def __init__(
+        self,
+        coordinator: GuestyDataUpdateCoordinator,
+        listing_id: str,
+    ) -> None:
+        """Initialize the current guest sensor."""
+        super().__init__(coordinator)
+        self._listing_id = listing_id
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{listing_id}_current_guest"
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the current guest name when private details are enabled."""
+        if not self._expose_guest_details or not self.coordinator.data:
+            return None
+        occupancy = self.coordinator.data.occupancy.get(self._listing_id)
+        if not occupancy or not occupancy.current_reservation:
+            return None
+        return occupancy.current_reservation.guest_name
+
+    @property
+    def _expose_guest_details(self) -> bool:
+        """Return whether guest details may be exposed in entity state."""
+        return self.coordinator.config_entry.options.get(
+            CONF_EXPOSE_GUEST_DETAILS,
+            DEFAULT_EXPOSE_GUEST_DETAILS,
+        )
+
+    @property
+    def device_info(self) -> dict:
+        """Return device information."""
+        listing = (
+            self.coordinator.data.listings.get(self._listing_id)
+            if self.coordinator.data
+            else None
+        )
+        listing_name = listing.display_name if listing else self._listing_id
+        return {
+            "identifiers": {(DOMAIN, self._listing_id)},
+            "name": listing_name,
+            "manufacturer": "Guesty",
+            "model": "Listing",
+            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
+        }
+
+    @property
+    def available(self) -> bool:
+        """Return whether explicitly enabled guest data is current enough to show."""
+        if not (
+            self._expose_guest_details
+            and super().available
             and self.coordinator.data is not None
             and self._listing_id in self.coordinator.data.listings
         ):

@@ -55,6 +55,9 @@
           "occupied": "Occupied"
         }
       },
+      "current_guest": {
+        "name": "Current guest"
+      },
       "sync_status": {
         "name": "Sync status",
         "state": {
