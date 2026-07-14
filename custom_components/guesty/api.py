@@ -270,7 +270,46 @@ class GuestyApiClient:
                 and item.get("fieldId") == field_id
                 and item.get("value") == value
             ):
+                break
+        else:
+            raise GuestyApiError("Guesty did not persist the custom field value")
+
+        # Guesty's update response can acknowledge a request before the value is
+        # visible on the reservation. Confirm it through the dedicated read
+        # endpoint before treating a guest access link as synchronized.
+        await self._async_verify_reservation_custom_field(
+            reservation_id,
+            field_id,
+            value,
+        )
+
+    async def _async_verify_reservation_custom_field(
+        self,
+        reservation_id: str,
+        field_id: str,
+        expected_value: str,
+    ) -> None:
+        """Verify a written reservation field with bounded eventual-consistency retries."""
+        for attempt in range(3):
+            try:
+                data = await self._async_request(
+                    "GET",
+                    f"/reservations-v3/{reservation_id}/custom-fields/{field_id}",
+                )
+            except GuestyNotFoundError:
+                data = None
+
+            custom_field = data.get("customField") if isinstance(data, dict) else None
+            if (
+                isinstance(data, dict)
+                and data.get("reservationId") == reservation_id
+                and isinstance(custom_field, dict)
+                and custom_field.get("fieldId") == field_id
+                and custom_field.get("value") == expected_value
+            ):
                 return
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
         raise GuestyApiError("Guesty did not persist the custom field value")
 
     async def async_delete_reservation_custom_field(

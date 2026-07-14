@@ -101,6 +101,7 @@ async def test_reconcile_writes_each_unchanged_link_only_once(
     assert args[2].startswith(
         f"https://ha.test/api/guesty/access/{manager.entry.entry_id}/"
     )
+    client.async_resolve_custom_field.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -116,6 +117,95 @@ async def test_unverified_v130_record_is_republished(hass, monkeypatch) -> None:
     client.async_update_reservation_custom_field.assert_awaited_once()
     assert record["write_verified"] is True
     assert manager.diagnostics()["verified_records"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_persisted_field_id_is_replaced_after_reload(
+    hass, monkeypatch
+) -> None:
+    """A deleted and recreated same-name field is re-resolved automatically."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    old_field_id = record["field_id"]
+    new_field_id = "75fab102a5284d73c6206db1"
+
+    # Simulate the next integration reload with a persisted old ID. Runtime
+    # validation must bypass that cache and find the recreated Guesty field.
+    manager._validated_field_references.clear()
+    client.async_resolve_custom_field.return_value = new_field_id
+    client.async_update_reservation_custom_field.reset_mock()
+    client.async_delete_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    assert record["field_id"] == new_field_id
+    assert record["version"] == old_version + 1
+    assert manager._validate_token(old_token) is None
+    client.async_delete_reservation_custom_field.assert_awaited_once_with(
+        "reservation-1", old_field_id
+    )
+    write_args = client.async_update_reservation_custom_field.await_args.args
+    assert write_args[:2] == ("reservation-1", new_field_id)
+    assert old_token not in write_args[2]
+    assert manager.diagnostics()["recovered_during_last_reconcile"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_write_rotates_link_and_retries_once(hass, monkeypatch) -> None:
+    """A field write failure refreshes the ID and retries with a new bearer URL."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_url = client.async_update_reservation_custom_field.await_args.args[2]
+    new_field_id = "75fab102a5284d73c6206db1"
+    record["field_synced"] = False
+    record["write_verified"] = False
+    record["url_hash"] = None
+    client.async_update_reservation_custom_field.reset_mock()
+    client.async_update_reservation_custom_field.side_effect = [
+        GuestyApiError("stale field"),
+        None,
+    ]
+    client.async_resolve_custom_field.return_value = new_field_id
+
+    await manager.async_reconcile()
+
+    assert client.async_update_reservation_custom_field.await_count == 2
+    first_write, retry = (
+        call.args
+        for call in client.async_update_reservation_custom_field.await_args_list
+    )
+    assert first_write[1] != retry[1]
+    assert first_write[2] == old_url
+    assert retry[2] != old_url
+    assert record["version"] == old_version + 1
+    assert record["field_id"] == new_field_id
+    assert record["write_verified"] is True
+    assert "recovery_marker" not in record
+    assert manager.diagnostics()["recovered_during_last_reconcile"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_does_not_rotate_on_every_poll(hass, monkeypatch) -> None:
+    """Repeated upstream failure retries the same link instead of token churn."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record["field_synced"] = False
+    record["write_verified"] = False
+    record["url_hash"] = None
+    client.async_update_reservation_custom_field.side_effect = GuestyApiError("offline")
+
+    await manager.async_reconcile()
+    recovered_version = record["version"]
+    resolve_count = client.async_resolve_custom_field.await_count
+
+    await manager.async_reconcile()
+
+    assert record["version"] == recovered_version
+    assert client.async_resolve_custom_field.await_count == resolve_count
+    assert manager.diagnostics()["recovered_during_last_reconcile"] == 0
 
 
 @pytest.mark.asyncio

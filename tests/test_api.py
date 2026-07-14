@@ -281,19 +281,29 @@ async def test_custom_field_name_is_resolved_once_from_account(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
-    """Door links never use Guesty's retired reservation field endpoint."""
+    """Door links use v3 and are read back before synchronization is reported."""
     client = _client()
     request = AsyncMock(
-        return_value={
-            "reservationId": "reservation-1",
-            "customFields": [
-                {
+        side_effect=[
+            {
+                "reservationId": "reservation-1",
+                "customFields": [
+                    {
+                        "_id": "value-1",
+                        "fieldId": "65fab102a5284d73c6206db0",
+                        "value": "https://ha.test/access",
+                    }
+                ],
+            },
+            {
+                "reservationId": "reservation-1",
+                "customField": {
                     "_id": "value-1",
                     "fieldId": "65fab102a5284d73c6206db0",
                     "value": "https://ha.test/access",
-                }
-            ],
-        }
+                },
+            },
+        ]
     )
     monkeypatch.setattr(client, "_async_request", request)
 
@@ -303,7 +313,7 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
         "https://ha.test/access",
     )
 
-    request.assert_awaited_once_with(
+    request.assert_any_await(
         "PUT",
         "/reservations-v3/reservation-1/custom-fields",
         json_body={
@@ -315,6 +325,11 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
             ]
         },
     )
+    request.assert_any_await(
+        "GET",
+        "/reservations-v3/reservation-1/custom-fields/65fab102a5284d73c6206db0",
+    )
+    assert request.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -340,6 +355,47 @@ async def test_reservation_custom_field_requires_persistence_confirmation(
             "65fab102a5284d73c6206db0",
             "https://ha.test/access",
         )
+
+
+@pytest.mark.asyncio
+async def test_reservation_custom_field_readback_retries_bounded_lag(
+    monkeypatch,
+) -> None:
+    """A briefly lagging Guesty read is retried without continuous traffic."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {
+                "reservationId": "reservation-1",
+                "customFields": [
+                    {
+                        "fieldId": "65fab102a5284d73c6206db0",
+                        "value": "https://ha.test/access",
+                    }
+                ],
+            },
+            GuestyNotFoundError("not ready"),
+            {
+                "reservationId": "reservation-1",
+                "customField": {
+                    "fieldId": "65fab102a5284d73c6206db0",
+                    "value": "https://ha.test/access",
+                },
+            },
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+    monkeypatch.setattr("custom_components.guesty.api.asyncio.sleep", sleep)
+
+    await client.async_update_reservation_custom_field(
+        "reservation-1",
+        "65fab102a5284d73c6206db0",
+        "https://ha.test/access",
+    )
+
+    sleep.assert_awaited_once_with(1)
+    assert request.await_count == 3
 
 
 @pytest.mark.asyncio

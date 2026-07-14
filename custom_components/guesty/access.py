@@ -118,6 +118,8 @@ class GuestyAccessManager:
         self._last_reconcile_error: str | None = None
         self._last_eligible_count = 0
         self._last_published_count = 0
+        self._last_recovered_count = 0
+        self._validated_field_references: set[str] = set()
         self._listeners: set[Callable[[], None]] = set()
         self._last_action: dict[tuple[str, int], float] = {}
         self._action_windows: defaultdict[tuple[str, int], deque[float]] = defaultdict(
@@ -195,6 +197,7 @@ class GuestyAccessManager:
             self._last_reconcile_result = "running"
             self._last_reconcile_error = None
             self._last_published_count = 0
+            self._last_recovered_count = 0
             records = self._records
             mappings = self._mappings
             enabled = bool(self.entry.options.get(CONF_ACCESS_ENABLED, False))
@@ -244,6 +247,7 @@ class GuestyAccessManager:
                             "write_verified": False,
                         }
                     )
+                    existing.pop("recovery_marker", None)
                 existing["revoked"] = False
                 records[reservation_id] = existing
 
@@ -290,63 +294,178 @@ class GuestyAccessManager:
 
             for reservation_id in sorted(eligible):
                 record = records[reservation_id]
-                old_field_id = record.get("field_id")
-                if (
-                    record.get("field_synced")
-                    and old_field_id
-                    and old_field_id != field_id
-                ):
-                    try:
-                        await self._client.async_delete_reservation_custom_field(
-                            reservation_id, old_field_id
-                        )
-                    except (GuestyApiError, GuestyAuthError) as err:
-                        _LOGGER.warning(
-                            "Could not clear an obsolete Guesty access field for "
-                            "reservation %s: %s",
-                            reservation_id,
-                            err,
-                        )
-                    record["field_synced"] = False
-                    record["write_verified"] = False
-                    record["url_hash"] = None
-
-                record["field_id"] = field_id
-                token = self._token_for(reservation_id, int(record["version"]))
-                access_url = (
-                    f"{base_url}{ACCESS_URL_PATH}/{self.entry.entry_id}/{token}"
+                field_id, publish_error = await self._async_publish_access_link(
+                    reservation_id,
+                    record,
+                    field_reference,
+                    field_id,
+                    base_url,
                 )
-                url_hash = hashlib.sha256(access_url.encode()).hexdigest()
-                if (
-                    record.get("url_hash") == url_hash
-                    and record.get("field_synced")
-                    and record.get("write_verified")
-                ):
-                    continue
-                try:
-                    await self._client.async_update_reservation_custom_field(
-                        reservation_id,
-                        field_id,
-                        access_url,
-                    )
-                except (GuestyApiError, GuestyAuthError) as err:
+                if publish_error is not None:
                     _LOGGER.warning(
                         "Could not publish a Guesty access link for reservation %s: %s",
                         reservation_id,
-                        err,
+                        publish_error,
                     )
                     self._last_reconcile_result = "partial"
-                    self._last_reconcile_error = str(err)[:500]
-                    continue
-                record["url_hash"] = url_hash
-                record["field_synced"] = True
-                record["write_verified"] = True
-                self._last_published_count += 1
+                    self._last_reconcile_error = str(publish_error)[:500]
 
             await self._async_cleanup_revoked_records()
             await self._storage.async_save(self._data)
             if self._last_reconcile_result == "running":
                 self._last_reconcile_result = "ok"
+
+    async def _async_publish_access_link(
+        self,
+        reservation_id: str,
+        record: dict[str, Any],
+        field_reference: str,
+        field_id: str,
+        base_url: str,
+    ) -> tuple[str, GuestyApiError | GuestyAuthError | None]:
+        """Publish one link and perform one bounded self-healing retry."""
+        old_field_id = record.get("field_id")
+        if isinstance(old_field_id, str) and old_field_id != field_id:
+            self._rotate_record_token(reservation_id, record)
+            record["field_id"] = field_id
+            self._last_recovered_count += 1
+            # Invalidate the old token before touching the remote field.
+            await self._storage.async_save(self._data)
+            await self._async_clear_obsolete_field(reservation_id, old_field_id)
+        else:
+            record["field_id"] = field_id
+
+        access_url, url_hash = self._access_url_and_hash(
+            base_url, reservation_id, record
+        )
+        if (
+            record.get("url_hash") == url_hash
+            and record.get("field_synced")
+            and record.get("write_verified")
+        ):
+            return field_id, None
+
+        try:
+            await self._client.async_update_reservation_custom_field(
+                reservation_id,
+                field_id,
+                access_url,
+            )
+        except GuestyAuthError as err:
+            return field_id, err
+        except GuestyApiError as first_error:
+            recovery = await self._async_prepare_link_recovery(
+                reservation_id,
+                record,
+                field_reference,
+                field_id,
+                base_url,
+            )
+            if recovery is None:
+                return field_id, first_error
+            field_id, access_url, url_hash = recovery
+            try:
+                await self._client.async_update_reservation_custom_field(
+                    reservation_id,
+                    field_id,
+                    access_url,
+                )
+            except (GuestyApiError, GuestyAuthError) as recovery_error:
+                return field_id, recovery_error
+            self._last_recovered_count += 1
+
+        record["url_hash"] = url_hash
+        record["field_synced"] = True
+        record["write_verified"] = True
+        record.pop("recovery_marker", None)
+        self._last_published_count += 1
+        return field_id, None
+
+    async def _async_prepare_link_recovery(
+        self,
+        reservation_id: str,
+        record: dict[str, Any],
+        field_reference: str,
+        current_field_id: str,
+        base_url: str,
+    ) -> tuple[str, str, str] | None:
+        """Refresh a stale field ID and rotate a failed bearer URL once."""
+        fingerprint = str(record.get("fingerprint", ""))
+        current_marker = f"{current_field_id}:{fingerprint}"
+        if record.get("recovery_marker") == current_marker:
+            return None
+
+        fresh_field_id = await self._async_resolve_field(
+            field_reference,
+            force_refresh=True,
+        )
+        recovery_marker = f"{fresh_field_id}:{fingerprint}"
+        if record.get("recovery_marker") == recovery_marker:
+            return None
+
+        old_field_id = record.get("field_id")
+        self._rotate_record_token(reservation_id, record)
+        record["field_id"] = fresh_field_id
+        record["recovery_marker"] = recovery_marker
+        # Invalidate the old token locally before retrying the remote write.
+        await self._storage.async_save(self._data)
+        if isinstance(old_field_id, str) and old_field_id != fresh_field_id:
+            await self._async_clear_obsolete_field(reservation_id, old_field_id)
+        access_url, url_hash = self._access_url_and_hash(
+            base_url, reservation_id, record
+        )
+        return fresh_field_id, access_url, url_hash
+
+    async def _async_clear_obsolete_field(
+        self,
+        reservation_id: str,
+        field_id: str,
+    ) -> None:
+        """Best-effort cleanup of an access value attached to an old field ID."""
+        try:
+            await self._client.async_delete_reservation_custom_field(
+                reservation_id,
+                field_id,
+            )
+        except (GuestyApiError, GuestyAuthError) as err:
+            _LOGGER.warning(
+                "Could not clear an obsolete Guesty access field for reservation %s: %s",
+                reservation_id,
+                err,
+            )
+
+    def _rotate_record_token(
+        self,
+        reservation_id: str,
+        record: dict[str, Any],
+    ) -> None:
+        """Rotate one bearer token and immediately invalidate its predecessor."""
+        try:
+            version = int(record.get("version", 0)) + 1
+        except (TypeError, ValueError):
+            version = 1
+        token = self._token_for(reservation_id, version)
+        record.update(
+            {
+                "version": version,
+                "token_hash": self._token_hash(token),
+                "url_hash": None,
+                "field_synced": False,
+                "write_verified": False,
+            }
+        )
+        self._rebuild_token_index()
+
+    def _access_url_and_hash(
+        self,
+        base_url: str,
+        reservation_id: str,
+        record: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        """Build an access URL and its non-secret persistence fingerprint."""
+        token = self._token_for(reservation_id, int(record["version"]))
+        access_url = f"{base_url}{ACCESS_URL_PATH}/{self.entry.entry_id}/{token}"
+        return access_url, hashlib.sha256(access_url.encode()).hexdigest()
 
     def diagnostics(self) -> dict[str, Any]:
         """Return a privacy-preserving access synchronization summary."""
@@ -358,6 +477,7 @@ class GuestyAccessManager:
             "last_reconcile_error": self._last_reconcile_error,
             "eligible_reservations": self._last_eligible_count,
             "published_during_last_reconcile": self._last_published_count,
+            "recovered_during_last_reconcile": self._last_recovered_count,
             "local_records": len(records),
             "synced_records": sum(
                 1 for record in records.values() if record.get("field_synced")
@@ -470,17 +590,25 @@ class GuestyAccessManager:
         token = self._token_for(reservation_id, version)
         return f"{base_url}{ACCESS_URL_PATH}/{self.entry.entry_id}/{token}"
 
-    async def _async_resolve_field(self, reference: str) -> str:
-        """Resolve and cache a configured Guesty custom field."""
+    async def _async_resolve_field(
+        self,
+        reference: str,
+        *,
+        force_refresh: bool = False,
+    ) -> str:
+        """Resolve and cache a configured field, revalidating it after reload."""
         cached = self._data.get("resolved_field")
         if (
-            isinstance(cached, dict)
+            not force_refresh
+            and reference in self._validated_field_references
+            and isinstance(cached, dict)
             and cached.get("reference") == reference
             and isinstance(cached.get("id"), str)
         ):
             return cached["id"]
         field_id = await self._client.async_resolve_custom_field(reference)
         self._data["resolved_field"] = {"reference": reference, "id": field_id}
+        self._validated_field_references.add(reference)
         await self._storage.async_save(self._data)
         return field_id
 

@@ -114,11 +114,18 @@ Endpunkt für Reservierungs-Custom-Fields.
 - Bestätigte Reservierung: Token und Guesty-Link werden erzeugt.
 - Datum, Listing oder Schlosszuordnung geändert: Der alte Token wird sofort
   ungültig und ein neuer Link wird veröffentlicht.
+- Gelöschtes oder neu angelegtes Custom Field: Die gespeicherte Feld-ID wird
+  nach einem Neustart neu geprüft. Bei einem Schreibfehler aktualisiert die
+  Integration die ID, macht den alten Link ungültig und versucht genau einmal,
+  einen neuen Link zu veröffentlichen.
 - Stornierung, Löschung, Check-out oder deaktivierte Funktion: Der Zugriff wird
   zuerst lokal gesperrt; anschließend wird das Guesty-Feld gelöscht.
 - Veraltete Guesty-Daten: Der Türzugang arbeitet „fail closed“ und verweigert
   die Öffnung, bis wieder aktuelle Reservierungsdaten vorliegen.
 - Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
+- „Synchronisiert“ wird erst gemeldet, nachdem der Wert über Guestys separaten
+  Reservation-Custom-Field-GET-Endpunkt zurückgelesen wurde. Kurz verzögerte
+  Guesty-Antworten werden begrenzt erneut geprüft.
 
 ### Reverse-Proxy-Sicherheit
 
