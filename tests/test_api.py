@@ -340,6 +340,82 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reservation_keycode_preserves_existing_reservation_notes(
+    monkeypatch,
+) -> None:
+    """A Keycode update never replaces unrelated reservation notes."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {
+                "_id": "reservation-1",
+                "notes": {
+                    "cleaning": "Keep this",
+                    "specialRequests": "Late arrival",
+                    "doneBy": "read-only metadata",
+                },
+            },
+            {
+                "reservationId": "reservation-1",
+                "notes": {"keyCode": "712345"},
+            },
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    request.assert_any_await(
+        "GET",
+        "/reservations/reservation-1",
+        params={"fields": "_id notes"},
+    )
+    request.assert_any_await(
+        "PUT",
+        "/reservations-v3/reservation-1/notes",
+        json_body={
+            "notes": {
+                "cleaning": "Keep this",
+                "specialRequests": "Late arrival",
+                "keyCode": "712345",
+            }
+        },
+    )
+    assert request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_reads_back_incomplete_acknowledgement(
+    monkeypatch,
+) -> None:
+    """Only an ambiguous write acknowledgement causes a targeted read."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {"_id": "reservation-1", "notes": {}},
+            {"reservationId": "reservation-1"},
+            {"_id": "reservation-1", "notes": {"keyCode": "712345"}},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    request.assert_any_await(
+        "GET",
+        "/reservations/reservation-1",
+        params={"fields": "_id notes.keyCode"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_rejects_invalid_value() -> None:
+    """Only the promised six-digit Keycode format can be published."""
+    with pytest.raises(ValueError, match="six digits"):
+        await _client().async_update_reservation_key_code("reservation-1", "12345")
+
+
+@pytest.mark.asyncio
 async def test_reservation_custom_field_requires_persistence_confirmation(
     monkeypatch,
 ) -> None:

@@ -24,6 +24,8 @@ from custom_components.guesty.models import (
 from custom_components.guesty.sensor import (
     GuestyAccessLinkSensor,
     GuestyCurrentGuestSensor,
+    GuestyKeycodeStatusSensor,
+    GuestyLoxonePinStatusSensor,
     GuestyOccupancySensor,
     _add_listing_entities as add_sensor_entities,
 )
@@ -100,6 +102,20 @@ def _access_manager(snapshot: dict | None = None):
     return SimpleNamespace(
         listing_access_snapshot=lambda _listing_id: (
             snapshot or {"status": "no_reservation"}
+        ),
+        async_add_listener=lambda _listener: lambda: None,
+    )
+
+
+def _loxone_manager(snapshot: dict | None = None):
+    """Return the small Loxone-manager surface used by status entities."""
+    return SimpleNamespace(
+        listing_status_snapshot=lambda _listing_id: (
+            snapshot
+            or {
+                "guesty_status": "no_reservation",
+                "loxone_status": "no_reservation",
+            }
         ),
         async_add_listener=lambda _listener: lambda: None,
     )
@@ -256,12 +272,49 @@ def test_access_link_sensor_hides_guest_name_without_privacy_opt_in() -> None:
     assert "guest_name" not in entity.extra_state_attributes
 
 
+def test_keycode_status_sensors_report_each_destination_without_secrets() -> None:
+    """Guesty and Loxone delivery have independent privacy-safe states."""
+    coordinator = _coordinator()
+    manager = _loxone_manager(
+        {
+            "guesty_status": "synced",
+            "loxone_status": "scheduled",
+            "access_start": datetime(2026, 7, 13, 15, 0, tzinfo=TZ),
+            "access_end": datetime(2026, 7, 16, 11, 0, tzinfo=TZ),
+            "provision_at": datetime(2026, 7, 13, 9, 0, tzinfo=TZ),
+            "reservation_status": "confirmed",
+            "field_synced": True,
+            "loxone_user_created": False,
+            "data_stale": False,
+        }
+    )
+    guesty_entity = GuestyKeycodeStatusSensor(coordinator, manager, "listing-1")
+    loxone_entity = GuestyLoxonePinStatusSensor(coordinator, manager, "listing-1")
+
+    assert guesty_entity.native_value == "synced"
+    assert loxone_entity.native_value == "scheduled"
+    assert guesty_entity.entity_category is EntityCategory.DIAGNOSTIC
+    assert loxone_entity.entity_registry_enabled_default is True
+    assert guesty_entity.extra_state_attributes == {
+        "data_stale": False,
+        "field_synced": True,
+        "loxone_user_created": False,
+        "reservation_status": "confirmed",
+        "access_start": "2026-07-13T15:00:00+02:00",
+        "access_end": "2026-07-16T11:00:00+02:00",
+        "provision_at": "2026-07-13T09:00:00+02:00",
+    }
+    assert "code" not in guesty_entity.extra_state_attributes
+    assert "guest_name" not in guesty_entity.extra_state_attributes
+
+
 def test_new_listings_create_entities_once_during_runtime() -> None:
     """Coordinator updates add new sensors and calendars without a reload."""
     coordinator = _coordinator()
     entry = SimpleNamespace(
         runtime_data=SimpleNamespace(
             access_manager=_access_manager(),
+            loxone_manager=_loxone_manager(),
             sensor_listing_ids=set(),
             calendar_listing_ids=set(),
         )
@@ -276,7 +329,7 @@ def test_new_listings_create_entities_once_during_runtime() -> None:
 
     add_sensors.assert_called_once()
     add_calendars.assert_called_once()
-    assert len(add_sensors.call_args.args[0]) == 3
+    assert len(add_sensors.call_args.args[0]) == 5
     assert entry.runtime_data.sensor_listing_ids == {"listing-1"}
     assert entry.runtime_data.calendar_listing_ids == {"listing-1"}
 

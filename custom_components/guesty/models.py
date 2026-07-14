@@ -171,6 +171,8 @@ class GuestyReservation:
     listing_default_check_out: str | None
     guest_name: str | None
     last_updated_at: str | None
+    key_code: str | None = None
+    key_code_observed: bool = False
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
@@ -190,6 +192,9 @@ class GuestyReservation:
 
         listing = data.get("listing") or {}
         guest = data.get("guest") or {}
+        notes = data.get("notes") or {}
+        if not isinstance(notes, dict):
+            notes = {}
         return cls(
             id=str(reservation_id),
             listing_id=str(listing_id),
@@ -205,6 +210,12 @@ class GuestyReservation:
             listing_default_check_out=listing.get("defaultCheckOutTime"),
             guest_name=guest.get("fullName"),
             last_updated_at=data.get("lastUpdatedAt"),
+            key_code=(
+                str(notes["keyCode"]).strip()
+                if notes.get("keyCode") is not None
+                else None
+            ),
+            key_code_observed=True,
         )
 
     def is_active_status(self) -> bool:
@@ -309,6 +320,10 @@ class GuestyReservation:
             listing_default_check_out=data.get("listing_default_check_out"),
             guest_name=data.get("guest_name"),
             last_updated_at=data.get("last_updated_at"),
+            # Keycodes are intentionally never restored from the general Guesty
+            # cache. The private Loxone store owns them only until access expires.
+            key_code=None,
+            key_code_observed=False,
         )
 
 

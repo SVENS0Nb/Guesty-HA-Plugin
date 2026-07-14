@@ -42,7 +42,8 @@
           "reservation_days_future": "Zukünftige Tage für Reservierungen",
           "stale_threshold_hours": "Stale-Schwellenwert (Stunden)",
           "expose_guest_details": "Gastnamen und Bestätigungscodes in Entitäten anzeigen",
-          "access_enabled": "Sicheren Gast-Türzugang aktivieren"
+          "access_enabled": "Sicheren Gast-Türzugang aktivieren",
+          "loxone_enabled": "Reservierungs-PINs für Loxone aktivieren"
         }
       },
       "access": {
@@ -72,12 +73,47 @@
           "access_lock_2_name_es": "Zweite Tür – Spanisch",
           "access_lock_2_name_fr": "Zweite Tür – Französisch"
         }
+      },
+      "loxone": {
+        "title": "Loxone Reservierungs-PINs",
+        "description": "Pro Reservierung wird ein sechsstelliger Guesty-Keycode erzeugt. Guesty ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "data": {
+          "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
+          "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
+          "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
+          "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
+          "loxone_server_count": "Anzahl der Loxone-Miniserver",
+          "loxone_listings": "Listings mit Loxone-PIN-Zugang"
+        }
+      },
+      "loxone_server": {
+        "title": "Loxone Miniserver {number}",
+        "description": "Trage eine HTTPS-URL des Miniservers oder Reverse-Proxys ein. Beim Speichern wird die Verbindung geprüft und die Gruppenliste geladen. Verwende ein eigenes Dienstkonto mit dem Recht Benutzerverwaltung.",
+        "data": {
+          "name": "Anzeigename",
+          "url": "HTTPS-URL",
+          "username": "Benutzername des Dienstkontos",
+          "password": "Passwort (leer lassen, um das vorhandene zu behalten)"
+        }
+      },
+      "loxone_listing": {
+        "title": "Loxone-Zugang für {listing}",
+        "description": "Wähle eine oder mehrere Benutzergruppen von genau einem Miniserver. Deren Berechtigungen bestimmen, welche Türen der Reservierungs-PIN öffnen darf.",
+        "data": {
+          "group_uuids": "Miniserver und Benutzergruppen"
+        }
       }
     },
     "error": {
       "select_listing": "Wähle mindestens ein Listing aus",
       "invalid_branding_url": "Logo und Favicon müssen gültige direkte HTTPS-URLs verwenden",
-      "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden"
+      "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden",
+      "invalid_code_prefix": "Der PIN-Präfix muss aus 1 oder 2 Ziffern bestehen",
+      "loxone_invalid_auth": "Loxone lehnt das Konto ab oder das Recht Benutzerverwaltung fehlt",
+      "loxone_cannot_connect": "Zu diesem Loxone-Miniserver konnte keine sichere Verbindung hergestellt werden",
+      "duplicate_loxone_server": "Diese Miniserver-Verbindung wurde mehrfach konfiguriert",
+      "select_loxone_group": "Wähle mindestens eine Loxone-Benutzergruppe",
+      "groups_from_one_server": "Alle Gruppen eines Listings müssen zum selben Miniserver gehören"
     },
     "abort": {
       "no_listings": "Derzeit sind keine Guesty-Listings verfügbar"
@@ -102,6 +138,30 @@
           "no_reservation": "Keine Reservierung",
           "pending": "Ausstehend",
           "synced": "Synchronisiert",
+          "error": "Fehler"
+        }
+      },
+      "guesty_keycode_status": {
+        "name": "Guesty-Keycode-Status",
+        "state": {
+          "not_configured": "Nicht konfiguriert",
+          "no_reservation": "Keine Reservierung",
+          "pending": "Ausstehend",
+          "synced": "Synchronisiert",
+          "conflict": "Konflikt",
+          "error": "Fehler"
+        }
+      },
+      "loxone_pin_status": {
+        "name": "Loxone-PIN-Status",
+        "state": {
+          "not_configured": "Nicht konfiguriert",
+          "no_reservation": "Keine Reservierung",
+          "scheduled": "Geplant",
+          "pending": "Ausstehend",
+          "provisioned": "Bereitgestellt",
+          "cleanup_pending": "Löschung ausstehend",
+          "conflict": "Konflikt",
           "error": "Fehler"
         }
       },

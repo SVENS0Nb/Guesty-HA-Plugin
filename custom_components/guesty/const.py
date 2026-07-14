@@ -35,6 +35,19 @@ CONF_ACCESS_LOCK_2_NAME: Final = "access_lock_2_name"
 CONF_ACCESS_LOCK_2_NAME_EN: Final = "access_lock_2_name_en"
 CONF_ACCESS_LOCK_2_NAME_ES: Final = "access_lock_2_name_es"
 CONF_ACCESS_LOCK_2_NAME_FR: Final = "access_lock_2_name_fr"
+CONF_LOXONE_ENABLED: Final = "loxone_enabled"
+CONF_LOXONE_PROVISION_LEAD_MINUTES: Final = "loxone_provision_lead_minutes"
+CONF_LOXONE_CODE_PREFIX: Final = "loxone_code_prefix"
+CONF_LOXONE_MINISERVERS: Final = "loxone_miniservers"
+CONF_LOXONE_LISTINGS: Final = "loxone_listings"
+CONF_LOXONE_LISTING_MAPPINGS: Final = "loxone_listing_mappings"
+CONF_LOXONE_SERVER_ID: Final = "server_id"
+CONF_LOXONE_SERVER_NAME: Final = "name"
+CONF_LOXONE_SERVER_URL: Final = "url"
+CONF_LOXONE_SERVER_USERNAME: Final = "username"
+CONF_LOXONE_SERVER_PASSWORD: Final = "password"
+CONF_LOXONE_SERVER_GROUPS: Final = "groups"
+CONF_LOXONE_GROUP_UUIDS: Final = "group_uuids"
 CONF_WEBHOOK_ID: Final = "webhook_id"
 CONF_GUESTY_WEBHOOK_ID: Final = "guesty_webhook_id"
 CONF_GUESTY_WEBHOOK_SECRET: Final = "guesty_webhook_secret"
@@ -52,6 +65,9 @@ DEFAULT_ACCESS_LOGO_URL: Final = ""
 DEFAULT_ACCESS_FAVICON_URL: Final = ""
 DEFAULT_ACCESS_EARLY_MINUTES: Final = 0
 DEFAULT_ACCESS_LATE_MINUTES: Final = 0
+DEFAULT_LOXONE_ENABLED: Final = False
+DEFAULT_LOXONE_PROVISION_LEAD_MINUTES: Final = 360
+DEFAULT_LOXONE_CODE_PREFIX: Final = "7"
 
 # Use a quicker listing fallback only while push updates are unavailable.
 WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL: Final = 900
@@ -107,7 +123,7 @@ RESERVATION_FIELDS: Final = (
     "checkIn checkOut checkInDateLocalized checkOutDateLocalized "
     "plannedArrival plannedDeparture lastUpdatedAt "
     "listing.defaultCheckInTime listing.defaultCheckOutTime "
-    "guest.fullName"
+    "guest.fullName notes.keyCode"
 )
 
 WEBHOOK_SUBSCRIPTION_EVENTS: Final = (
@@ -141,9 +157,27 @@ ACCESS_RETRY_BASE_SECONDS: Final = 300
 ACCESS_RETRY_MAX_SECONDS: Final = 3600
 ACCESS_REVOKED_RECORD_RETENTION_DAYS: Final = 7
 
+LOXONE_STORAGE_VERSION: Final = 1
+LOXONE_ACCESS_CODE_LENGTH: Final = 6
+LOXONE_RETRY_BASE_SECONDS: Final = 300
+LOXONE_RETRY_MAX_SECONDS: Final = 3600
+LOXONE_REQUEST_TIMEOUT: Final = 20.0
+LOXONE_MAX_RESPONSE_BYTES: Final = 1024 * 1024
+LOXONE_MAX_RETRIES: Final = 2
+LOXONE_PERMISSION_CONFIG: Final = 0x00000004
+LOXONE_PERMISSION_USER_MANAGEMENT: Final = 0x00000100
+LOXONE_PRIVILEGED_GROUP_RIGHTS: Final = (
+    LOXONE_PERMISSION_CONFIG | LOXONE_PERMISSION_USER_MANAGEMENT
+)
+LOXONE_USER_STATE_TIMESPAN: Final = 4
+LOXONE_EXPIRATION_ACTION_DELETE: Final = 1
+LOXONE_EPOCH: Final = "2009-01-01T00:00:00+00:00"
+
 SENSOR_OCCUPANCY: Final = "occupancy"
 SENSOR_CURRENT_GUEST: Final = "current_guest"
 SENSOR_ACCESS_LINK: Final = "access_link"
+SENSOR_GUESTY_KEYCODE_STATUS: Final = "guesty_keycode_status"
+SENSOR_LOXONE_PIN_STATUS: Final = "loxone_pin_status"
 SENSOR_SYNC_STATUS: Final = "sync_status"
 
 SYNC_STATUS_OK: Final = "ok"

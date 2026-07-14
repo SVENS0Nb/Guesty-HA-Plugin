@@ -20,11 +20,14 @@ from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_GUESTY_WEBHOOK_ID,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_LISTING_MAPPINGS,
     CONF_TOKEN_EXPIRES_AT,
     CONF_WEBHOOK_ID,
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry, GuestyRuntimeData
+from .loxone import GuestyLoxoneManager, async_remove_stored_loxone_users
 from .scheduler import GuestyTransitionScheduler
 from .storage import GuestyStorage
 from .webhook import async_register_guesty_webhook, async_setup_webhook
@@ -54,6 +57,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
     await coordinator.async_config_entry_first_refresh()
 
+    # The general cache intentionally strips Keycodes. When Loxone is enabled
+    # after a restart, perform one shared full read instead of issuing one
+    # reservation request per cached booking or treating an unknown value as an
+    # explicit deletion.
+    mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
+    mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
+    if (
+        entry.options.get(CONF_LOXONE_ENABLED, False)
+        and coordinator.data is not None
+        and any(
+            reservation.is_active_status()
+            and reservation.listing_id in mapped_listing_ids
+            and not reservation.key_code_observed
+            for reservation in coordinator.data.reservations
+        )
+    ):
+        await coordinator.async_force_full_sync()
+
     if CONF_ACCESS_TOKEN in entry.data or CONF_TOKEN_EXPIRES_AT in entry.data:
         hass.config_entries.async_update_entry(
             entry,
@@ -75,8 +96,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
     async_register_access_manager(hass, access_manager)
     await access_manager.async_setup()
 
+    loxone_manager = GuestyLoxoneManager(hass, entry, client, coordinator)
+    await loxone_manager.async_setup()
+
     entry.runtime_data = GuestyRuntimeData(
-        coordinator, client, scheduler, access_manager
+        coordinator, client, scheduler, access_manager, loxone_manager
     )
 
     webhook_id = await async_setup_webhook(hass, entry, coordinator)
@@ -89,6 +113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
     def _on_coordinator_update() -> None:
         scheduler.async_schedule()
         access_manager.async_schedule_reconcile()
+        loxone_manager.async_schedule_reconcile()
 
     entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -109,6 +134,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> b
     if access_manager is not None:
         await access_manager.async_unload()
     async_unregister_access_manager(hass, entry.entry_id)
+
+    loxone_manager = getattr(entry.runtime_data, "loxone_manager", None)
+    if loxone_manager is not None:
+        await loxone_manager.async_unload()
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok
@@ -150,6 +179,11 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> N
             _LOGGER.warning("Could not clear a Guesty door access field during removal")
     await storage.async_remove()
     await access_storage.async_remove()
+    if not await async_remove_stored_loxone_users(hass, entry):
+        _LOGGER.error(
+            "One or more managed Loxone users could not be removed; "
+            "code-free cleanup records were retained"
+        )
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: GuestyConfigEntry) -> None:
