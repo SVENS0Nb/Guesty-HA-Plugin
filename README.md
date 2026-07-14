@@ -19,7 +19,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **API Retries** – exponentielles Backoff bei temporären Fehlern
 - **Datenschutzmodus** – Gastnamen und Bestätigungscodes sind standardmäßig verborgen
 - **Sicherer Gast-Türzugang** – ein zeitlich begrenzter Link pro Reservierung mit
-  bis zu zwei serverseitig zugeordneten Home-Assistant-Schlössern
+  bis zu zwei serverseitig zugeordneten Home-Assistant-Schlössern und
+  automatischer Browser-Sprache (Deutsch, Englisch, Spanisch oder Französisch)
 - **Zugangslink-Diagnose pro Listing** – zeigt Link und Guesty-Syncstatus ohne
   den sensiblen Link in der Recorder-Historie zu speichern
 
@@ -80,13 +81,21 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 Die Integration kann pro Guesty-Listing ein oder zwei vorhandene
 Home-Assistant-Entitäten aus der Domain `lock` zuordnen. Für jede aktive
 Reservierung wird **ein** geschützter Link erzeugt. Auf der Seite erscheinen
-Schaltflächen wie „Haustür öffnen“ oder „Wohnungstür öffnen“.
+Schaltflächen wie „Haustür öffnen“ oder „Wohnungstür öffnen“. Die Seite richtet
+sich automatisch nach der bevorzugten Browser-/Systemsprache; Deutsch,
+Englisch, Spanisch und Französisch werden unterstützt, alle anderen Sprachen
+verwenden Englisch.
 
 Ein Aufruf des Links per `GET` öffnet niemals eine Tür. Erst eine kleine,
 CSRF-geschützte `POST`-Anfrage nach einem bewussten Tastendruck kann
 `lock.unlock` auslösen. Dabei werden Reservierungsstatus, Listing-Zuordnung,
 Zeitfenster und Schlosszuordnung erneut serverseitig geprüft. Der Browser kann
-keine beliebige Entity-ID übergeben.
+keine beliebige Entity-ID übergeben. Eine erfolgreiche Aktion zeigt fünf
+Sekunden lang eine kleine Bestätigung. Die Schloss-Schaltflächen bleiben
+sichtbar und können anschließend ohne Neuladen erneut verwendet werden. Ein
+abgelaufenes Aktions-Nonce wird erst beim nächsten Tastendruck erneuert und
+einmal automatisch wiederholt; dadurch entsteht kein regelmäßiger
+Hintergrund-Traffic.
 
 ### Einrichtung
 
