@@ -278,7 +278,9 @@ flowchart TD
    `reservation.created.v2` und `reservation.updated.v2` werden nach einer
    kurzen 0,75-s-Sammelphase verarbeitet. Die Integration prüft die von Guesty
    bereitgestellte HMAC-Signatur; Duplikate und Ereignis-Bursts erzeugen dadurch
-   möglichst wenige API-Aufrufe.
+   möglichst wenige API-Aufrufe. Bestehende Abonnements ohne Signatur-Secret
+   werden einmalig sicher neu erstellt; schlägt auch danach der Secret-Abruf
+   fehl, bleibt der Polling-Fallback aktiv, ohne eine Neuanlage-Schleife.
 3. **Scheduler** – Belegung wechselt punktgenau bei Check-in/out
 4. **Täglicher Vollsync** – verhindert Drift im Cache
 

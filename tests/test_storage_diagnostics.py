@@ -15,6 +15,7 @@ from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET,
+    CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
     DOMAIN,
 )
 from custom_components.guesty.diagnostics import async_get_config_entry_diagnostics
@@ -66,6 +67,7 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
             CONF_CLIENT_ID: "private-client",
             CONF_CLIENT_SECRET: "private-secret",
             CONF_GUESTY_WEBHOOK_SECRET: "private-webhook-secret",
+            CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID: "private-migration-id",
         },
         options={
             CONF_ACCESS_ENABLED: True,
@@ -128,6 +130,7 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "legacy response body" not in serialized
     assert "private-secret" not in serialized
     assert "private-webhook-secret" not in serialized
+    assert "private-migration-id" not in serialized
     assert "private-field-id" not in serialized
     assert "lock.private_door" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1

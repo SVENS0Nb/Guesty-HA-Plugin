@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from homeassistant.components import webhook
 
-from .api import GuestyApiError, GuestyAuthError
+from .api import GuestyApiError, GuestyAuthError, GuestyNotFoundError
 
 if TYPE_CHECKING:
     from .coordinator import GuestyDataUpdateCoordinator
@@ -176,7 +176,11 @@ async def async_register_guesty_webhook(
     """Register the HA webhook URL with Guesty."""
     from homeassistant.helpers.network import NoURLAvailableError, get_url
 
-    from .const import CONF_GUESTY_WEBHOOK_ID, CONF_GUESTY_WEBHOOK_SECRET
+    from .const import (
+        CONF_GUESTY_WEBHOOK_ID,
+        CONF_GUESTY_WEBHOOK_SECRET,
+        CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
+    )
 
     try:
         base_url = get_url(hass, prefer_external=True, allow_internal=False)
@@ -188,23 +192,67 @@ async def async_register_guesty_webhook(
 
     webhook_url = f"{base_url.rstrip('/')}/api/webhook/{webhook_id}"
     existing_id = entry.data.get(CONF_GUESTY_WEBHOOK_ID)
+    stored_secret = entry.data.get(CONF_GUESTY_WEBHOOK_SECRET)
+    migration_id = entry.data.get(CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID)
     try:
         guesty_webhook_id = await client.async_ensure_webhook(
             webhook_url,
             existing_id,
         )
-        webhook_secret = await client.async_get_webhook_secret(webhook_url)
+        if (
+            guesty_webhook_id == existing_id
+            and isinstance(stored_secret, str)
+            and len(stored_secret.strip()) >= 16
+        ):
+            # The secret belongs to this unchanged remote subscription. Avoid a
+            # needless API lookup and keep working during Guesty API outages.
+            webhook_secret = stored_secret.strip()
+        else:
+            try:
+                webhook_secret = await client.async_get_webhook_secret(webhook_url)
+            except GuestyNotFoundError:
+                if migration_id == guesty_webhook_id:
+                    # This exact subscription was already recreated once. Keep
+                    # polling and retry the secret lookup after the next reload,
+                    # but never enter a delete/create loop.
+                    raise
+                _LOGGER.info("Guesty webhook has no signing secret; recreating it once")
+                try:
+                    await client.async_unregister_webhook(guesty_webhook_id)
+                except GuestyNotFoundError:
+                    pass
+                guesty_webhook_id = await client.async_register_webhook(webhook_url)
+
+                # Persist the new id and one-time marker before the second
+                # lookup. A failure or restart cannot cause repeated recreation.
+                migration_data = {
+                    **entry.data,
+                    CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id,
+                    CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID: guesty_webhook_id,
+                }
+                migration_data.pop(CONF_GUESTY_WEBHOOK_SECRET, None)
+                hass.config_entries.async_update_entry(entry, data=migration_data)
+                webhook_secret = await client.async_get_webhook_secret(webhook_url)
+    except GuestyNotFoundError as err:
+        _LOGGER.warning(
+            "Guesty webhook signing secret is not available after a safe "
+            "one-time migration; polling remains active: %s",
+            err,
+        )
+        return None
     except (GuestyApiError, GuestyAuthError) as err:
         _LOGGER.warning("Failed to register Guesty webhook: %s", err)
         return None
 
+    updated_data = {
+        **entry.data,
+        CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id,
+        CONF_GUESTY_WEBHOOK_SECRET: webhook_secret,
+    }
+    updated_data.pop(CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID, None)
     hass.config_entries.async_update_entry(
         entry,
-        data={
-            **entry.data,
-            CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id,
-            CONF_GUESTY_WEBHOOK_SECRET: webhook_secret,
-        },
+        data=updated_data,
     )
     _LOGGER.info("Guesty webhook registered successfully")
     return guesty_webhook_id
