@@ -15,9 +15,11 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import webhook as guesty_webhook
+from custom_components.guesty.api import GuestyNotFoundError
 from custom_components.guesty.const import (
     CONF_GUESTY_WEBHOOK_ID,
     CONF_GUESTY_WEBHOOK_SECRET,
+    CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
     CONF_WEBHOOK_ID,
     DOMAIN,
 )
@@ -173,7 +175,7 @@ async def test_invalid_stale_and_replayed_signatures_are_rejected(
 
 @pytest.mark.asyncio
 async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None:
-    """Reloading Home Assistant does not delete and recreate Guesty's webhook."""
+    """An unchanged subscription reuses its stored secret without extra traffic."""
     monkeypatch.setattr(
         "homeassistant.helpers.network.get_url",
         lambda *args, **kwargs: "https://ha.example.test",
@@ -193,10 +195,93 @@ async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None
         "https://ha.example.test/api/webhook/local-id",
         "remote-id",
     )
-    client.async_get_webhook_secret.assert_awaited_once_with(
+    client.async_get_webhook_secret.assert_not_awaited()
+    assert entry.data[CONF_GUESTY_WEBHOOK_SECRET] == TEST_SECRET
+
+
+@pytest.mark.asyncio
+async def test_legacy_subscription_without_secret_is_recreated_once(
+    hass, monkeypatch
+) -> None:
+    """A pre-signature webhook is replaced and receives a verifiable secret."""
+    monkeypatch.setattr(
+        "homeassistant.helpers.network.get_url",
+        lambda *args, **kwargs: "https://ha.example.test",
+    )
+    entry = _entry(
+        hass,
+        {
+            CONF_GUESTY_WEBHOOK_ID: "legacy-id",
+            CONF_GUESTY_WEBHOOK_SECRET: "",
+        },
+    )
+    client = SimpleNamespace(
+        async_ensure_webhook=AsyncMock(return_value="legacy-id"),
+        async_get_webhook_secret=AsyncMock(
+            side_effect=[GuestyNotFoundError("not found"), TEST_SECRET]
+        ),
+        async_unregister_webhook=AsyncMock(),
+        async_register_webhook=AsyncMock(return_value="signed-id"),
+    )
+
+    result = await guesty_webhook.async_register_guesty_webhook(
+        hass, entry, client, "local-id"
+    )
+
+    assert result == "signed-id"
+    client.async_unregister_webhook.assert_awaited_once_with("legacy-id")
+    client.async_register_webhook.assert_awaited_once_with(
         "https://ha.example.test/api/webhook/local-id"
     )
+    assert client.async_get_webhook_secret.await_count == 2
+    assert entry.data[CONF_GUESTY_WEBHOOK_ID] == "signed-id"
     assert entry.data[CONF_GUESTY_WEBHOOK_SECRET] == TEST_SECRET
+    assert CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID not in entry.data
+
+
+@pytest.mark.asyncio
+async def test_failed_secret_migration_never_recreates_in_a_loop(
+    hass, monkeypatch
+) -> None:
+    """A persistent Guesty 404 keeps polling without repeated webhook creation."""
+    monkeypatch.setattr(
+        "homeassistant.helpers.network.get_url",
+        lambda *args, **kwargs: "https://ha.example.test",
+    )
+    entry = _entry(
+        hass,
+        {
+            CONF_GUESTY_WEBHOOK_ID: "legacy-id",
+            CONF_GUESTY_WEBHOOK_SECRET: "",
+        },
+    )
+    client = SimpleNamespace(
+        async_ensure_webhook=AsyncMock(side_effect=["legacy-id", "signed-id"]),
+        async_get_webhook_secret=AsyncMock(
+            side_effect=[
+                GuestyNotFoundError("not found"),
+                GuestyNotFoundError("still not found"),
+                GuestyNotFoundError("still not found"),
+            ]
+        ),
+        async_unregister_webhook=AsyncMock(),
+        async_register_webhook=AsyncMock(return_value="signed-id"),
+    )
+
+    first = await guesty_webhook.async_register_guesty_webhook(
+        hass, entry, client, "local-id"
+    )
+    second = await guesty_webhook.async_register_guesty_webhook(
+        hass, entry, client, "local-id"
+    )
+
+    assert first is None
+    assert second is None
+    client.async_unregister_webhook.assert_awaited_once_with("legacy-id")
+    client.async_register_webhook.assert_awaited_once()
+    assert entry.data[CONF_GUESTY_WEBHOOK_ID] == "signed-id"
+    assert entry.data[CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID] == "signed-id"
+    assert not entry.data.get(CONF_GUESTY_WEBHOOK_SECRET)
 
 
 @pytest.mark.asyncio

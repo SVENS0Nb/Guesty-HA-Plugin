@@ -38,6 +38,7 @@ CONF_ACCESS_LOCK_2_NAME_FR: Final = "access_lock_2_name_fr"
 CONF_WEBHOOK_ID: Final = "webhook_id"
 CONF_GUESTY_WEBHOOK_ID: Final = "guesty_webhook_id"
 CONF_GUESTY_WEBHOOK_SECRET: Final = "guesty_webhook_secret"
+CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID: Final = "guesty_webhook_secret_migration_id"
 
 DEFAULT_SCAN_INTERVAL: Final = 300
 DEFAULT_LISTING_SYNC_INTERVAL: Final = 86400
