@@ -20,6 +20,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Datenschutzmodus** – Gastnamen und Bestätigungscodes sind standardmäßig verborgen
 - **Sicherer Gast-Türzugang** – ein zeitlich begrenzter Link pro Reservierung mit
   bis zu zwei serverseitig zugeordneten Home-Assistant-Schlössern
+- **Zugangslink-Diagnose pro Listing** – zeigt Link und Guesty-Syncstatus ohne
+  den sensiblen Link in der Recorder-Historie zu speichern
 
 ## Voraussetzungen
 
@@ -143,11 +145,23 @@ Schloss-Entity und Ergebnis, aber weder Gastnamen noch Zugriffstoken.
 |---------|----------|--------------|
 | Sensor | `sensor.ferienwohnung_belegung` | `vacant` oder `occupied` |
 | Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_aktueller_gast` | Name des Gastes der aktuell laufenden Reservierung |
+| Diagnose-Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_gast_zugangslink` | Status des aktuellen beziehungsweise nächsten Links; die erzeugte URL steht im Attribut `access_url` |
 | Kalender | `calendar.ferienwohnung_reservierungen` | Alle Reservierungen |
 
 Kalendereinträge zeigen standardmäßig nur „Reserviert“ und den Reservierungsstatus. Gastnamen und Bestätigungscodes können in den Integrationsoptionen aktiviert werden.
 
 Der Sensor „Aktueller Gast“ benötigt ebenfalls die Option „Gastdetails anzeigen“ und ist zusätzlich standardmäßig deaktiviert. Nach dem manuellen Aktivieren wird sein Zustand vom Home-Assistant-Recorder gespeichert, sofern die Entität nicht in der Recorder-Konfiguration ausgeschlossen wird.
+
+Der Sensor „Gast-Zugangslink“ ist aus Sicherheitsgründen ebenfalls
+standardmäßig deaktiviert. Zum Prüfen unter **Einstellungen → Geräte & Dienste →
+Guesty → Gerät des Listings → Entitäten** auch deaktivierte Entitäten anzeigen
+und den Sensor aktivieren. Sein Zustand ist `Nicht konfiguriert`, `Keine
+Reservierung`, `Ausstehend`, `Synchronisiert` oder `Fehler`. Der aktuelle oder
+nächste Link steht in den Entitätsattributen unter `access_url`, zum Beispiel in
+**Entwicklerwerkzeuge → Zustände**. `access_url` und der optionale Gastname werden
+nicht in der Recorder-Historie gespeichert. Der Link ist dennoch ein
+Zugangsschlüssel und darf nicht öffentlich geteilt oder in Dashboards für andere
+Benutzer angezeigt werden.
 
 Zusätzlich ein Integrations-Sensor:
 
@@ -245,6 +259,10 @@ python -m pytest
 
 - **Webhook nicht aktiv** – externe URL in Home Assistant konfigurieren (Einstellungen → System → Netzwerk)
 - **Sync-Status `degraded`** – API temporär nicht erreichbar, Cache wird genutzt
+- **Guesty-Feld bleibt leer** – den deaktivierten Diagnose-Sensor
+  „Gast-Zugangslink“ aktivieren: `Synchronisiert` mit `access_url` bestätigt die
+  lokale Erzeugung und den von Guesty bestätigten Schreibvorgang; `Ausstehend`
+  oder `Fehler` zeigt, dass die Veröffentlichung noch nicht bestätigt ist
 - **Diagnostics** – Integration → ⋮ → Diagnose-Daten herunterladen
 - **Logs** – `logger: custom_components.guesty: debug` in `configuration.yaml`
 

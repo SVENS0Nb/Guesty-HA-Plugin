@@ -86,6 +86,16 @@
       "current_guest": {
         "name": "Current guest"
       },
+      "access_link": {
+        "name": "Guest access link",
+        "state": {
+          "not_configured": "Not configured",
+          "no_reservation": "No reservation",
+          "pending": "Pending",
+          "synced": "Synchronized",
+          "error": "Error"
+        }
+      },
       "sync_status": {
         "name": "Sync status",
         "state": {

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -124,6 +124,8 @@ async def test_update_during_reconcile_is_not_lost(hass, monkeypatch) -> None:
     manager, _client = await _manager(hass, monkeypatch)
     manager._reconcile_task = None
     reconcile = AsyncMock()
+    listener = MagicMock()
+    manager.async_add_listener(listener)
 
     async def _reconcile() -> None:
         await reconcile()
@@ -139,6 +141,40 @@ async def test_update_during_reconcile_is_not_lost(hass, monkeypatch) -> None:
     await task
 
     assert reconcile.await_count == 2
+    assert listener.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_listing_snapshot_recreates_current_verified_link(
+    hass, monkeypatch
+) -> None:
+    """A listing diagnostic can display its link without storing the bearer URL."""
+    manager, _client = await _manager(hass, monkeypatch)
+
+    snapshot = manager.listing_access_snapshot("listing-1")
+
+    assert snapshot["status"] == "synced"
+    assert snapshot["access_active"] is True
+    assert snapshot["field_synced"] is True
+    assert snapshot["write_verified"] is True
+    assert snapshot["reservation"].id == "reservation-1"
+    assert snapshot["access_url"].startswith(
+        f"https://ha.test/api/guesty/access/{manager.entry.entry_id}/"
+    )
+    assert "access_url" not in manager._records["reservation-1"]
+
+
+@pytest.mark.asyncio
+async def test_listing_snapshot_reports_unconfigured_mapping(hass, monkeypatch) -> None:
+    """Listings without an enabled lock mapping do not expose access links."""
+    manager, _client = await _manager(hass, monkeypatch)
+
+    assert manager.listing_access_snapshot("listing-2") == {"status": "not_configured"}
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={**manager.entry.options, CONF_ACCESS_ENABLED: False},
+    )
+    assert manager.listing_access_snapshot("listing-1") == {"status": "not_configured"}
 
 
 @pytest.mark.asyncio
