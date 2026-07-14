@@ -127,6 +127,7 @@ ACCESS_MAX_REQUEST_BYTES: Final = 4096
 
 SENSOR_OCCUPANCY: Final = "occupancy"
 SENSOR_CURRENT_GUEST: Final = "current_guest"
+SENSOR_ACCESS_LINK: Final = "access_link"
 SENSOR_SYNC_STATUS: Final = "sync_status"
 
 SYNC_STATUS_OK: Final = "ok"

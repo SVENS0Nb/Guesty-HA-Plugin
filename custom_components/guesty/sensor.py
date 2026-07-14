@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -13,6 +16,7 @@ from .const import (
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
+    SENSOR_ACCESS_LINK,
     SENSOR_CURRENT_GUEST,
     SENSOR_OCCUPANCY,
     SENSOR_SYNC_STATUS,
@@ -20,6 +24,9 @@ from .const import (
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
 from .models import ListingOccupancy
+
+if TYPE_CHECKING:
+    from .access import GuestyAccessManager
 
 
 def _add_listing_entities(
@@ -42,6 +49,11 @@ def _add_listing_entities(
         for entity in (
             GuestyOccupancySensor(coordinator, listing_id),
             GuestyCurrentGuestSensor(coordinator, listing_id),
+            GuestyAccessLinkSensor(
+                coordinator,
+                entry.runtime_data.access_manager,
+                listing_id,
+            ),
         )
     ]
     async_add_entities(entities)
@@ -294,6 +306,120 @@ class GuestyCurrentGuestSensor(
             if cache_age is not None and cache_age > stale_threshold * 60 * 2:
                 return False
         return True
+
+
+class GuestyAccessLinkSensor(
+    CoordinatorEntity[GuestyDataUpdateCoordinator], SensorEntity
+):
+    """Privacy-conscious view of the current or next guest access link."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = [
+        "not_configured",
+        "no_reservation",
+        "pending",
+        "synced",
+        "error",
+    ]
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:link-lock"
+    _attr_translation_key = SENSOR_ACCESS_LINK
+    _unrecorded_attributes = frozenset({"access_url", "guest_name"})
+
+    def __init__(
+        self,
+        coordinator: GuestyDataUpdateCoordinator,
+        access_manager: GuestyAccessManager,
+        listing_id: str,
+    ) -> None:
+        """Initialize a disabled-by-default access link sensor."""
+        super().__init__(coordinator)
+        self._access_manager = access_manager
+        self._listing_id = listing_id
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{listing_id}_access_link"
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to both Guesty data and completed access writes."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self._access_manager.async_add_listener(self._handle_access_update)
+        )
+
+    @callback
+    def _handle_access_update(self) -> None:
+        """Refresh after the access manager finishes a reconciliation pass."""
+        self.async_write_ha_state()
+
+    @property
+    def snapshot(self) -> dict[str, Any]:
+        """Return the current access snapshot."""
+        return self._access_manager.listing_access_snapshot(self._listing_id)
+
+    @property
+    def native_value(self) -> str:
+        """Return whether a generated URL is confirmed in Guesty."""
+        return str(self.snapshot.get("status", "error"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the bearer URL live without allowing recorder history."""
+        snapshot = self.snapshot
+        attributes: dict[str, Any] = {
+            "access_active": snapshot.get("access_active", False),
+            "field_synced": snapshot.get("field_synced", False),
+            "write_verified": snapshot.get("write_verified", False),
+        }
+        access_url = snapshot.get("access_url")
+        if isinstance(access_url, str):
+            attributes["access_url"] = access_url
+        for key in ("access_start", "access_end"):
+            value = snapshot.get(key)
+            if value is not None:
+                attributes[key] = value.isoformat()
+        reservation = snapshot.get("reservation")
+        if reservation is not None:
+            attributes["reservation_status"] = reservation.status
+            if self._expose_guest_details and reservation.guest_name:
+                attributes["guest_name"] = reservation.guest_name
+        return attributes
+
+    @property
+    def _expose_guest_details(self) -> bool:
+        """Return whether the existing privacy opt-in allows the guest name."""
+        return self.coordinator.config_entry.options.get(
+            CONF_EXPOSE_GUEST_DETAILS,
+            DEFAULT_EXPOSE_GUEST_DETAILS,
+        )
+
+    @property
+    def device_info(self) -> dict:
+        """Attach the sensor to its Guesty listing device."""
+        listing = (
+            self.coordinator.data.listings.get(self._listing_id)
+            if self.coordinator.data
+            else None
+        )
+        listing_name = listing.display_name if listing else self._listing_id
+        return {
+            "identifiers": {(DOMAIN, self._listing_id)},
+            "name": listing_name,
+            "manufacturer": "Guesty",
+            "model": "Listing",
+            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
+        }
+
+    @property
+    def available(self) -> bool:
+        """Return whether current Guesty listing data is available."""
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and self._listing_id in self.coordinator.data.listings
+        )
 
 
 class GuestySyncStatusSensor(

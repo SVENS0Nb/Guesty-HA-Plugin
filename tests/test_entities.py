@@ -9,6 +9,7 @@ import zoneinfo
 
 import pytest
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.entity import EntityCategory
 
 from custom_components.guesty.calendar import (
     GuestyReservationCalendar,
@@ -21,6 +22,7 @@ from custom_components.guesty.models import (
     calculate_listing_occupancy,
 )
 from custom_components.guesty.sensor import (
+    GuestyAccessLinkSensor,
     GuestyCurrentGuestSensor,
     GuestyOccupancySensor,
     _add_listing_entities as add_sensor_entities,
@@ -90,6 +92,16 @@ def _coordinator(
         last_update_success=True,
         async_add_listener=lambda listener, context=None: lambda: None,
         get_listing_reservations=lambda listing_id: [reservation],
+    )
+
+
+def _access_manager(snapshot: dict | None = None):
+    """Return the small access-manager surface used by sensor entities."""
+    return SimpleNamespace(
+        listing_access_snapshot=lambda _listing_id: (
+            snapshot or {"status": "no_reservation"}
+        ),
+        async_add_listener=lambda _listener: lambda: None,
     )
 
 
@@ -194,11 +206,62 @@ def test_current_guest_sensor_exposes_only_the_active_guest() -> None:
     assert upcoming.native_value is None
 
 
+def test_access_link_sensor_exposes_live_unrecorded_url_after_enable() -> None:
+    """The diagnostic sensor shows a verified link without recorder history."""
+    coordinator = _coordinator(expose_details=True)
+    reservation = coordinator.data.reservations[0]
+    manager = _access_manager(
+        {
+            "status": "synced",
+            "access_url": "https://ha.test/api/guesty/access/entry/token",
+            "reservation": reservation,
+            "access_start": datetime(2026, 7, 13, 15, 0, tzinfo=TZ),
+            "access_end": datetime(2026, 7, 16, 11, 0, tzinfo=TZ),
+            "access_active": True,
+            "field_synced": True,
+            "write_verified": True,
+        }
+    )
+    entity = GuestyAccessLinkSensor(coordinator, manager, "listing-1")
+
+    assert entity.native_value == "synced"
+    assert entity.entity_registry_enabled_default is False
+    assert entity.entity_category is EntityCategory.DIAGNOSTIC
+    assert entity.extra_state_attributes == {
+        "access_active": True,
+        "field_synced": True,
+        "write_verified": True,
+        "access_url": "https://ha.test/api/guesty/access/entry/token",
+        "access_start": "2026-07-13T15:00:00+02:00",
+        "access_end": "2026-07-16T11:00:00+02:00",
+        "reservation_status": "confirmed",
+        "guest_name": "Private Guest",
+    }
+    assert {"access_url", "guest_name"} <= entity._unrecorded_attributes
+
+
+def test_access_link_sensor_hides_guest_name_without_privacy_opt_in() -> None:
+    """The link diagnostic reuses the existing guest-detail privacy setting."""
+    coordinator = _coordinator()
+    manager = _access_manager(
+        {
+            "status": "pending",
+            "reservation": coordinator.data.reservations[0],
+            "access_active": False,
+        }
+    )
+    entity = GuestyAccessLinkSensor(coordinator, manager, "listing-1")
+
+    assert entity.native_value == "pending"
+    assert "guest_name" not in entity.extra_state_attributes
+
+
 def test_new_listings_create_entities_once_during_runtime() -> None:
     """Coordinator updates add new sensors and calendars without a reload."""
     coordinator = _coordinator()
     entry = SimpleNamespace(
         runtime_data=SimpleNamespace(
+            access_manager=_access_manager(),
             sensor_listing_ids=set(),
             calendar_listing_ids=set(),
         )
@@ -213,7 +276,7 @@ def test_new_listings_create_entities_once_during_runtime() -> None:
 
     add_sensors.assert_called_once()
     add_calendars.assert_called_once()
-    assert len(add_sensors.call_args.args[0]) == 2
+    assert len(add_sensors.call_args.args[0]) == 3
     assert entry.runtime_data.sensor_listing_ids == {"listing-1"}
     assert entry.runtime_data.calendar_listing_ids == {"listing-1"}
 
@@ -223,6 +286,7 @@ def test_removed_listing_entities_become_unavailable() -> None:
     coordinator = _coordinator()
     sensor = GuestyOccupancySensor(coordinator, "listing-1")
     guest_sensor = GuestyCurrentGuestSensor(coordinator, "listing-1")
+    access_sensor = GuestyAccessLinkSensor(coordinator, _access_manager(), "listing-1")
     calendar = GuestyReservationCalendar(coordinator, "listing-1")
 
     coordinator.data.listings.clear()
@@ -230,4 +294,5 @@ def test_removed_listing_entities_become_unavailable() -> None:
 
     assert not sensor.available
     assert not guest_sensor.available
+    assert not access_sensor.available
     assert not calendar.available

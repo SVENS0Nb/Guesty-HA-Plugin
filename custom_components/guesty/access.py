@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import defaultdict, deque
-from collections.abc import Mapping
-from datetime import timedelta
+from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import html
@@ -21,7 +21,7 @@ from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant, valid_entity_id
+from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -118,6 +118,7 @@ class GuestyAccessManager:
         self._last_reconcile_error: str | None = None
         self._last_eligible_count = 0
         self._last_published_count = 0
+        self._listeners: set[Callable[[], None]] = set()
         self._last_action: dict[tuple[str, int], float] = {}
         self._action_windows: defaultdict[tuple[str, int], deque[float]] = defaultdict(
             deque
@@ -178,6 +179,8 @@ class GuestyAccessManager:
                     self._last_reconcile_result = "error"
                     self._last_reconcile_error = type(err).__name__
                     _LOGGER.exception("Unexpected guest access synchronization failure")
+                finally:
+                    self._notify_listeners()
         finally:
             # Close the small race where a listener sets pending just as the
             # loop finishes but still sees this task as running.
@@ -364,6 +367,109 @@ class GuestyAccessManager:
             ),
         }
 
+    @callback
+    def async_add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Listen for completed access reconciliation passes."""
+        self._listeners.add(listener)
+
+        @callback
+        def _remove_listener() -> None:
+            self._listeners.discard(listener)
+
+        return _remove_listener
+
+    @callback
+    def _notify_listeners(self) -> None:
+        """Update access entities after local or remote state changes."""
+        for listener in tuple(self._listeners):
+            listener()
+
+    def listing_access_snapshot(self, listing_id: str) -> dict[str, Any]:
+        """Return the current or next reservation link for one listing."""
+        if (
+            not self.entry.options.get(CONF_ACCESS_ENABLED, False)
+            or listing_id not in self._mappings
+        ):
+            return {"status": "not_configured"}
+        data = self._coordinator.data
+        if data is None:
+            return {"status": "error"}
+
+        now = dt_util.utcnow()
+        candidates: list[tuple[int, datetime, datetime, GuestyReservation]] = []
+        for reservation in data.reservations:
+            if (
+                reservation.listing_id != listing_id
+                or not reservation.is_active_status()
+            ):
+                continue
+            try:
+                start, end = self._access_window(reservation)
+            except ValueError:
+                continue
+            if end <= now:
+                continue
+            priority = 0 if start <= now < end else 1
+            candidates.append((priority, start, end, reservation))
+
+        if not candidates:
+            return {"status": "no_reservation"}
+        _priority, start, end, reservation = min(
+            candidates,
+            key=lambda item: (item[0], item[1], item[3].id),
+        )
+        record = self._records.get(reservation.id)
+        if not isinstance(record, dict) or record.get("revoked"):
+            return {
+                "status": "pending",
+                "reservation": reservation,
+                "access_start": start,
+                "access_end": end,
+                "access_active": start <= now < end,
+            }
+
+        access_url = self._access_url_for_record(reservation.id, record)
+        field_synced = bool(record.get("field_synced"))
+        verified = bool(record.get("write_verified"))
+        synchronized = field_synced and verified
+        status = "synced" if synchronized else "pending"
+        if access_url is None or (
+            not synchronized and self._last_reconcile_result in {"error", "partial"}
+        ):
+            status = "error"
+        return {
+            "status": status,
+            "access_url": access_url,
+            "reservation": reservation,
+            "access_start": start,
+            "access_end": end,
+            "access_active": start <= now < end,
+            "field_synced": field_synced,
+            "write_verified": verified,
+        }
+
+    def _access_url_for_record(
+        self,
+        reservation_id: str,
+        record: Mapping[str, Any],
+    ) -> str | None:
+        """Recreate a bearer URL without persisting it in Home Assistant storage."""
+        version = record.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            return None
+        try:
+            base_url = get_url(
+                self.hass,
+                prefer_external=True,
+                allow_internal=False,
+            ).rstrip("/")
+        except NoURLAvailableError:
+            return None
+        if urlsplit(base_url).scheme != "https":
+            return None
+        token = self._token_for(reservation_id, version)
+        return f"{base_url}{ACCESS_URL_PATH}/{self.entry.entry_id}/{token}"
+
     async def _async_resolve_field(self, reference: str) -> str:
         """Resolve and cache a configured Guesty custom field."""
         cached = self._data.get("resolved_field")
@@ -520,7 +626,9 @@ class GuestyAccessManager:
             return None
         return reservation_id, reservation, doors
 
-    def _access_window(self, reservation: GuestyReservation) -> tuple[Any, Any]:
+    def _access_window(
+        self, reservation: GuestyReservation
+    ) -> tuple[datetime, datetime]:
         """Return the configured access window for a reservation."""
         data = self._coordinator.data
         if data is None or reservation.listing_id not in data.listings:
