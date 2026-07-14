@@ -37,6 +37,7 @@ CONF_ACCESS_LOCK_2_NAME_ES: Final = "access_lock_2_name_es"
 CONF_ACCESS_LOCK_2_NAME_FR: Final = "access_lock_2_name_fr"
 CONF_WEBHOOK_ID: Final = "webhook_id"
 CONF_GUESTY_WEBHOOK_ID: Final = "guesty_webhook_id"
+CONF_GUESTY_WEBHOOK_SECRET: Final = "guesty_webhook_secret"
 
 DEFAULT_SCAN_INTERVAL: Final = 300
 DEFAULT_LISTING_SYNC_INTERVAL: Final = 86400
@@ -109,20 +110,21 @@ RESERVATION_FIELDS: Final = (
 )
 
 WEBHOOK_SUBSCRIPTION_EVENTS: Final = (
-    "reservation.new",
-    "reservation.updated",
+    "reservation.created.v2",
+    "reservation.updated.v2",
     "listing.new",
     "listing.updated",
     "listing.removed",
 )
 
-# Accept newer payload names defensively, but only subscribe to event names
-# documented by Guesty's Open API.
+# Existing Guesty subscriptions may still deliver the legacy event names during
+# migration. Accept them locally, but never request them from the API again.
 WEBHOOK_EVENTS: Final = (
     *WEBHOOK_SUBSCRIPTION_EVENTS,
-    "reservation.created.v2",
-    "reservation.updated.v2",
+    "reservation.new",
+    "reservation.updated",
 )
+WEBHOOK_SIGNATURE_TOLERANCE_SECONDS: Final = 300
 
 EVENT_OCCUPANCY_CHANGED: Final = "guesty_occupancy_changed"
 EVENT_DOOR_ACCESS: Final = "guesty_door_access"
@@ -134,6 +136,9 @@ ACCESS_UNLOCK_COOLDOWN_SECONDS: Final = 5
 ACCESS_RATE_LIMIT_WINDOW_SECONDS: Final = 60
 ACCESS_RATE_LIMIT_MAX_ACTIONS: Final = 10
 ACCESS_MAX_REQUEST_BYTES: Final = 4096
+ACCESS_RETRY_BASE_SECONDS: Final = 300
+ACCESS_RETRY_MAX_SECONDS: Final = 3600
+ACCESS_REVOKED_RECORD_RETENTION_DAYS: Final = 7
 
 SENSOR_OCCUPANCY: Final = "occupancy"
 SENSOR_CURRENT_GUEST: Final = "current_guest"

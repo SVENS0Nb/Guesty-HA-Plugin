@@ -39,6 +39,9 @@ from .const import (
     ACCESS_MAX_REQUEST_BYTES,
     ACCESS_RATE_LIMIT_MAX_ACTIONS,
     ACCESS_RATE_LIMIT_WINDOW_SECONDS,
+    ACCESS_RETRY_BASE_SECONDS,
+    ACCESS_RETRY_MAX_SECONDS,
+    ACCESS_REVOKED_RECORD_RETENTION_DAYS,
     ACCESS_TOKEN_BYTES,
     ACCESS_UNLOCK_COOLDOWN_SECONDS,
     ACCESS_URL_PATH,
@@ -232,6 +235,7 @@ class GuestyAccessManager:
         self._last_eligible_count = 0
         self._last_published_count = 0
         self._last_recovered_count = 0
+        self._last_deferred_count = 0
         self._validated_field_references: set[str] = set()
         self._listeners: set[Callable[[], None]] = set()
         self._last_action: dict[tuple[str, int], float] = {}
@@ -265,6 +269,9 @@ class GuestyAccessManager:
             except asyncio.CancelledError:
                 pass
         self._token_index.clear()
+        self._last_action.clear()
+        self._action_windows.clear()
+        self._listeners.clear()
 
     def async_schedule_reconcile(self) -> None:
         """Debounce coordinator updates into one access reconciliation."""
@@ -311,6 +318,7 @@ class GuestyAccessManager:
             self._last_reconcile_error = None
             self._last_published_count = 0
             self._last_recovered_count = 0
+            self._last_deferred_count = 0
             records = self._records
             mappings = self._mappings
             enabled = bool(self.entry.options.get(CONF_ACCESS_ENABLED, False))
@@ -341,13 +349,16 @@ class GuestyAccessManager:
             for reservation_id, record in list(records.items()):
                 if reservation_id not in eligible:
                     record["revoked"] = True
+                    record.setdefault("revoked_at", now.isoformat())
 
             for reservation_id, (reservation, fingerprint) in eligible.items():
                 existing = records.get(reservation_id)
                 if not isinstance(existing, dict):
                     existing = {}
-                if existing.get("fingerprint") != fingerprint:
-                    version = int(existing.get("version", 0)) + 1
+                if existing.get("fingerprint") != fingerprint or existing.get(
+                    "revoked"
+                ):
+                    version = self._next_token_version(existing)
                     token = self._token_for(reservation_id, version)
                     existing.update(
                         {
@@ -361,7 +372,10 @@ class GuestyAccessManager:
                         }
                     )
                     existing.pop("recovery_marker", None)
+                    self._clear_retry(existing, "publish")
+                    self._clear_retry(existing, "cleanup")
                 existing["revoked"] = False
+                existing.pop("revoked_at", None)
                 records[reservation_id] = existing
 
             # Revocation becomes effective locally before any remote API request.
@@ -407,6 +421,9 @@ class GuestyAccessManager:
 
             for reservation_id in sorted(eligible):
                 record = records[reservation_id]
+                if self._retry_is_deferred(record, "publish", now):
+                    self._last_deferred_count += 1
+                    continue
                 field_id, publish_error = await self._async_publish_access_link(
                     reservation_id,
                     record,
@@ -415,6 +432,7 @@ class GuestyAccessManager:
                     base_url,
                 )
                 if publish_error is not None:
+                    self._record_retry_failure(record, "publish", now)
                     _LOGGER.warning(
                         "Could not publish a Guesty access link for reservation %s: %s",
                         reservation_id,
@@ -422,6 +440,8 @@ class GuestyAccessManager:
                     )
                     self._last_reconcile_result = "partial"
                     self._last_reconcile_error = str(publish_error)[:500]
+                else:
+                    self._clear_retry(record, "publish")
 
             await self._async_cleanup_revoked_records()
             await self._storage.async_save(self._data)
@@ -553,10 +573,7 @@ class GuestyAccessManager:
         record: dict[str, Any],
     ) -> None:
         """Rotate one bearer token and immediately invalidate its predecessor."""
-        try:
-            version = int(record.get("version", 0)) + 1
-        except (TypeError, ValueError):
-            version = 1
+        version = self._next_token_version(record)
         token = self._token_for(reservation_id, version)
         record.update(
             {
@@ -591,6 +608,7 @@ class GuestyAccessManager:
             "eligible_reservations": self._last_eligible_count,
             "published_during_last_reconcile": self._last_published_count,
             "recovered_during_last_reconcile": self._last_recovered_count,
+            "deferred_during_last_reconcile": self._last_deferred_count,
             "local_records": len(records),
             "synced_records": sum(
                 1 for record in records.values() if record.get("field_synced")
@@ -727,25 +745,109 @@ class GuestyAccessManager:
 
     async def _async_cleanup_revoked_records(self) -> None:
         """Clear Guesty fields for revoked records and retain failed tombstones."""
+        now = dt_util.utcnow()
         for reservation_id, record in list(self._records.items()):
             if not record.get("revoked"):
                 continue
+            revoked_at = dt_util.parse_datetime(str(record.get("revoked_at", "")))
+            retention_expired = bool(
+                revoked_at
+                and now - revoked_at
+                >= timedelta(days=ACCESS_REVOKED_RECORD_RETENTION_DAYS)
+            )
             if record.get("field_synced") and isinstance(record.get("field_id"), str):
+                if self._retry_is_deferred(record, "cleanup", now):
+                    if not retention_expired:
+                        continue
+                    _LOGGER.warning(
+                        "Discarding an expired Guesty access cleanup tombstone for "
+                        "reservation %s; its old URL remains locally invalid",
+                        reservation_id,
+                    )
+                    self._remove_record(reservation_id)
+                    continue
                 try:
                     await self._client.async_delete_reservation_custom_field(
                         reservation_id,
                         record["field_id"],
                     )
                 except (GuestyApiError, GuestyAuthError) as err:
+                    self._record_retry_failure(record, "cleanup", now)
                     _LOGGER.warning(
                         "Access is revoked locally, but its Guesty field could not "
                         "yet be cleared for reservation %s: %s",
                         reservation_id,
                         err,
                     )
-                    continue
-            self._records.pop(reservation_id, None)
+                    if not retention_expired:
+                        continue
+                else:
+                    self._clear_retry(record, "cleanup")
+            self._remove_record(reservation_id)
         self._rebuild_token_index()
+
+    @staticmethod
+    def _next_token_version(record: Mapping[str, Any]) -> int:
+        """Advance an existing token or randomize the first generation."""
+        current = record.get("version")
+        if isinstance(current, int) and not isinstance(current, bool) and current >= 1:
+            return current + 1
+        # A random first generation prevents a deleted and later reactivated
+        # reservation from recreating a previously published bearer URL.
+        return secrets.randbits(63) or 1
+
+    @staticmethod
+    def _retry_is_deferred(
+        record: Mapping[str, Any],
+        operation: str,
+        now: datetime,
+    ) -> bool:
+        """Return whether a persistent per-record retry is still cooling down."""
+        value = record.get(f"{operation}_retry_at")
+        if not isinstance(value, str):
+            return False
+        retry_at = dt_util.parse_datetime(value)
+        if retry_at is None:
+            return False
+        try:
+            return retry_at > now
+        except TypeError:
+            return False
+
+    @staticmethod
+    def _record_retry_failure(
+        record: dict[str, Any],
+        operation: str,
+        now: datetime,
+    ) -> None:
+        """Persist bounded exponential backoff for a failed remote operation."""
+        count_key = f"{operation}_retry_count"
+        try:
+            count = min(max(int(record.get(count_key, 0)), 0) + 1, 20)
+        except (TypeError, ValueError):
+            count = 1
+        delay = min(
+            ACCESS_RETRY_BASE_SECONDS * (2 ** (count - 1)),
+            ACCESS_RETRY_MAX_SECONDS,
+        )
+        record[count_key] = count
+        record[f"{operation}_retry_at"] = (now + timedelta(seconds=delay)).isoformat()
+
+    @staticmethod
+    def _clear_retry(record: dict[str, Any], operation: str) -> None:
+        """Clear persistent retry metadata after success or a material change."""
+        record.pop(f"{operation}_retry_count", None)
+        record.pop(f"{operation}_retry_at", None)
+
+    def _remove_record(self, reservation_id: str) -> None:
+        """Remove a record and every in-memory rate-limit key derived from it."""
+        self._records.pop(reservation_id, None)
+        for key in tuple(self._last_action):
+            if key[0] == reservation_id:
+                self._last_action.pop(key, None)
+        for key in tuple(self._action_windows):
+            if key[0] == reservation_id:
+                self._action_windows.pop(key, None)
 
     async def async_get_portal(
         self,

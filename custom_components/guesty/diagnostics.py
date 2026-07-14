@@ -16,6 +16,7 @@ from .const import (
     CONF_CLIENT_SECRET,
     CONF_ACCESS_TOKEN,
     CONF_GUESTY_WEBHOOK_ID,
+    CONF_GUESTY_WEBHOOK_SECRET,
     CONF_WEBHOOK_ID,
 )
 from .data import GuestyConfigEntry
@@ -24,6 +25,7 @@ TO_REDACT = {
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_GUESTY_WEBHOOK_ID,
+    CONF_GUESTY_WEBHOOK_SECRET,
     CONF_WEBHOOK_ID,
     "access_token",
     CONF_ACCESS_TOKEN,

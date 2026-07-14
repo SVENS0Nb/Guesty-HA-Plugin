@@ -211,6 +211,13 @@ def test_targeted_reservation_filters_limit_new_listing_traffic() -> None:
 @pytest.mark.asyncio
 async def test_webhook_registration_uses_only_documented_events(monkeypatch) -> None:
     """Compatibility-only event names cannot make registration fail."""
+    assert WEBHOOK_SUBSCRIPTION_EVENTS == (
+        "reservation.created.v2",
+        "reservation.updated.v2",
+        "listing.new",
+        "listing.updated",
+        "listing.removed",
+    )
     client = _client()
     request = AsyncMock(return_value={"_id": "webhook-1"})
     monkeypatch.setattr(client, "_async_request", request)
@@ -444,10 +451,63 @@ async def test_existing_webhook_is_repaired_in_place(monkeypatch) -> None:
     request.assert_any_await(
         "PUT",
         "/webhooks/webhook-1",
+        json_body={"events": list(WEBHOOK_SUBSCRIPTION_EVENTS)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_changed_webhook_url_is_deleted_and_recreated(monkeypatch) -> None:
+    """Guesty's immutable webhook URLs are migrated without an invalid PUT."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": "webhook-old",
+                    "url": "https://old.example.test/hook",
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                    "active": True,
+                }
+            ],
+            [],
+            {"_id": "webhook-new"},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    assert (
+        await client.async_ensure_webhook(
+            "https://new.example.test/hook", "webhook-old"
+        )
+        == "webhook-new"
+    )
+    request.assert_any_await("DELETE", "/webhooks/webhook-old")
+    request.assert_any_await(
+        "POST",
+        "/webhooks",
         json_body={
-            "url": "https://ha.example.test/hook",
+            "url": "https://new.example.test/hook",
             "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
         },
+    )
+    assert not any(call.args[:1] == ("PUT",) for call in request.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_webhook_signing_secret_is_parsed(monkeypatch) -> None:
+    """The endpoint-specific Guesty signing secret is required for ingestion."""
+    client = _client()
+    request = AsyncMock(return_value={"data": {"secret": "whsec_abcdefghijklmnop"}})
+    monkeypatch.setattr(client, "_async_request", request)
+
+    assert (
+        await client.async_get_webhook_secret("https://ha.example.test/hook")
+        == "whsec_abcdefghijklmnop"
+    )
+    request.assert_awaited_once_with(
+        "GET",
+        "/webhooks-v2/secret",
+        params={"url": "https://ha.example.test/hook"},
     )
 
 

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -17,13 +23,76 @@ _LOGGER = logging.getLogger(__name__)
 MAX_WEBHOOK_BODY_BYTES = 1_000_000
 
 
+def _webhook_secret_key(secret: str) -> bytes | None:
+    """Decode a Standard Webhooks/Svix secret without accepting empty keys."""
+    encoded = secret.removeprefix("whsec_").strip()
+    if not encoded:
+        return None
+    try:
+        key = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        key = encoded.encode()
+    return key if len(key) >= 16 else None
+
+
+def verify_webhook_signature(
+    headers: Any,
+    body: bytes,
+    secret: str,
+    *,
+    now: float | None = None,
+) -> str | None:
+    """Verify Standard Webhooks or legacy Svix headers and return message id."""
+    from .const import WEBHOOK_SIGNATURE_TOLERANCE_SECONDS
+
+    message_id = headers.get("webhook-id") or headers.get("svix-id")
+    timestamp = headers.get("webhook-timestamp") or headers.get("svix-timestamp")
+    signatures = headers.get("webhook-signature") or headers.get("svix-signature")
+    if not all(
+        isinstance(value, str) and value
+        for value in (message_id, timestamp, signatures)
+    ):
+        return None
+
+    try:
+        timestamp_value = int(timestamp)
+    except (TypeError, ValueError):
+        return None
+    current_time = time.time() if now is None else now
+    if abs(current_time - timestamp_value) > WEBHOOK_SIGNATURE_TOLERANCE_SECONDS:
+        return None
+
+    key = _webhook_secret_key(secret)
+    if key is None:
+        return None
+    signed = f"{message_id}.{timestamp}.".encode() + body
+    expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    for item in signatures.split():
+        version, separator, candidate = item.partition(",")
+        if separator and version == "v1" and hmac.compare_digest(candidate, expected):
+            return message_id
+    return None
+
+
 async def async_setup_webhook(
     hass: Any,
     entry: Any,
     coordinator: GuestyDataUpdateCoordinator,
 ) -> str | None:
     """Register the Home Assistant webhook endpoint."""
-    from .const import CONF_WEBHOOK_ID, DOMAIN, WEBHOOK_EVENTS
+    from .const import (
+        CONF_GUESTY_WEBHOOK_SECRET,
+        CONF_WEBHOOK_ID,
+        DOMAIN,
+        WEBHOOK_EVENTS,
+        WEBHOOK_SIGNATURE_TOLERANCE_SECONDS,
+    )
+
+    seen_message_ids: dict[str, int] = {}
 
     async def handle_webhook(
         hass: Any, webhook_id: str, request: web.Request
@@ -32,8 +101,35 @@ async def async_setup_webhook(
         if (getattr(request, "content_length", None) or 0) > MAX_WEBHOOK_BODY_BYTES:
             return web.Response(status=413, body="payload too large")
         try:
-            payload = await request.json()
-        except (ValueError, TypeError):
+            body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return web.Response(status=413, body="payload too large")
+        if len(body) > MAX_WEBHOOK_BODY_BYTES:
+            return web.Response(status=413, body="payload too large")
+
+        secret = entry.data.get(CONF_GUESTY_WEBHOOK_SECRET)
+        if not isinstance(secret, str) or not secret:
+            _LOGGER.warning(
+                "Guesty webhook rejected because no signing secret is loaded"
+            )
+            return web.Response(status=503, body="webhook verification unavailable")
+        message_id = verify_webhook_signature(request.headers, body, secret)
+        if message_id is None:
+            _LOGGER.warning("Guesty webhook received an invalid signature")
+            return web.Response(status=401, body="invalid signature")
+
+        now = int(time.time())
+        cutoff = now - WEBHOOK_SIGNATURE_TOLERANCE_SECONDS
+        for seen_id, seen_at in tuple(seen_message_ids.items()):
+            if seen_at < cutoff:
+                seen_message_ids.pop(seen_id, None)
+        if message_id in seen_message_ids:
+            return web.Response(status=202)
+        seen_message_ids[message_id] = now
+
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             _LOGGER.warning("Guesty webhook received invalid JSON")
             return web.Response(status=400, body="invalid json")
 
@@ -46,10 +142,7 @@ async def async_setup_webhook(
             _LOGGER.debug("Ignoring unsupported Guesty webhook event %r", event)
             return web.Response(status=202)
 
-        hass.async_create_task(
-            coordinator.async_handle_webhook(payload),
-            f"guesty_webhook_{event}",
-        )
+        await coordinator.async_handle_webhook(payload)
         return web.Response(status=202)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
@@ -83,7 +176,7 @@ async def async_register_guesty_webhook(
     """Register the HA webhook URL with Guesty."""
     from homeassistant.helpers.network import NoURLAvailableError, get_url
 
-    from .const import CONF_GUESTY_WEBHOOK_ID
+    from .const import CONF_GUESTY_WEBHOOK_ID, CONF_GUESTY_WEBHOOK_SECRET
 
     try:
         base_url = get_url(hass, prefer_external=True, allow_internal=False)
@@ -100,19 +193,18 @@ async def async_register_guesty_webhook(
             webhook_url,
             existing_id,
         )
+        webhook_secret = await client.async_get_webhook_secret(webhook_url)
     except (GuestyApiError, GuestyAuthError) as err:
         _LOGGER.warning("Failed to register Guesty webhook: %s", err)
         return None
 
-    if existing_id and existing_id != guesty_webhook_id:
-        try:
-            await client.async_unregister_webhook(existing_id)
-        except (GuestyApiError, GuestyAuthError):
-            _LOGGER.debug("Could not remove the obsolete Guesty webhook")
-
     hass.config_entries.async_update_entry(
         entry,
-        data={**entry.data, CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id},
+        data={
+            **entry.data,
+            CONF_GUESTY_WEBHOOK_ID: guesty_webhook_id,
+            CONF_GUESTY_WEBHOOK_SECRET: webhook_secret,
+        },
     )
     _LOGGER.info("Guesty webhook registered successfully")
     return guesty_webhook_id
