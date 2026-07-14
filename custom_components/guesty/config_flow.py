@@ -25,6 +25,13 @@ from .api import (
     GuestyAuthError,
     GuestyPermissionError,
 )
+from .loxone_api import (
+    LoxoneApiClient,
+    LoxoneApiError,
+    LoxoneAuthError,
+    loxone_server_id,
+    normalize_loxone_url,
+)
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_CUSTOM_FIELD,
@@ -49,6 +56,19 @@ from .const import (
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_LISTING_SYNC_INTERVAL,
+    CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_GROUP_UUIDS,
+    CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_LOXONE_LISTINGS,
+    CONF_LOXONE_MINISERVERS,
+    CONF_LOXONE_PROVISION_LEAD_MINUTES,
+    CONF_LOXONE_SERVER_GROUPS,
+    CONF_LOXONE_SERVER_ID,
+    CONF_LOXONE_SERVER_NAME,
+    CONF_LOXONE_SERVER_PASSWORD,
+    CONF_LOXONE_SERVER_URL,
+    CONF_LOXONE_SERVER_USERNAME,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_STALE_THRESHOLD_HOURS,
@@ -61,6 +81,9 @@ from .const import (
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_ACCESS_LOGO_URL,
     DEFAULT_LISTING_SYNC_INTERVAL,
+    DEFAULT_LOXONE_CODE_PREFIX,
+    DEFAULT_LOXONE_ENABLED,
+    DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
     DEFAULT_SCAN_INTERVAL,
@@ -84,6 +107,8 @@ _LOCK_2_NAME_FIELDS = {
     "es": CONF_ACCESS_LOCK_2_NAME_ES,
     "fr": CONF_ACCESS_LOCK_2_NAME_FR,
 }
+
+CONF_LOXONE_SERVER_COUNT = "loxone_server_count"
 
 
 def _door_mapping_from_input(
@@ -139,6 +164,7 @@ OPTIONS_SCHEMA = vol.Schema(
             CONF_EXPOSE_GUEST_DETAILS, default=DEFAULT_EXPOSE_GUEST_DETAILS
         ): bool,
         vol.Optional(CONF_ACCESS_ENABLED, default=DEFAULT_ACCESS_ENABLED): bool,
+        vol.Optional(CONF_LOXONE_ENABLED, default=DEFAULT_LOXONE_ENABLED): bool,
     }
 )
 
@@ -217,6 +243,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_STALE_THRESHOLD_HOURS: DEFAULT_STALE_THRESHOLD_HOURS,
                         CONF_EXPOSE_GUEST_DETAILS: DEFAULT_EXPOSE_GUEST_DETAILS,
                         CONF_ACCESS_ENABLED: DEFAULT_ACCESS_ENABLED,
+                        CONF_LOXONE_ENABLED: DEFAULT_LOXONE_ENABLED,
                     },
                 )
 
@@ -277,6 +304,10 @@ class GuestyOptionsFlow(OptionsFlow):
     _pending_options: dict[str, Any]
     _pending_mappings: dict[str, list[dict[str, str]]]
     _listing_queue: list[str]
+    _pending_loxone_servers: list[dict[str, Any]]
+    _pending_loxone_mappings: dict[str, dict[str, Any]]
+    _loxone_server_queue: list[int]
+    _loxone_listing_queue: list[str]
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -284,9 +315,11 @@ class GuestyOptionsFlow(OptionsFlow):
         """Manage Guesty options."""
         if user_input is not None:
             self._pending_options = {**self.config_entry.options, **user_input}
-            if not user_input.get(CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED):
-                return self.async_create_entry(title="", data=self._pending_options)
-            return await self.async_step_access()
+            if user_input.get(CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED):
+                return await self.async_step_access()
+            if user_input.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED):
+                return await self.async_step_loxone()
+            return self.async_create_entry(title="", data=self._pending_options)
 
         options = self.config_entry.options
         return self.async_show_form(
@@ -315,6 +348,9 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                     CONF_ACCESS_ENABLED: options.get(
                         CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED
+                    ),
+                    CONF_LOXONE_ENABLED: options.get(
+                        CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED
                     ),
                 },
             ),
@@ -501,6 +537,10 @@ class GuestyOptionsFlow(OptionsFlow):
                 self._pending_options[CONF_ACCESS_LOCK_MAPPINGS] = (
                     self._pending_mappings
                 )
+                if self._pending_options.get(
+                    CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED
+                ):
+                    return await self.async_step_loxone()
                 return self.async_create_entry(title="", data=self._pending_options)
 
         current = self.config_entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
@@ -544,6 +584,314 @@ class GuestyOptionsFlow(OptionsFlow):
                     CONF_ACCESS_LOCK_2_NAME_ES: second_names["es"],
                     CONF_ACCESS_LOCK_2_NAME_FR: second_names["fr"],
                 },
+            ),
+            errors=errors,
+            description_placeholders={"listing": listing.display_name},
+        )
+
+    async def async_step_loxone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure shared Loxone PIN timing and selected Guesty listings."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        listings = coordinator.data.listings if coordinator.data else {}
+        if not listings:
+            return self.async_abort(reason="no_listings")
+        choices = [
+            selector.SelectOptionDict(value=listing_id, label=listing.display_name)
+            for listing_id, listing in sorted(
+                listings.items(), key=lambda item: item[1].display_name.lower()
+            )
+        ]
+        current_servers = self.config_entry.options.get(CONF_LOXONE_MINISERVERS, [])
+        if not isinstance(current_servers, list):
+            current_servers = []
+        current_mappings = self.config_entry.options.get(
+            CONF_LOXONE_LISTING_MAPPINGS, {}
+        )
+        if not isinstance(current_mappings, dict):
+            current_mappings = {}
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            selected = user_input.get(CONF_LOXONE_LISTINGS)
+            prefix = str(user_input.get(CONF_LOXONE_CODE_PREFIX, "")).strip()
+            if not isinstance(selected, list) or not selected:
+                errors["base"] = "select_listing"
+            elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
+                errors["base"] = "invalid_code_prefix"
+            else:
+                selected_ids = list(
+                    dict.fromkeys(item for item in selected if item in listings)
+                )
+                if not selected_ids:
+                    errors["base"] = "select_listing"
+                else:
+                    self._pending_options.update(
+                        {
+                            CONF_LOXONE_PROVISION_LEAD_MINUTES: int(
+                                user_input[CONF_LOXONE_PROVISION_LEAD_MINUTES]
+                            ),
+                            CONF_LOXONE_CODE_PREFIX: prefix,
+                            CONF_ACCESS_EARLY_MINUTES: int(
+                                user_input[CONF_ACCESS_EARLY_MINUTES]
+                            ),
+                            CONF_ACCESS_LATE_MINUTES: int(
+                                user_input[CONF_ACCESS_LATE_MINUTES]
+                            ),
+                        }
+                    )
+                    server_count = int(user_input[CONF_LOXONE_SERVER_COUNT])
+                    self._pending_loxone_servers = []
+                    self._pending_loxone_mappings = {}
+                    self._loxone_server_queue = list(range(server_count))
+                    self._loxone_listing_queue = selected_ids
+                    return await self.async_step_loxone_server()
+
+        selected_listings = [
+            listing_id for listing_id in current_mappings if listing_id in listings
+        ]
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_LOXONE_PROVISION_LEAD_MINUTES): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=10080)
+                ),
+                vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
+                    str, vol.Length(min=1, max=2)
+                ),
+                vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=180)
+                ),
+                vol.Required(CONF_ACCESS_LATE_MINUTES): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=180)
+                ),
+                vol.Required(CONF_LOXONE_SERVER_COUNT): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=10)
+                ),
+                vol.Required(CONF_LOXONE_LISTINGS): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=choices,
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="loxone",
+            data_schema=self.add_suggested_values_to_schema(
+                schema,
+                {
+                    CONF_LOXONE_PROVISION_LEAD_MINUTES: self.config_entry.options.get(
+                        CONF_LOXONE_PROVISION_LEAD_MINUTES,
+                        DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
+                    ),
+                    CONF_LOXONE_CODE_PREFIX: self.config_entry.options.get(
+                        CONF_LOXONE_CODE_PREFIX, DEFAULT_LOXONE_CODE_PREFIX
+                    ),
+                    CONF_ACCESS_EARLY_MINUTES: self._pending_options.get(
+                        CONF_ACCESS_EARLY_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                        ),
+                    ),
+                    CONF_ACCESS_LATE_MINUTES: self._pending_options.get(
+                        CONF_ACCESS_LATE_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                        ),
+                    ),
+                    CONF_LOXONE_SERVER_COUNT: max(len(current_servers), 1),
+                    CONF_LOXONE_LISTINGS: selected_listings,
+                },
+            ),
+            errors=errors,
+        )
+
+    async def async_step_loxone_server(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure and actively test one Loxone Miniserver connection."""
+        index = self._loxone_server_queue[0]
+        existing_servers = self.config_entry.options.get(CONF_LOXONE_MINISERVERS, [])
+        if not isinstance(existing_servers, list):
+            existing_servers = []
+        existing = existing_servers[index] if index < len(existing_servers) else {}
+        if not isinstance(existing, dict):
+            existing = {}
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            password = str(user_input.get(CONF_LOXONE_SERVER_PASSWORD, ""))
+            try:
+                url = normalize_loxone_url(str(user_input[CONF_LOXONE_SERVER_URL]))
+                username = str(user_input[CONF_LOXONE_SERVER_USERNAME]).strip()
+                name = str(user_input[CONF_LOXONE_SERVER_NAME]).strip()
+                existing_url = None
+                if not password and existing:
+                    try:
+                        existing_url = normalize_loxone_url(
+                            str(existing.get(CONF_LOXONE_SERVER_URL, ""))
+                        )
+                    except ValueError:
+                        pass
+                existing_username = str(
+                    existing.get(CONF_LOXONE_SERVER_USERNAME, "")
+                ).strip()
+                if (
+                    not password
+                    and existing
+                    and url == existing_url
+                    and username == existing_username
+                ):
+                    password = str(existing.get(CONF_LOXONE_SERVER_PASSWORD, ""))
+                client = LoxoneApiClient.from_hass(self.hass, url, username, password)
+                groups = await client.async_get_groups()
+                if not groups:
+                    raise LoxoneApiError("No configurable Loxone user groups found")
+            except LoxoneAuthError:
+                errors["base"] = "loxone_invalid_auth"
+            except (LoxoneApiError, ValueError, KeyError):
+                errors["base"] = "loxone_cannot_connect"
+            else:
+                server_id = loxone_server_id(url, username)
+                if any(
+                    server.get(CONF_LOXONE_SERVER_ID) == server_id
+                    for server in self._pending_loxone_servers
+                ):
+                    errors["base"] = "duplicate_loxone_server"
+                else:
+                    self._pending_loxone_servers.append(
+                        {
+                            CONF_LOXONE_SERVER_ID: server_id,
+                            CONF_LOXONE_SERVER_NAME: name,
+                            CONF_LOXONE_SERVER_URL: url,
+                            CONF_LOXONE_SERVER_USERNAME: username,
+                            CONF_LOXONE_SERVER_PASSWORD: password,
+                            CONF_LOXONE_SERVER_GROUPS: groups,
+                        }
+                    )
+                    self._loxone_server_queue.pop(0)
+                    if self._loxone_server_queue:
+                        return await self.async_step_loxone_server()
+                    return await self.async_step_loxone_listing()
+
+        password_selector = selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_LOXONE_SERVER_NAME): vol.All(
+                    str, vol.Length(min=1, max=80)
+                ),
+                vol.Required(CONF_LOXONE_SERVER_URL): vol.All(
+                    str, vol.Length(min=8, max=512)
+                ),
+                vol.Required(CONF_LOXONE_SERVER_USERNAME): vol.All(
+                    str, vol.Length(min=1, max=128)
+                ),
+                vol.Optional(CONF_LOXONE_SERVER_PASSWORD): password_selector,
+            }
+        )
+        return self.async_show_form(
+            step_id="loxone_server",
+            data_schema=self.add_suggested_values_to_schema(
+                schema,
+                {
+                    CONF_LOXONE_SERVER_NAME: existing.get(
+                        CONF_LOXONE_SERVER_NAME, f"Miniserver {index + 1}"
+                    ),
+                    CONF_LOXONE_SERVER_URL: existing.get(CONF_LOXONE_SERVER_URL, ""),
+                    CONF_LOXONE_SERVER_USERNAME: existing.get(
+                        CONF_LOXONE_SERVER_USERNAME, ""
+                    ),
+                    CONF_LOXONE_SERVER_PASSWORD: "",
+                },
+            ),
+            errors=errors,
+            description_placeholders={
+                "number": str(index + 1),
+                "total": str(index + 1 + len(self._loxone_server_queue) - 1),
+            },
+        )
+
+    async def async_step_loxone_listing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Map one Guesty listing to groups on exactly one Miniserver."""
+        listing_id = self._loxone_listing_queue[0]
+        listing = self.config_entry.runtime_data.coordinator.data.listings[listing_id]
+        choices: list[selector.SelectOptionDict] = []
+        valid_values: dict[str, tuple[str, str]] = {}
+        for server in self._pending_loxone_servers:
+            server_id = server[CONF_LOXONE_SERVER_ID]
+            server_name = server[CONF_LOXONE_SERVER_NAME]
+            for group in server.get(CONF_LOXONE_SERVER_GROUPS, []):
+                value = f"{server_id}|{group['uuid']}"
+                valid_values[value] = (server_id, group["uuid"])
+                choices.append(
+                    selector.SelectOptionDict(
+                        value=value,
+                        label=f"{server_name} — {group['name']}",
+                    )
+                )
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            selected = user_input.get(CONF_LOXONE_GROUP_UUIDS)
+            parsed = (
+                [valid_values[item] for item in selected if item in valid_values]
+                if isinstance(selected, list)
+                else []
+            )
+            server_ids = {item[0] for item in parsed}
+            if not parsed:
+                errors["base"] = "select_loxone_group"
+            elif len(server_ids) != 1:
+                errors["base"] = "groups_from_one_server"
+            else:
+                server_id = next(iter(server_ids))
+                self._pending_loxone_mappings[listing_id] = {
+                    CONF_LOXONE_SERVER_ID: server_id,
+                    CONF_LOXONE_GROUP_UUIDS: list(
+                        dict.fromkeys(item[1] for item in parsed)
+                    ),
+                }
+                self._loxone_listing_queue.pop(0)
+                if self._loxone_listing_queue:
+                    return await self.async_step_loxone_listing()
+                self._pending_options[CONF_LOXONE_MINISERVERS] = (
+                    self._pending_loxone_servers
+                )
+                self._pending_options[CONF_LOXONE_LISTING_MAPPINGS] = (
+                    self._pending_loxone_mappings
+                )
+                return self.async_create_entry(title="", data=self._pending_options)
+
+        current = self.config_entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
+        existing = current.get(listing_id, {}) if isinstance(current, dict) else {}
+        selected_values = []
+        if isinstance(existing, dict):
+            selected_values = [
+                f"{existing.get(CONF_LOXONE_SERVER_ID)}|{group_uuid}"
+                for group_uuid in existing.get(CONF_LOXONE_GROUP_UUIDS, [])
+                if f"{existing.get(CONF_LOXONE_SERVER_ID)}|{group_uuid}" in valid_values
+            ]
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_LOXONE_GROUP_UUIDS): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=choices,
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
+            }
+        )
+        return self.async_show_form(
+            step_id="loxone_listing",
+            data_schema=self.add_suggested_values_to_schema(
+                schema, {CONF_LOXONE_GROUP_UUIDS: selected_values}
             ),
             errors=errors,
             description_placeholders={"listing": listing.display_name},

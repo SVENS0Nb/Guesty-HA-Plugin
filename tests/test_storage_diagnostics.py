@@ -16,6 +16,15 @@ from custom_components.guesty.const import (
     CONF_CLIENT_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
+    CONF_LOXONE_GROUP_UUIDS,
+    CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_LOXONE_MINISERVERS,
+    CONF_LOXONE_SERVER_GROUPS,
+    CONF_LOXONE_SERVER_ID,
+    CONF_LOXONE_SERVER_NAME,
+    CONF_LOXONE_SERVER_PASSWORD,
+    CONF_LOXONE_SERVER_URL,
+    CONF_LOXONE_SERVER_USERNAME,
     DOMAIN,
 )
 from custom_components.guesty.diagnostics import async_get_config_entry_diagnostics
@@ -77,6 +86,24 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
                     {"entity_id": "lock.private_door", "name": "Private door"}
                 ]
             },
+            CONF_LOXONE_MINISERVERS: [
+                {
+                    CONF_LOXONE_SERVER_ID: "private-server-id",
+                    CONF_LOXONE_SERVER_NAME: "Private house",
+                    CONF_LOXONE_SERVER_URL: "https://private-loxone.test",
+                    CONF_LOXONE_SERVER_USERNAME: "private-loxone-user",
+                    CONF_LOXONE_SERVER_PASSWORD: "private-loxone-password",
+                    CONF_LOXONE_SERVER_GROUPS: [
+                        {"uuid": "private-group-id", "name": "Private group"}
+                    ],
+                }
+            ],
+            CONF_LOXONE_LISTING_MAPPINGS: {
+                "private-listing-id": {
+                    CONF_LOXONE_SERVER_ID: "private-server-id",
+                    CONF_LOXONE_GROUP_UUIDS: ["private-group-id"],
+                }
+            },
         },
     )
     entry.add_to_hass(hass)
@@ -118,6 +145,14 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
                 "last_reconcile_error": None,
             }
         ),
+        loxone_manager=SimpleNamespace(
+            diagnostics=lambda: {
+                "enabled": True,
+                "configured_miniservers": 1,
+                "mapped_listings": 1,
+                "conflicts": 0,
+            }
+        ),
     )
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
@@ -133,6 +168,10 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "private-migration-id" not in serialized
     assert "private-field-id" not in serialized
     assert "lock.private_door" not in serialized
+    assert "private-loxone" not in serialized
+    assert "private-server-id" not in serialized
+    assert "private-group-id" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1
     assert diagnostics["guest_access"]["eligible_reservations"] == 1
     assert diagnostics["guest_access"]["verified_records"] == 1
+    assert diagnostics["loxone_pin_access"]["configured_miniservers"] == 1

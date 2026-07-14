@@ -18,6 +18,9 @@ from .const import (
     CONF_GUESTY_WEBHOOK_ID,
     CONF_GUESTY_WEBHOOK_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
+    CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_LOXONE_LISTINGS,
+    CONF_LOXONE_MINISERVERS,
     CONF_WEBHOOK_ID,
 )
 from .data import GuestyConfigEntry
@@ -43,6 +46,9 @@ async def async_get_config_entry_diagnostics(
     data = coordinator.data
     options = dict(entry.options)
     mappings = options.pop(CONF_ACCESS_LOCK_MAPPINGS, {})
+    options.pop(CONF_LOXONE_MINISERVERS, None)
+    options.pop(CONF_LOXONE_LISTING_MAPPINGS, None)
+    options.pop(CONF_LOXONE_LISTINGS, None)
     options.pop(CONF_ACCESS_CUSTOM_FIELD, None)
     mapped_listings = len(mappings) if isinstance(mappings, dict) else 0
     mapped_locks = (
@@ -68,6 +74,9 @@ async def async_get_config_entry_diagnostics(
     access_manager = getattr(entry.runtime_data, "access_manager", None)
     if access_manager is not None:
         diagnostics["guest_access"].update(access_manager.diagnostics())
+    loxone_manager = getattr(entry.runtime_data, "loxone_manager", None)
+    if loxone_manager is not None:
+        diagnostics["loxone_pin_access"] = loxone_manager.diagnostics()
 
     if data:
         diagnostics["sync"] = {

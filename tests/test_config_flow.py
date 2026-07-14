@@ -29,11 +29,24 @@ from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
+    CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_GROUP_UUIDS,
+    CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_LOXONE_LISTINGS,
+    CONF_LOXONE_MINISERVERS,
+    CONF_LOXONE_PROVISION_LEAD_MINUTES,
+    CONF_LOXONE_SERVER_ID,
+    CONF_LOXONE_SERVER_NAME,
+    CONF_LOXONE_SERVER_PASSWORD,
+    CONF_LOXONE_SERVER_URL,
+    CONF_LOXONE_SERVER_USERNAME,
     CONF_SCAN_INTERVAL,
     CONF_TOKEN_EXPIRES_AT,
     DOMAIN,
 )
 from custom_components.guesty.models import GuestyListing
+from custom_components.guesty.loxone_api import loxone_server_id
 
 
 VALIDATED = {
@@ -272,3 +285,104 @@ async def test_options_flow_rejects_insecure_branding_url(hass) -> None:
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "access"
     assert result["errors"] == {"base": "invalid_branding_url"}
+
+
+@pytest.mark.asyncio
+async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> None:
+    """The UI stores tested Miniserver credentials and one-server group mappings."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={CONF_SCAN_INTERVAL: 300},
+    )
+    entry.add_to_hass(hass)
+    listing = GuestyListing(
+        id="listing-1",
+        title="Apartment",
+        nickname=None,
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data=SimpleNamespace(listings={listing.id: listing})
+        )
+    )
+    loxone_client = SimpleNamespace(
+        async_get_groups=AsyncMock(
+            return_value=[
+                {"uuid": "group-front", "name": "Haustür"},
+                {"uuid": "group-flat", "name": "Wohnung"},
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        config_flow.LoxoneApiClient,
+        "from_hass",
+        lambda *args: loxone_client,
+    )
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    loxone_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_SCAN_INTERVAL: 300,
+            "listing_sync_interval": 86400,
+            "reservation_days_past": 30,
+            "reservation_days_future": 365,
+            "stale_threshold_hours": 6,
+            CONF_EXPOSE_GUEST_DETAILS: False,
+            CONF_ACCESS_ENABLED: False,
+            CONF_LOXONE_ENABLED: True,
+        },
+    )
+    assert loxone_form["step_id"] == "loxone"
+
+    server_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_PROVISION_LEAD_MINUTES: 360,
+            CONF_LOXONE_CODE_PREFIX: "7",
+            CONF_ACCESS_EARLY_MINUTES: 15,
+            CONF_ACCESS_LATE_MINUTES: 30,
+            config_flow.CONF_LOXONE_SERVER_COUNT: 1,
+            CONF_LOXONE_LISTINGS: ["listing-1"],
+        },
+    )
+    assert server_form["step_id"] == "loxone_server"
+
+    listing_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_SERVER_NAME: "Haus",
+            CONF_LOXONE_SERVER_URL: "https://loxone.example.test/proxy/",
+            CONF_LOXONE_SERVER_USERNAME: "service",
+            CONF_LOXONE_SERVER_PASSWORD: "secret",
+        },
+    )
+    assert listing_form["step_id"] == "loxone_listing"
+
+    server_id = loxone_server_id("https://loxone.example.test/proxy", "service")
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_GROUP_UUIDS: [
+                f"{server_id}|group-front",
+                f"{server_id}|group-flat",
+            ]
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_LOXONE_LISTING_MAPPINGS] == {
+        "listing-1": {
+            CONF_LOXONE_SERVER_ID: server_id,
+            CONF_LOXONE_GROUP_UUIDS: ["group-front", "group-flat"],
+        }
+    }
+    assert (
+        result["data"][CONF_LOXONE_MINISERVERS][0][CONF_LOXONE_SERVER_PASSWORD]
+        == "secret"
+    )

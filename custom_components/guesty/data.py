@@ -13,6 +13,7 @@ from .scheduler import GuestyTransitionScheduler
 
 if TYPE_CHECKING:
     from .access import GuestyAccessManager
+    from .loxone import GuestyLoxoneManager
 
 
 @dataclass(slots=True)
@@ -23,6 +24,7 @@ class GuestyRuntimeData:
     client: GuestyApiClient
     scheduler: GuestyTransitionScheduler
     access_manager: GuestyAccessManager
+    loxone_manager: GuestyLoxoneManager
     sensor_listing_ids: set[str] = field(default_factory=set)
     calendar_listing_ids: set[str] = field(default_factory=set)
 

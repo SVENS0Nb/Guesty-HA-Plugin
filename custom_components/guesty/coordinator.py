@@ -629,7 +629,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             cache["last_reservation_sync"] = now
             cache["last_error"] = None
             await self._storage.async_save(cache)
-            self._async_set_fresh_data_from_cache(cache)
+            self._async_set_fresh_data_from_cache(
+                cache,
+                reservation_overrides={reservation.id: reservation},
+            )
 
     async def _async_remove_reservation_from_cache(self, reservation_id: str) -> None:
         """Remove a reservation Guesty reports as no longer existing."""
@@ -655,10 +658,19 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             await self._storage.async_save(cache)
             self._async_set_fresh_data_from_cache(cache)
 
-    def _async_set_fresh_data_from_cache(self, cache: dict[str, Any]) -> None:
-        """Publish a successful targeted cache update to all entities."""
+    def _async_set_fresh_data_from_cache(
+        self,
+        cache: dict[str, Any],
+        *,
+        reservation_overrides: dict[str, GuestyReservation] | None = None,
+    ) -> None:
+        """Publish targeted data while keeping Keycodes out of disk storage."""
         listings = GuestyStorage.listings_from_cache(cache)
         reservations = GuestyStorage.reservations_from_cache(cache)
+        if reservation_overrides:
+            reservations = [
+                reservation_overrides.get(item.id, item) for item in reservations
+            ]
         occupancy = self._calculate_occupancy(listings, reservations)
         self._fire_occupancy_events(occupancy)
         self.async_set_updated_data(

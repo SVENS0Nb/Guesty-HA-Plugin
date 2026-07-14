@@ -78,6 +78,28 @@ def test_occupancy_boundaries(moment, expected) -> None:
     assert occupancy.status == expected
 
 
+def test_reservation_keycode_is_parsed_but_not_written_to_general_cache() -> None:
+    """Sensitive Keycodes live only in the private, expiring Loxone store."""
+    reservation = models.GuestyReservation.from_api(
+        {
+            "_id": "res-keycode",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-20T13:00:00Z",
+            "checkOut": "2026-07-22T09:00:00Z",
+            "notes": {"keyCode": 712345},
+        }
+    )
+
+    assert reservation is not None
+    assert reservation.key_code == "712345"
+    assert reservation.key_code_observed is True
+    assert "key_code" not in reservation.to_dict()
+    cached = models.GuestyReservation.from_dict(reservation.to_dict())
+    assert cached.key_code is None
+    assert cached.key_code_observed is False
+
+
 def test_planned_arrival_overrides_default() -> None:
     """Planned arrival changes the occupancy transition."""
     reservation = _reservation(planned_arrival="13:00")

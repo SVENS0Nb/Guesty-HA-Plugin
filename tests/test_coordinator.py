@@ -286,7 +286,11 @@ def _listing(listing_id: str = "listing-1") -> GuestyListing:
     )
 
 
-def _reservation(reservation_id: str = "reservation-1") -> GuestyReservation:
+def _reservation(
+    reservation_id: str = "reservation-1",
+    *,
+    key_code: str | None = None,
+) -> GuestyReservation:
     return GuestyReservation(
         id=reservation_id,
         listing_id="listing-1",
@@ -302,6 +306,8 @@ def _reservation(reservation_id: str = "reservation-1") -> GuestyReservation:
         listing_default_check_out=None,
         guest_name=None,
         last_updated_at=None,
+        key_code=key_code,
+        key_code_observed=key_code is not None,
     )
 
 
@@ -390,6 +396,27 @@ async def test_targeted_reservation_does_not_advance_global_cursor(hass) -> None
 
     saved_cache = storage.async_save.await_args.args[0]
     assert saved_cache["last_incremental_sync"] == "2026-07-13T11:55:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_targeted_webhook_exposes_keycode_only_in_memory(hass) -> None:
+    """A manual Guesty PIN edit reaches listeners without entering disk cache."""
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    reservation = _reservation(key_code="799999")
+    client = SimpleNamespace(async_get_reservation=AsyncMock(return_value=reservation))
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    assert instance.data.reservations[0].key_code == "799999"
+    assert instance.data.reservations[0].key_code_observed is True
+    saved_cache = storage.async_save.await_args.args[0]
+    assert "key_code" not in saved_cache["reservations"][0]
 
 
 @pytest.mark.asyncio

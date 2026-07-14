@@ -42,7 +42,8 @@
           "reservation_days_future": "Future days for reservations",
           "stale_threshold_hours": "Stale threshold (hours)",
           "expose_guest_details": "Show guest names and confirmation codes in entities",
-          "access_enabled": "Enable secure guest door access"
+          "access_enabled": "Enable secure guest door access",
+          "loxone_enabled": "Enable Loxone reservation PINs"
         }
       },
       "access": {
@@ -72,12 +73,47 @@
           "access_lock_2_name_es": "Second door – Spanish",
           "access_lock_2_name_fr": "Second door – French"
         }
+      },
+      "loxone": {
+        "title": "Loxone reservation PINs",
+        "description": "Generate one six-digit Guesty Keycode per reservation. Guesty is the source of truth, so valid manual changes are synchronized to Loxone; duplicate codes are replaced automatically. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
+        "data": {
+          "loxone_provision_lead_minutes": "Create Loxone user before access starts (minutes)",
+          "loxone_code_prefix": "Reserved PIN prefix (1–2 digits)",
+          "access_early_minutes": "Enable access before check-in (minutes)",
+          "access_late_minutes": "Keep access after check-out (minutes)",
+          "loxone_server_count": "Number of Loxone Miniservers",
+          "loxone_listings": "Listings with Loxone PIN access"
+        }
+      },
+      "loxone_server": {
+        "title": "Loxone Miniserver {number}",
+        "description": "Enter an HTTPS Miniserver or reverse-proxy URL. Saving tests the connection and loads the available user groups. Use a dedicated account with User management rights.",
+        "data": {
+          "name": "Display name",
+          "url": "HTTPS URL",
+          "username": "Service-account username",
+          "password": "Password (leave empty to keep the current password)"
+        }
+      },
+      "loxone_listing": {
+        "title": "Loxone access for {listing}",
+        "description": "Select one or more user groups from exactly one Miniserver. Their permissions determine which doors the reservation PIN can open.",
+        "data": {
+          "group_uuids": "Miniserver and user groups"
+        }
       }
     },
     "error": {
       "select_listing": "Select at least one listing",
       "invalid_branding_url": "Logo and favicon must use valid direct HTTPS URLs",
-      "same_lock": "The same lock cannot be assigned twice"
+      "same_lock": "The same lock cannot be assigned twice",
+      "invalid_code_prefix": "The PIN prefix must contain 1 or 2 digits",
+      "loxone_invalid_auth": "Loxone rejected the account or it lacks User management rights",
+      "loxone_cannot_connect": "Could not connect securely to this Loxone Miniserver",
+      "duplicate_loxone_server": "This Miniserver connection is configured more than once",
+      "select_loxone_group": "Select at least one Loxone user group",
+      "groups_from_one_server": "All groups for one listing must belong to the same Miniserver"
     },
     "abort": {
       "no_listings": "No Guesty listings are currently available"
@@ -102,6 +138,30 @@
           "no_reservation": "No reservation",
           "pending": "Pending",
           "synced": "Synchronized",
+          "error": "Error"
+        }
+      },
+      "guesty_keycode_status": {
+        "name": "Guesty Keycode status",
+        "state": {
+          "not_configured": "Not configured",
+          "no_reservation": "No reservation",
+          "pending": "Pending",
+          "synced": "Synchronized",
+          "conflict": "Conflict",
+          "error": "Error"
+        }
+      },
+      "loxone_pin_status": {
+        "name": "Loxone PIN status",
+        "state": {
+          "not_configured": "Not configured",
+          "no_reservation": "No reservation",
+          "scheduled": "Scheduled",
+          "pending": "Pending",
+          "provisioned": "Provisioned",
+          "cleanup_pending": "Deletion pending",
+          "conflict": "Conflict",
           "error": "Error"
         }
       },
