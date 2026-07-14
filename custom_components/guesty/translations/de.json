@@ -47,9 +47,11 @@
       },
       "access": {
         "title": "Gast-Türzugang",
-        "description": "Lege zuerst in Guesty ein Reservierungs-Custom-Field vom Typ Text an. Die Integration schreibt pro aktiver Reservierung einen geschützten Zugangslink. Der Link öffnet niemals direkt eine Tür.",
+        "description": "Lege zuerst in Guesty ein Reservierungs-Custom-Field vom Typ Text an. Die Integration schreibt pro aktiver Reservierung einen geschützten Zugangslink. Optionale Branding-Bilder müssen direkte HTTPS-URLs verwenden.",
         "data": {
           "access_custom_field": "Name oder ID des Guesty-Custom-Fields",
+          "access_logo_url": "Logo-Bild-URL (optional, HTTPS)",
+          "access_favicon_url": "Favicon-Bild-URL (optional, HTTPS)",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
           "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
           "access_listings": "Listings mit Gast-Türzugang"
@@ -57,17 +59,24 @@
       },
       "listing": {
         "title": "Schlösser für {listing}",
-        "description": "Wähle ein oder zwei Home-Assistant-Schlösser. Diese serverseitige Zuordnung kann durch einen Gastlink nicht verändert werden.",
+        "description": "Wähle ein oder zwei Home-Assistant-Schlösser und lege die Bezeichnungen für deine Gäste fest. Bekannte allgemeine Türnamen erhalten lokale Übersetzungsvorschläge; jede Sprache kann angepasst werden. Diese serverseitige Zuordnung kann durch einen Gastlink nicht verändert werden.",
         "data": {
           "access_lock_1": "Erstes Schloss",
-          "access_lock_1_name": "Bezeichnung der ersten Tür",
+          "access_lock_1_name": "Erste Tür – Deutsch",
+          "access_lock_1_name_en": "Erste Tür – Englisch",
+          "access_lock_1_name_es": "Erste Tür – Spanisch",
+          "access_lock_1_name_fr": "Erste Tür – Französisch",
           "access_lock_2": "Zweites Schloss (optional)",
-          "access_lock_2_name": "Bezeichnung der zweiten Tür"
+          "access_lock_2_name": "Zweite Tür – Deutsch",
+          "access_lock_2_name_en": "Zweite Tür – Englisch",
+          "access_lock_2_name_es": "Zweite Tür – Spanisch",
+          "access_lock_2_name_fr": "Zweite Tür – Französisch"
         }
       }
     },
     "error": {
       "select_listing": "Wähle mindestens ein Listing aus",
+      "invalid_branding_url": "Logo und Favicon müssen gültige direkte HTTPS-URLs verwenden",
       "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden"
     },
     "abort": {

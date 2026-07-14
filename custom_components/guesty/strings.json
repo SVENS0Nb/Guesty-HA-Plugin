@@ -47,9 +47,11 @@
       },
       "access": {
         "title": "Guest door access",
-        "description": "Create a Guesty reservation custom field of type Text first. The integration writes one protected access link per active reservation. The link never unlocks a door directly.",
+        "description": "Create a Guesty reservation custom field of type Text first. The integration writes one protected access link per active reservation. Optional branding images must use direct HTTPS URLs.",
         "data": {
           "access_custom_field": "Guesty custom field name or ID",
+          "access_logo_url": "Logo image URL (optional, HTTPS)",
+          "access_favicon_url": "Favicon image URL (optional, HTTPS)",
           "access_early_minutes": "Enable access before check-in (minutes)",
           "access_late_minutes": "Keep access after check-out (minutes)",
           "access_listings": "Listings with guest door access"
@@ -57,17 +59,24 @@
       },
       "listing": {
         "title": "Locks for {listing}",
-        "description": "Select one or two Home Assistant lock entities. These server-side assignments cannot be changed by a guest link.",
+        "description": "Select one or two Home Assistant lock entities and configure their guest-facing labels. Known generic door names receive local translation suggestions; every language can be customized. These server-side assignments cannot be changed by a guest link.",
         "data": {
           "access_lock_1": "First lock",
-          "access_lock_1_name": "First door label",
+          "access_lock_1_name": "First door – German",
+          "access_lock_1_name_en": "First door – English",
+          "access_lock_1_name_es": "First door – Spanish",
+          "access_lock_1_name_fr": "First door – French",
           "access_lock_2": "Second lock (optional)",
-          "access_lock_2_name": "Second door label"
+          "access_lock_2_name": "Second door – German",
+          "access_lock_2_name_en": "Second door – English",
+          "access_lock_2_name_es": "Second door – Spanish",
+          "access_lock_2_name_fr": "Second door – French"
         }
       }
     },
     "error": {
       "select_listing": "Select at least one listing",
+      "invalid_branding_url": "Logo and favicon must use valid direct HTTPS URLs",
       "same_lock": "The same lock cannot be assigned twice"
     },
     "abort": {

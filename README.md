@@ -75,6 +75,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Stale-Schwellenwert | 6 h | Ab wann Daten als veraltet gelten |
 | Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Entitäten anzeigen; sensible Attribute werden nicht im Recorder gespeichert |
 | Sicherer Gast-Türzugang | Aus | Erst nach weiterer Konfiguration werden Reservierungslinks erzeugt |
+| Logo-URL | Leer | Optionales Logo oberhalb des Türportals; direkte HTTPS-Bild-URL |
+| Favicon-URL | Leer | Optionales Browser-Icon des Türportals; direkte HTTPS-Bild-URL |
 
 ## Zeitlich begrenzter Gast-Türzugang
 
@@ -84,7 +86,11 @@ Reservierung wird **ein** geschützter Link erzeugt. Auf der Seite erscheinen
 Schaltflächen wie „Haustür öffnen“ oder „Wohnungstür öffnen“. Die Seite richtet
 sich automatisch nach der bevorzugten Browser-/Systemsprache; Deutsch,
 Englisch, Spanisch und Französisch werden unterstützt, alle anderen Sprachen
-verwenden Englisch.
+verwenden Englisch. Für jedes Schloss können in den Integrationsoptionen eigene
+Bezeichnungen in allen vier Sprachen hinterlegt werden. Bekannte allgemeine
+Namen wie „Haustür“ und „Wohnungstür“ erhalten lokale Übersetzungsvorschläge.
+Unbekannte individuelle Namen bleiben als sicherer Fallback unverändert; es
+werden keine Namen an einen externen Übersetzungsdienst übertragen.
 
 Ein Aufruf des Links per `GET` öffnet niemals eine Tür. Erst eine kleine,
 CSRF-geschützte `POST`-Anfrage nach einem bewussten Tastendruck kann
@@ -96,6 +102,9 @@ sichtbar und können anschließend ohne Neuladen erneut verwendet werden. Ein
 abgelaufenes Aktions-Nonce wird erst beim nächsten Tastendruck erneuert und
 einmal automatisch wiederholt; dadurch entsteht kein regelmäßiger
 Hintergrund-Traffic.
+Vor oder nach dem erlaubten Zeitraum erklärt die Seite in der erkannten Sprache,
+dass sie nur im Buchungszeitraum verfügbar ist, ohne Reservierungsdetails
+preiszugeben.
 
 ### Einrichtung
 
@@ -107,10 +116,13 @@ Hintergrund-Traffic.
    **Sicheren Gast-Türzugang** aktivieren.
 4. Name oder ID des Custom Fields angeben. Der Standardname
    `Door access link` wird automatisch über die Guesty API aufgelöst.
-5. Listings auswählen und jedem Listing ein oder zwei `lock.*`-Entitäten sowie
-   gastfreundliche Türnamen zuordnen.
-6. Optional eine Freigabe vor Check-in oder nach Check-out einstellen.
-7. In Guesty die erzeugte Custom-Field-Variable, zum Beispiel
+5. Optional eine direkte HTTPS-URL für ein Logo und ein Favicon eintragen. Das
+   Logo wird zentriert und responsiv mit maximal 96 px Höhe dargestellt.
+6. Listings auswählen und jedem Listing ein oder zwei `lock.*`-Entitäten sowie
+   gastfreundliche Türnamen auf Deutsch, Englisch, Spanisch und Französisch
+   zuordnen. Die vorgeschlagenen Übersetzungen können frei angepasst werden.
+7. Optional eine Freigabe vor Check-in oder nach Check-out einstellen.
+8. In Guesty die erzeugte Custom-Field-Variable, zum Beispiel
    `{{door_access_link}}`, im Guest-App-Check-in-Text oder in einer
    automatisierten Nachricht verwenden.
 
@@ -147,6 +159,9 @@ Endpunkt für Reservierungs-Custom-Fields.
   `/api/guesty/access/` deshalb deaktivieren oder den Pfad redigieren.
 - TLS, korrekte `X-Forwarded-Proto`-/Host-Header und Home Assistants
   `trusted_proxies` korrekt konfigurieren.
+- Logo und Favicon werden vom Browser direkt von den eingetragenen Hosts
+  geladen. Für bestmöglichen Datenschutz die Bilder auf der eigenen
+  HTTPS-Domain bereitstellen. Die Seite übermittelt dabei keinen Referrer.
 
 Zusätzliche Schutzmaßnahmen sind ein 5-Sekunden-Cooldown, maximal zehn gültige
 Aktionen pro Minute und Schloss, restriktive Browser-Header sowie das lokale

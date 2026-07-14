@@ -13,6 +13,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
+from .access_branding import MAX_BRANDING_URL_LENGTH, normalize_branding_url
+from .access_names import (
+    DEFAULT_FIRST_DOOR_NAMES,
+    DEFAULT_SECOND_DOOR_NAMES,
+    localized_door_names,
+)
 from .api import (
     GuestyApiClient,
     GuestyApiError,
@@ -24,12 +30,20 @@ from .const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_FAVICON_URL,
     CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LISTINGS,
+    CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_1,
     CONF_ACCESS_LOCK_1_NAME,
+    CONF_ACCESS_LOCK_1_NAME_EN,
+    CONF_ACCESS_LOCK_1_NAME_ES,
+    CONF_ACCESS_LOCK_1_NAME_FR,
     CONF_ACCESS_LOCK_2,
     CONF_ACCESS_LOCK_2_NAME,
+    CONF_ACCESS_LOCK_2_NAME_EN,
+    CONF_ACCESS_LOCK_2_NAME_ES,
+    CONF_ACCESS_LOCK_2_NAME_FR,
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -43,7 +57,9 @@ from .const import (
     DEFAULT_ACCESS_CUSTOM_FIELD,
     DEFAULT_ACCESS_EARLY_MINUTES,
     DEFAULT_ACCESS_ENABLED,
+    DEFAULT_ACCESS_FAVICON_URL,
     DEFAULT_ACCESS_LATE_MINUTES,
+    DEFAULT_ACCESS_LOGO_URL,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
@@ -55,6 +71,39 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_LOCK_1_NAME_FIELDS = {
+    "de": CONF_ACCESS_LOCK_1_NAME,
+    "en": CONF_ACCESS_LOCK_1_NAME_EN,
+    "es": CONF_ACCESS_LOCK_1_NAME_ES,
+    "fr": CONF_ACCESS_LOCK_1_NAME_FR,
+}
+_LOCK_2_NAME_FIELDS = {
+    "de": CONF_ACCESS_LOCK_2_NAME,
+    "en": CONF_ACCESS_LOCK_2_NAME_EN,
+    "es": CONF_ACCESS_LOCK_2_NAME_ES,
+    "fr": CONF_ACCESS_LOCK_2_NAME_FR,
+}
+
+
+def _door_mapping_from_input(
+    entity_id: str,
+    user_input: dict[str, Any],
+    fields: dict[str, str],
+    defaults: dict[str, str],
+) -> dict[str, str]:
+    """Build complete localized mapping data, including legacy compatibility."""
+    raw = {
+        f"name_{language}": user_input.get(field) for language, field in fields.items()
+    }
+    raw["name"] = user_input.get(fields["de"])
+    names = localized_door_names(raw, defaults)
+    return {
+        "entity_id": entity_id,
+        "name": names["de"],
+        **{f"name_{language}": name for language, name in names.items()},
+    }
+
 
 STEP_USER_SCHEMA = vol.Schema(
     {
@@ -289,7 +338,20 @@ class GuestyOptionsFlow(OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             selected = user_input.get(CONF_ACCESS_LISTINGS)
-            if not isinstance(selected, list) or not selected:
+            logo_url = normalize_branding_url(user_input.get(CONF_ACCESS_LOGO_URL))
+            favicon_url = normalize_branding_url(
+                user_input.get(CONF_ACCESS_FAVICON_URL)
+            )
+            branding_invalid = any(
+                str(user_input.get(key) or "").strip() and normalized is None
+                for key, normalized in (
+                    (CONF_ACCESS_LOGO_URL, logo_url),
+                    (CONF_ACCESS_FAVICON_URL, favicon_url),
+                )
+            )
+            if branding_invalid:
+                errors["base"] = "invalid_branding_url"
+            elif not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
             else:
                 self._pending_options.update(
@@ -303,6 +365,8 @@ class GuestyOptionsFlow(OptionsFlow):
                         CONF_ACCESS_LATE_MINUTES: int(
                             user_input[CONF_ACCESS_LATE_MINUTES]
                         ),
+                        CONF_ACCESS_LOGO_URL: logo_url or "",
+                        CONF_ACCESS_FAVICON_URL: favicon_url or "",
                     }
                 )
                 self._listing_queue = list(
@@ -327,6 +391,12 @@ class GuestyOptionsFlow(OptionsFlow):
                 vol.Required(CONF_ACCESS_CUSTOM_FIELD): vol.All(
                     str, vol.Length(min=1, max=128)
                 ),
+                vol.Optional(CONF_ACCESS_LOGO_URL): vol.All(
+                    str, vol.Length(max=MAX_BRANDING_URL_LENGTH)
+                ),
+                vol.Optional(CONF_ACCESS_FAVICON_URL): vol.All(
+                    str, vol.Length(max=MAX_BRANDING_URL_LENGTH)
+                ),
                 vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=180)
                 ),
@@ -347,16 +417,46 @@ class GuestyOptionsFlow(OptionsFlow):
             data_schema=self.add_suggested_values_to_schema(
                 schema,
                 {
-                    CONF_ACCESS_CUSTOM_FIELD: self.config_entry.options.get(
-                        CONF_ACCESS_CUSTOM_FIELD, DEFAULT_ACCESS_CUSTOM_FIELD
+                    CONF_ACCESS_CUSTOM_FIELD: (
+                        user_input.get(CONF_ACCESS_CUSTOM_FIELD)
+                        if user_input is not None
+                        else self.config_entry.options.get(
+                            CONF_ACCESS_CUSTOM_FIELD, DEFAULT_ACCESS_CUSTOM_FIELD
+                        )
                     ),
-                    CONF_ACCESS_EARLY_MINUTES: self.config_entry.options.get(
-                        CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                    CONF_ACCESS_LOGO_URL: (
+                        user_input.get(CONF_ACCESS_LOGO_URL, "")
+                        if user_input is not None
+                        else self.config_entry.options.get(
+                            CONF_ACCESS_LOGO_URL, DEFAULT_ACCESS_LOGO_URL
+                        )
                     ),
-                    CONF_ACCESS_LATE_MINUTES: self.config_entry.options.get(
-                        CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                    CONF_ACCESS_FAVICON_URL: (
+                        user_input.get(CONF_ACCESS_FAVICON_URL, "")
+                        if user_input is not None
+                        else self.config_entry.options.get(
+                            CONF_ACCESS_FAVICON_URL, DEFAULT_ACCESS_FAVICON_URL
+                        )
                     ),
-                    CONF_ACCESS_LISTINGS: selected_listings,
+                    CONF_ACCESS_EARLY_MINUTES: (
+                        user_input.get(CONF_ACCESS_EARLY_MINUTES)
+                        if user_input is not None
+                        else self.config_entry.options.get(
+                            CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                        )
+                    ),
+                    CONF_ACCESS_LATE_MINUTES: (
+                        user_input.get(CONF_ACCESS_LATE_MINUTES)
+                        if user_input is not None
+                        else self.config_entry.options.get(
+                            CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                        )
+                    ),
+                    CONF_ACCESS_LISTINGS: (
+                        user_input.get(CONF_ACCESS_LISTINGS, [])
+                        if user_input is not None
+                        else selected_listings
+                    ),
                 },
             ),
             errors=errors,
@@ -378,21 +478,21 @@ class GuestyOptionsFlow(OptionsFlow):
                 errors["base"] = "same_lock"
             else:
                 doors = [
-                    {
-                        "entity_id": lock_1,
-                        "name": str(
-                            user_input.get(CONF_ACCESS_LOCK_1_NAME) or "Tür 1"
-                        ).strip()[:80],
-                    }
+                    _door_mapping_from_input(
+                        lock_1,
+                        user_input,
+                        _LOCK_1_NAME_FIELDS,
+                        DEFAULT_FIRST_DOOR_NAMES,
+                    )
                 ]
                 if lock_2:
                     doors.append(
-                        {
-                            "entity_id": lock_2,
-                            "name": str(
-                                user_input.get(CONF_ACCESS_LOCK_2_NAME) or "Tür 2"
-                            ).strip()[:80],
-                        }
+                        _door_mapping_from_input(
+                            lock_2,
+                            user_input,
+                            _LOCK_2_NAME_FIELDS,
+                            DEFAULT_SECOND_DOOR_NAMES,
+                        )
                     )
                 self._pending_mappings[listing_id] = doors
                 self._listing_queue.pop(0)
@@ -407,15 +507,25 @@ class GuestyOptionsFlow(OptionsFlow):
         existing = current.get(listing_id, []) if isinstance(current, dict) else []
         first = existing[0] if len(existing) > 0 else {}
         second = existing[1] if len(existing) > 1 else {}
+        first_names = localized_door_names(first, DEFAULT_FIRST_DOOR_NAMES)
+        second_names = localized_door_names(second, DEFAULT_SECOND_DOOR_NAMES)
         lock_selector = selector.EntitySelector(
             selector.EntitySelectorConfig(domain="lock")
         )
+        required_label = vol.All(str, vol.Length(min=1, max=80))
+        optional_label = vol.All(str, vol.Length(max=80))
         schema = vol.Schema(
             {
                 vol.Required(CONF_ACCESS_LOCK_1): lock_selector,
-                vol.Required(CONF_ACCESS_LOCK_1_NAME): str,
+                vol.Required(CONF_ACCESS_LOCK_1_NAME): required_label,
+                vol.Required(CONF_ACCESS_LOCK_1_NAME_EN): required_label,
+                vol.Required(CONF_ACCESS_LOCK_1_NAME_ES): required_label,
+                vol.Required(CONF_ACCESS_LOCK_1_NAME_FR): required_label,
                 vol.Optional(CONF_ACCESS_LOCK_2): lock_selector,
-                vol.Optional(CONF_ACCESS_LOCK_2_NAME): str,
+                vol.Optional(CONF_ACCESS_LOCK_2_NAME): optional_label,
+                vol.Optional(CONF_ACCESS_LOCK_2_NAME_EN): optional_label,
+                vol.Optional(CONF_ACCESS_LOCK_2_NAME_ES): optional_label,
+                vol.Optional(CONF_ACCESS_LOCK_2_NAME_FR): optional_label,
             }
         )
         return self.async_show_form(
@@ -424,9 +534,15 @@ class GuestyOptionsFlow(OptionsFlow):
                 schema,
                 {
                     CONF_ACCESS_LOCK_1: first.get("entity_id"),
-                    CONF_ACCESS_LOCK_1_NAME: first.get("name", "Haustür"),
+                    CONF_ACCESS_LOCK_1_NAME: first_names["de"],
+                    CONF_ACCESS_LOCK_1_NAME_EN: first_names["en"],
+                    CONF_ACCESS_LOCK_1_NAME_ES: first_names["es"],
+                    CONF_ACCESS_LOCK_1_NAME_FR: first_names["fr"],
                     CONF_ACCESS_LOCK_2: second.get("entity_id"),
-                    CONF_ACCESS_LOCK_2_NAME: second.get("name", "Wohnungstür"),
+                    CONF_ACCESS_LOCK_2_NAME: second_names["de"],
+                    CONF_ACCESS_LOCK_2_NAME_EN: second_names["en"],
+                    CONF_ACCESS_LOCK_2_NAME_ES: second_names["es"],
+                    CONF_ACCESS_LOCK_2_NAME_FR: second_names["fr"],
                 },
             ),
             errors=errors,

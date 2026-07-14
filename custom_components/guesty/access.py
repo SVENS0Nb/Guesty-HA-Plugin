@@ -26,6 +26,13 @@ from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from .access_branding import branding_csp_source, normalize_branding_url
+from .access_names import (
+    DEFAULT_FIRST_DOOR_NAMES,
+    DEFAULT_SECOND_DOOR_NAMES,
+    localized_door_name,
+    localized_door_names,
+)
 from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
 from .const import (
     ACCESS_ACTION_NONCE_SECONDS,
@@ -38,11 +45,15 @@ from .const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_FAVICON_URL,
     CONF_ACCESS_LATE_MINUTES,
+    CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
     DEFAULT_ACCESS_CUSTOM_FIELD,
     DEFAULT_ACCESS_EARLY_MINUTES,
+    DEFAULT_ACCESS_FAVICON_URL,
     DEFAULT_ACCESS_LATE_MINUTES,
+    DEFAULT_ACCESS_LOGO_URL,
     DOMAIN,
     EVENT_DOOR_ACCESS,
 )
@@ -62,6 +73,7 @@ ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
         "open": "{door} öffnen",
         "opening": "Wird geöffnet …",
         "unavailable": "Zugang nicht verfügbar",
+        "unavailable_detail": "Diese Seite ist nur im Buchungszeitraum verfügbar.",
         "invalid_request": "Ungültige Anfrage",
         "invalid_nonce": "Sitzung wurde aktualisiert",
         "cooldown": "Bitte kurz warten und erneut versuchen",
@@ -73,10 +85,11 @@ ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
         "network_error": "Verbindung fehlgeschlagen. Bitte erneut versuchen",
     },
     "en": {
-        "title": "Door access",
+        "title": "Door Access",
         "open": "Open {door}",
         "opening": "Opening …",
-        "unavailable": "Access unavailable",
+        "unavailable": "Access Unavailable",
+        "unavailable_detail": "This page is only available during the booking period.",
         "invalid_request": "Invalid request",
         "invalid_nonce": "Session refreshed",
         "cooldown": "Please wait a moment and try again",
@@ -92,6 +105,9 @@ ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
         "open": "Abrir {door}",
         "opening": "Abriendo …",
         "unavailable": "Acceso no disponible",
+        "unavailable_detail": (
+            "Esta página solo está disponible durante el período de la reserva."
+        ),
         "invalid_request": "Solicitud no válida",
         "invalid_nonce": "Sesión actualizada",
         "cooldown": "Espera un momento e inténtalo de nuevo",
@@ -107,6 +123,9 @@ ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
         "open": "Ouvrir {door}",
         "opening": "Ouverture …",
         "unavailable": "Accès indisponible",
+        "unavailable_detail": (
+            "Cette page est disponible uniquement pendant la période de réservation."
+        ),
         "invalid_request": "Requête non valide",
         "invalid_nonce": "Session actualisée",
         "cooldown": "Veuillez patienter un instant et réessayer",
@@ -740,9 +759,13 @@ class GuestyAccessManager:
         """Return a non-operative page or the active door controls."""
         validated = self._validate_token(token)
         if validated is None:
+            logo_url, favicon_url = self._portal_branding()
             return self._page(
                 _portal_text(language, "unavailable"),
                 language=language,
+                detail=_portal_text(language, "unavailable_detail"),
+                logo_url=logo_url,
+                favicon_url=favicon_url,
                 status=404,
             )
         _reservation_id, _reservation, doors = validated
@@ -867,7 +890,7 @@ class GuestyAccessManager:
             "unlocked",
             status=200,
             as_json=as_json,
-            door=door["name"],
+            door=localized_door_name(door, language),
         )
 
     def _validate_token(
@@ -937,13 +960,19 @@ class GuestyAccessManager:
     def _reservation_fingerprint(self, reservation: GuestyReservation) -> str:
         """Hash every server-side permission input to invalidate stale tokens."""
         start, end = self._access_window(reservation)
+        mappings = self._mappings.get(reservation.listing_id, [])
         payload = {
             "listing_id": reservation.listing_id,
             "active": reservation.is_active_status(),
             "guest_name": reservation.guest_name or "",
             "start": start.isoformat(),
             "end": end.isoformat(),
-            "doors": self._mappings.get(reservation.listing_id, []),
+            # Keep the legacy fingerprint shape. Additional translated labels
+            # do not rotate or republish an otherwise unchanged bearer link.
+            "doors": [
+                {"entity_id": door["entity_id"], "name": door["name"]}
+                for door in mappings
+            ],
             "custom_field": str(
                 self.entry.options.get(
                     CONF_ACCESS_CUSTOM_FIELD, DEFAULT_ACCESS_CUSTOM_FIELD
@@ -976,20 +1005,29 @@ class GuestyAccessManager:
             if not isinstance(listing_id, str) or not isinstance(value, list):
                 continue
             doors: list[dict[str, str]] = []
-            for item in value[:2]:
+            for index, item in enumerate(value[:2]):
                 if not isinstance(item, Mapping):
                     continue
                 entity_id = item.get("entity_id")
-                name = item.get("name")
                 if (
                     isinstance(entity_id, str)
                     and entity_id.startswith("lock.")
                     and valid_entity_id(entity_id)
                 ):
+                    defaults = (
+                        DEFAULT_FIRST_DOOR_NAMES
+                        if index == 0
+                        else DEFAULT_SECOND_DOOR_NAMES
+                    )
+                    names = localized_door_names(item, defaults)
                     doors.append(
                         {
                             "entity_id": entity_id,
-                            "name": (str(name or "Tür").strip() or "Tür")[:80],
+                            "name": names["de"],
+                            **{
+                                f"name_{language}": localized_name
+                                for language, localized_name in names.items()
+                            },
                         }
                     )
             if doors:
@@ -1110,7 +1148,19 @@ class GuestyAccessManager:
             response.headers.update(self._security_headers())
             return response
         if doors is None:
-            return self._page(message, language=language, status=status)
+            logo_url, favicon_url = self._portal_branding()
+            return self._page(
+                message,
+                language=language,
+                detail=(
+                    _portal_text(language, "unavailable_detail")
+                    if message_key == "unavailable"
+                    else None
+                ),
+                logo_url=logo_url,
+                favicon_url=favicon_url,
+                status=status,
+            )
         return self._portal_page(
             token,
             doors,
@@ -1119,6 +1169,44 @@ class GuestyAccessManager:
             notice_kind="success" if status < 400 else "error",
             status=status,
         )
+
+    def _portal_branding(self) -> tuple[str | None, str | None]:
+        """Return validated optional logo and favicon URLs from config options."""
+        logo_url = normalize_branding_url(
+            self.entry.options.get(CONF_ACCESS_LOGO_URL, DEFAULT_ACCESS_LOGO_URL)
+        )
+        favicon_url = normalize_branding_url(
+            self.entry.options.get(CONF_ACCESS_FAVICON_URL, DEFAULT_ACCESS_FAVICON_URL)
+        )
+        return logo_url, favicon_url
+
+    @staticmethod
+    def _branding_markup(
+        logo_url: str | None,
+        favicon_url: str | None,
+    ) -> tuple[str, str, tuple[str, ...]]:
+        """Build escaped branding markup and the minimum CSP image allowlist."""
+        logo_url = normalize_branding_url(logo_url)
+        favicon_url = normalize_branding_url(favicon_url)
+        logo_html = ""
+        favicon_html = ""
+        if logo_url:
+            escaped_logo = html.escape(logo_url, quote=True)
+            logo_html = (
+                '<div class="brand"><img src="'
+                f'{escaped_logo}" alt="" decoding="async" '
+                'referrerpolicy="no-referrer"></div>'
+            )
+        if favicon_url:
+            escaped_favicon = html.escape(favicon_url, quote=True)
+            favicon_html = (
+                f'<link rel="icon" href="{escaped_favicon}" '
+                'referrerpolicy="no-referrer">'
+            )
+        image_sources = tuple(
+            sorted({branding_csp_source(url) for url in (logo_url, favicon_url) if url})
+        )
+        return favicon_html, logo_html, image_sources
 
     def _portal_page(
         self,
@@ -1133,10 +1221,15 @@ class GuestyAccessManager:
         """Render persistent door controls enhanced with same-origin AJAX."""
         language = language if language in ACCESS_PORTAL_TRANSLATIONS else "en"
         nonces = self._action_nonces(token, doors)
+        logo_url, favicon_url = self._portal_branding()
+        favicon_html, logo_html, image_sources = self._branding_markup(
+            logo_url, favicon_url
+        )
         opening_label = html.escape(_portal_text(language, "opening"), quote=True)
         buttons = []
         for index, door in enumerate(doors):
-            label = html.escape(_portal_text(language, "open", door=door["name"]))
+            door_name = localized_door_name(door, language)
+            label = html.escape(_portal_text(language, "open", door=door_name))
             buttons.append(
                 '<form method="post">'
                 f'<input type="hidden" name="door" value="{index}">'
@@ -1154,17 +1247,19 @@ class GuestyAccessManager:
         document = f"""<!doctype html>
 <html lang="{language}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
+<title>{title}</title>{favicon_html}
 <style>
 body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:1.25rem;
 background:#f5f7fa;color:#14213d}}main{{background:white;padding:2rem;border-radius:1rem;
-box-shadow:0 .25rem 1.5rem #0002}}h1{{margin-top:0}}form{{margin:1rem 0}}
+box-shadow:0 .25rem 1.5rem #0002}}.brand{{display:flex;justify-content:center;
+margin:0 0 1.5rem}}.brand img{{display:block;max-width:min(70%,18rem);max-height:6rem;
+width:auto;height:auto;object-fit:contain}}h1{{margin-top:0}}form{{margin:1rem 0}}
 button{{width:100%;padding:1rem;border:0;border-radius:.75rem;background:#0b57d0;
 color:white;font-size:1.05rem;font-weight:600;cursor:pointer}}
 button:disabled{{cursor:wait;opacity:.65}}.notice{{margin:0 0 1.25rem;padding:.9rem 1rem;
 border-radius:.75rem;font-weight:600}}.notice.success{{background:#e8f5e9;color:#176b2c}}
 .notice.error{{background:#ffebee;color:#9b1c1c}}.notice[hidden]{{display:none}}
-</style></head><body><main data-network-error="{network_error}">
+</style></head><body><main data-network-error="{network_error}">{logo_html}
 <h1>{title}</h1><div id="notice" class="notice {notice_class}" role="status"
 aria-live="polite"{notice_hidden}>{escaped_notice}</div>{"".join(buttons)}</main>
 <script nonce="{script_nonce}">
@@ -1232,11 +1327,15 @@ aria-live="polite"{notice_hidden}>{escaped_notice}</div>{"".join(buttons)}</main
             text=document,
             content_type="text/html",
             status=status,
-            headers=self._security_headers(script_nonce),
+            headers=self._security_headers(script_nonce, image_sources=image_sources),
         )
 
     @staticmethod
-    def _security_headers(script_nonce: str | None = None) -> dict[str, str]:
+    def _security_headers(
+        script_nonce: str | None = None,
+        *,
+        image_sources: tuple[str, ...] = (),
+    ) -> dict[str, str]:
         """Return restrictive headers shared by portal HTML and AJAX responses."""
         content_security_policy = (
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
@@ -1244,6 +1343,8 @@ aria-live="polite"{notice_hidden}>{escaped_notice}</div>{"".join(buttons)}</main
         )
         if script_nonce:
             content_security_policy += f"; script-src 'nonce-{script_nonce}'"
+        if image_sources:
+            content_security_policy += f"; img-src {' '.join(image_sources)}"
         return {
             "Cache-Control": "no-store, max-age=0",
             "Content-Security-Policy": content_security_policy,
@@ -1259,27 +1360,36 @@ aria-live="polite"{notice_hidden}>{escaped_notice}</div>{"".join(buttons)}</main
         title: str,
         *,
         language: str = "en",
-        body: str = "",
+        detail: str | None = None,
+        logo_url: str | None = None,
+        favicon_url: str | None = None,
         status: int,
     ) -> web.Response:
         """Return a self-contained non-interactive page without fallback text."""
         language = language if language in ACCESS_PORTAL_TRANSLATIONS else "en"
         escaped_title = html.escape(title)
+        detail_html = f"<p>{html.escape(detail)}</p>" if detail else ""
+        favicon_html, logo_html, image_sources = cls._branding_markup(
+            logo_url, favicon_url
+        )
         document = f"""<!doctype html>
 <html lang="{language}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{escaped_title}</title>
+<title>{escaped_title}</title>{favicon_html}
 <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;
 padding:1.25rem;background:#f5f7fa;color:#14213d}}main{{background:white;padding:2rem;
-border-radius:1rem;box-shadow:0 0.25rem 1.5rem #0002}}form{{margin:1rem 0}}
+border-radius:1rem;box-shadow:0 0.25rem 1.5rem #0002}}.brand{{display:flex;
+justify-content:center;margin:0 0 1.5rem}}.brand img{{display:block;
+max-width:min(70%,18rem);max-height:6rem;width:auto;height:auto;object-fit:contain}}
+form{{margin:1rem 0}}
 button{{width:100%;padding:1rem;border:0;border-radius:.75rem;background:#0b57d0;
 color:white;font-size:1.05rem;font-weight:600}}p{{line-height:1.5}}</style></head>
-<body><main><h1>{escaped_title}</h1>{body}</main></body></html>"""
+<body><main>{logo_html}<h1>{escaped_title}</h1>{detail_html}</main></body></html>"""
         return web.Response(
             text=document,
             content_type="text/html",
             status=status,
-            headers=cls._security_headers(),
+            headers=cls._security_headers(image_sources=image_sources),
         )
 
 
@@ -1322,6 +1432,7 @@ class GuestyAccessView(HomeAssistantView):
             return GuestyAccessManager._page(
                 _portal_text(language, "unavailable"),
                 language=language,
+                detail=_portal_text(language, "unavailable_detail"),
                 status=404,
             )
         return await manager.async_get_portal(token, language)
@@ -1337,6 +1448,7 @@ class GuestyAccessView(HomeAssistantView):
             return GuestyAccessManager._page(
                 _portal_text(language, "unavailable"),
                 language=language,
+                detail=_portal_text(language, "unavailable_detail"),
                 status=404,
             )
         if request.content_length is None:
