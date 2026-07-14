@@ -56,6 +56,100 @@ ACCESS_STORAGE_KEY = "guesty_access"
 ACCESS_MANAGERS = "access_managers"
 ACCESS_VIEW_REGISTERED = "access_view_registered"
 
+ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "de": {
+        "title": "Türzugang",
+        "open": "{door} öffnen",
+        "opening": "Wird geöffnet …",
+        "unavailable": "Zugang nicht verfügbar",
+        "invalid_request": "Ungültige Anfrage",
+        "invalid_nonce": "Sitzung wurde aktualisiert",
+        "cooldown": "Bitte kurz warten und erneut versuchen",
+        "lock_unavailable": "Das Schloss ist momentan nicht erreichbar",
+        "unlock_failed": "Die Tür konnte nicht geöffnet werden",
+        "unlocked": "{door} wurde geöffnet",
+        "length_required": "Länge der Anfrage fehlt",
+        "request_too_large": "Anfrage zu groß",
+        "network_error": "Verbindung fehlgeschlagen. Bitte erneut versuchen",
+    },
+    "en": {
+        "title": "Door access",
+        "open": "Open {door}",
+        "opening": "Opening …",
+        "unavailable": "Access unavailable",
+        "invalid_request": "Invalid request",
+        "invalid_nonce": "Session refreshed",
+        "cooldown": "Please wait a moment and try again",
+        "lock_unavailable": "The lock is currently unavailable",
+        "unlock_failed": "The door could not be opened",
+        "unlocked": "{door} was opened",
+        "length_required": "Request length missing",
+        "request_too_large": "Request too large",
+        "network_error": "Connection failed. Please try again",
+    },
+    "es": {
+        "title": "Acceso a la puerta",
+        "open": "Abrir {door}",
+        "opening": "Abriendo …",
+        "unavailable": "Acceso no disponible",
+        "invalid_request": "Solicitud no válida",
+        "invalid_nonce": "Sesión actualizada",
+        "cooldown": "Espera un momento e inténtalo de nuevo",
+        "lock_unavailable": "La cerradura no está disponible en este momento",
+        "unlock_failed": "No se pudo abrir la puerta",
+        "unlocked": "Se abrió {door}",
+        "length_required": "Falta la longitud de la solicitud",
+        "request_too_large": "La solicitud es demasiado grande",
+        "network_error": "Error de conexión. Inténtalo de nuevo",
+    },
+    "fr": {
+        "title": "Accès à la porte",
+        "open": "Ouvrir {door}",
+        "opening": "Ouverture …",
+        "unavailable": "Accès indisponible",
+        "invalid_request": "Requête non valide",
+        "invalid_nonce": "Session actualisée",
+        "cooldown": "Veuillez patienter un instant et réessayer",
+        "lock_unavailable": "La serrure est actuellement indisponible",
+        "unlock_failed": "La porte n’a pas pu être ouverte",
+        "unlocked": "{door} a été ouverte",
+        "length_required": "Longueur de la requête manquante",
+        "request_too_large": "Requête trop volumineuse",
+        "network_error": "Échec de la connexion. Veuillez réessayer",
+    },
+}
+
+
+def _preferred_language(accept_language: str | None) -> str:
+    """Select a supported portal language from an HTTP Accept-Language value."""
+    if not accept_language:
+        return "en"
+    candidates: list[tuple[float, int, str]] = []
+    for order, raw_item in enumerate(accept_language.split(",")):
+        parts = [part.strip() for part in raw_item.split(";")]
+        language = parts[0].lower().split("-", 1)[0]
+        if language not in ACCESS_PORTAL_TRANSLATIONS:
+            continue
+        quality = 1.0
+        for parameter in parts[1:]:
+            if not parameter.lower().startswith("q="):
+                continue
+            try:
+                quality = float(parameter[2:])
+            except ValueError:
+                quality = 0.0
+        if quality > 0:
+            candidates.append((-min(quality, 1.0), order, language))
+    return min(candidates)[2] if candidates else "en"
+
+
+def _portal_text(language: str, key: str, **values: str) -> str:
+    """Return one translated portal string with an English fallback."""
+    translations = ACCESS_PORTAL_TRANSLATIONS.get(
+        language, ACCESS_PORTAL_TRANSLATIONS["en"]
+    )
+    return translations.get(key, ACCESS_PORTAL_TRANSLATIONS["en"][key]).format(**values)
+
 
 class GuestyAccessStorage:
     """Persist access secrets and token metadata separately from API cache."""
@@ -634,27 +728,31 @@ class GuestyAccessManager:
             self._records.pop(reservation_id, None)
         self._rebuild_token_index()
 
-    async def async_get_portal(self, token: str) -> web.Response:
+    async def async_get_portal(
+        self,
+        token: str,
+        language: str = "de",
+        *,
+        notice: str | None = None,
+        notice_kind: str = "success",
+        status: int = 200,
+    ) -> web.Response:
         """Return a non-operative page or the active door controls."""
         validated = self._validate_token(token)
         if validated is None:
-            return self._page("Zugang nicht verfügbar", status=404)
-        reservation_id, _reservation, doors = validated
-        buttons = []
-        for index, door in enumerate(doors):
-            nonce = self._action_nonce(token, index)
-            label = html.escape(door["name"])
-            buttons.append(
-                '<form method="post">'
-                f'<input type="hidden" name="door" value="{index}">'
-                f'<input type="hidden" name="nonce" value="{nonce}">'
-                f'<button type="submit">{label} öffnen</button>'
-                "</form>"
+            return self._page(
+                _portal_text(language, "unavailable"),
+                language=language,
+                status=404,
             )
-        return self._page(
-            "Türzugang",
-            body="".join(buttons),
-            status=200,
+        _reservation_id, _reservation, doors = validated
+        return self._portal_page(
+            token,
+            doors,
+            language,
+            notice=notice,
+            notice_kind=notice_kind,
+            status=status,
         )
 
     async def async_unlock(
@@ -662,25 +760,62 @@ class GuestyAccessManager:
         token: str,
         door_value: str,
         nonce: str,
+        language: str = "de",
+        *,
+        as_json: bool = False,
     ) -> web.Response:
         """Validate an action and unlock only a server-selected lock entity."""
         validated = self._validate_token(token)
         if validated is None:
-            return self._page("Zugang nicht verfügbar", status=404)
+            return self._action_response(
+                token,
+                None,
+                language,
+                "unavailable",
+                "unavailable",
+                status=404,
+                as_json=as_json,
+            )
         reservation_id, reservation, doors = validated
         try:
             door_index = int(door_value)
+            if door_index < 0:
+                raise IndexError
             door = doors[door_index]
         except (ValueError, IndexError):
-            return self._page("Ungültige Anfrage", status=400)
-        if door_index < 0 or not self._valid_action_nonce(token, door_index, nonce):
+            return self._action_response(
+                token,
+                doors,
+                language,
+                "invalid_request",
+                "invalid_request",
+                status=400,
+                as_json=as_json,
+            )
+        if not self._valid_action_nonce(token, door_index, nonce):
             self._fire_audit(reservation, door.get("entity_id"), "invalid_request")
-            return self._page("Ungültige oder abgelaufene Anfrage", status=403)
+            return self._action_response(
+                token,
+                doors,
+                language,
+                "invalid_nonce",
+                "invalid_nonce",
+                status=403,
+                as_json=as_json,
+            )
 
         rate_result = self._check_rate_limit(reservation_id, door_index)
         if rate_result is not None:
             self._fire_audit(reservation, door.get("entity_id"), rate_result)
-            return self._page("Bitte kurz warten und erneut versuchen", status=429)
+            return self._action_response(
+                token,
+                doors,
+                language,
+                "cooldown",
+                rate_result,
+                status=429,
+                as_json=as_json,
+            )
 
         entity_id = door["entity_id"]
         state = self.hass.states.get(entity_id)
@@ -691,7 +826,15 @@ class GuestyAccessManager:
             or not entity_id.startswith("lock.")
         ):
             self._fire_audit(reservation, entity_id, "lock_unavailable")
-            return self._page("Das Schloss ist momentan nicht erreichbar", status=503)
+            return self._action_response(
+                token,
+                doors,
+                language,
+                "lock_unavailable",
+                "lock_unavailable",
+                status=503,
+                as_json=as_json,
+            )
 
         try:
             async with asyncio.timeout(15):
@@ -705,10 +848,27 @@ class GuestyAccessManager:
             # Never expose integration or lock details to the public response.
             _LOGGER.warning("Guest access could not unlock %s: %s", entity_id, err)
             self._fire_audit(reservation, entity_id, "unlock_failed")
-            return self._page("Die Tür konnte nicht geöffnet werden", status=503)
+            return self._action_response(
+                token,
+                doors,
+                language,
+                "unlock_failed",
+                "unlock_failed",
+                status=503,
+                as_json=as_json,
+            )
 
         self._fire_audit(reservation, entity_id, "unlocked")
-        return self._page(f"{door['name']} wurde geöffnet", status=200)
+        return self._action_response(
+            token,
+            doors,
+            language,
+            "unlocked",
+            "unlocked",
+            status=200,
+            as_json=as_json,
+            door=door["name"],
+        )
 
     def _validate_token(
         self, token: str
@@ -913,12 +1073,200 @@ class GuestyAccessManager:
             },
         )
 
+    def _action_nonces(
+        self,
+        token: str,
+        doors: list[dict[str, str]],
+    ) -> dict[str, str]:
+        """Return fresh per-door nonces for a validated bearer URL."""
+        return {
+            str(index): self._action_nonce(token, index) for index in range(len(doors))
+        }
+
+    def _action_response(
+        self,
+        token: str,
+        doors: list[dict[str, str]] | None,
+        language: str,
+        message_key: str,
+        code: str,
+        *,
+        status: int,
+        as_json: bool,
+        door: str = "",
+    ) -> web.Response:
+        """Return an AJAX result or the same reusable controls as a fallback."""
+        message = _portal_text(language, message_key, door=door)
+        if as_json:
+            response = web.json_response(
+                {
+                    "ok": status < 400,
+                    "code": code,
+                    "message": message,
+                    "nonces": self._action_nonces(token, doors) if doors else {},
+                },
+                status=status,
+            )
+            response.headers.update(self._security_headers())
+            return response
+        if doors is None:
+            return self._page(message, language=language, status=status)
+        return self._portal_page(
+            token,
+            doors,
+            language,
+            notice=message,
+            notice_kind="success" if status < 400 else "error",
+            status=status,
+        )
+
+    def _portal_page(
+        self,
+        token: str,
+        doors: list[dict[str, str]],
+        language: str,
+        *,
+        notice: str | None = None,
+        notice_kind: str = "success",
+        status: int = 200,
+    ) -> web.Response:
+        """Render persistent door controls enhanced with same-origin AJAX."""
+        language = language if language in ACCESS_PORTAL_TRANSLATIONS else "en"
+        nonces = self._action_nonces(token, doors)
+        opening_label = html.escape(_portal_text(language, "opening"), quote=True)
+        buttons = []
+        for index, door in enumerate(doors):
+            label = html.escape(_portal_text(language, "open", door=door["name"]))
+            buttons.append(
+                '<form method="post">'
+                f'<input type="hidden" name="door" value="{index}">'
+                f'<input type="hidden" name="nonce" value="{nonces[str(index)]}">'
+                f'<button type="submit" data-busy-label="{opening_label}">'
+                f"{label}</button></form>"
+            )
+
+        script_nonce = secrets.token_urlsafe(18)
+        escaped_notice = html.escape(notice or "")
+        notice_class = "success" if notice_kind == "success" else "error"
+        notice_hidden = "" if notice else " hidden"
+        network_error = html.escape(_portal_text(language, "network_error"), quote=True)
+        title = html.escape(_portal_text(language, "title"))
+        document = f"""<!doctype html>
+<html lang="{language}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:1.25rem;
+background:#f5f7fa;color:#14213d}}main{{background:white;padding:2rem;border-radius:1rem;
+box-shadow:0 .25rem 1.5rem #0002}}h1{{margin-top:0}}form{{margin:1rem 0}}
+button{{width:100%;padding:1rem;border:0;border-radius:.75rem;background:#0b57d0;
+color:white;font-size:1.05rem;font-weight:600;cursor:pointer}}
+button:disabled{{cursor:wait;opacity:.65}}.notice{{margin:0 0 1.25rem;padding:.9rem 1rem;
+border-radius:.75rem;font-weight:600}}.notice.success{{background:#e8f5e9;color:#176b2c}}
+.notice.error{{background:#ffebee;color:#9b1c1c}}.notice[hidden]{{display:none}}
+</style></head><body><main data-network-error="{network_error}">
+<h1>{title}</h1><div id="notice" class="notice {notice_class}" role="status"
+aria-live="polite"{notice_hidden}>{escaped_notice}</div>{"".join(buttons)}</main>
+<script nonce="{script_nonce}">
+(() => {{
+  const main = document.querySelector("main");
+  const notice = document.getElementById("notice");
+  let noticeTimer;
+  const hideNotice = () => {{ notice.hidden = true; }};
+  const showNotice = (message, success) => {{
+    clearTimeout(noticeTimer);
+    notice.textContent = message;
+    notice.className = `notice ${{success ? "success" : "error"}}`;
+    notice.hidden = false;
+    noticeTimer = setTimeout(hideNotice, 5000);
+  }};
+  if (!notice.hidden) noticeTimer = setTimeout(hideNotice, 5000);
+  const updateNonces = (nonces) => {{
+    if (!nonces) return;
+    document.querySelectorAll("form").forEach((form) => {{
+      const door = form.elements.door.value;
+      if (nonces[door]) form.elements.nonce.value = nonces[door];
+    }});
+  }};
+  document.querySelectorAll("form").forEach((form) => {{
+    form.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      const button = form.querySelector("button");
+      const originalLabel = button.textContent;
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = button.dataset.busyLabel;
+      try {{
+        for (let attempt = 0; attempt < 2; attempt += 1) {{
+          const response = await fetch(window.location.href, {{
+            method: "POST",
+            headers: {{
+              "Accept": "application/json",
+              "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"
+            }},
+            body: new URLSearchParams(new FormData(form)),
+            credentials: "same-origin",
+            cache: "no-store",
+            redirect: "error"
+          }});
+          const payload = await response.json();
+          updateNonces(payload.nonces);
+          if (response.status === 403 && payload.code === "invalid_nonce" && attempt === 0) {{
+            continue;
+          }}
+          showNotice(payload.message || main.dataset.networkError, response.ok);
+          break;
+        }}
+      }} catch (_error) {{
+        showNotice(main.dataset.networkError, false);
+      }} finally {{
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        button.textContent = originalLabel;
+      }}
+    }});
+  }});
+}})();
+</script></body></html>"""
+        return web.Response(
+            text=document,
+            content_type="text/html",
+            status=status,
+            headers=self._security_headers(script_nonce),
+        )
+
     @staticmethod
-    def _page(title: str, *, body: str = "", status: int) -> web.Response:
-        """Return a self-contained page with restrictive browser headers."""
+    def _security_headers(script_nonce: str | None = None) -> dict[str, str]:
+        """Return restrictive headers shared by portal HTML and AJAX responses."""
+        content_security_policy = (
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+            "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
+        )
+        if script_nonce:
+            content_security_policy += f"; script-src 'nonce-{script_nonce}'"
+        return {
+            "Cache-Control": "no-store, max-age=0",
+            "Content-Security-Policy": content_security_policy,
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        }
+
+    @classmethod
+    def _page(
+        cls,
+        title: str,
+        *,
+        language: str = "en",
+        body: str = "",
+        status: int,
+    ) -> web.Response:
+        """Return a self-contained non-interactive page without fallback text."""
+        language = language if language in ACCESS_PORTAL_TRANSLATIONS else "en"
         escaped_title = html.escape(title)
         document = f"""<!doctype html>
-<html lang="de"><head><meta charset="utf-8">
+<html lang="{language}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escaped_title}</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;
@@ -926,22 +1274,12 @@ padding:1.25rem;background:#f5f7fa;color:#14213d}}main{{background:white;padding
 border-radius:1rem;box-shadow:0 0.25rem 1.5rem #0002}}form{{margin:1rem 0}}
 button{{width:100%;padding:1rem;border:0;border-radius:.75rem;background:#0b57d0;
 color:white;font-size:1.05rem;font-weight:600}}p{{line-height:1.5}}</style></head>
-<body><main><h1>{escaped_title}</h1>{body or "<p>Bitte kontaktiere deinen Gastgeber.</p>"}</main></body></html>"""
+<body><main><h1>{escaped_title}</h1>{body}</main></body></html>"""
         return web.Response(
             text=document,
             content_type="text/html",
             status=status,
-            headers={
-                "Cache-Control": "no-store, max-age=0",
-                "Content-Security-Policy": (
-                    "default-src 'none'; style-src 'unsafe-inline'; "
-                    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-                ),
-                "Referrer-Policy": "no-referrer",
-                "X-Content-Type-Options": "nosniff",
-                "X-Frame-Options": "DENY",
-                "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-            },
+            headers=cls._security_headers(),
         )
 
 
@@ -964,34 +1302,81 @@ class GuestyAccessView(HomeAssistantView):
         manager = managers.get(entry_id) if isinstance(managers, dict) else None
         return manager if isinstance(manager, GuestyAccessManager) else None
 
+    @staticmethod
+    def _language(request: web.Request) -> str:
+        """Select the page language from the browser request."""
+        return _preferred_language(request.headers.get("Accept-Language"))
+
+    @staticmethod
+    def _wants_json(request: web.Request) -> bool:
+        """Return whether the enhanced page requested an AJAX result."""
+        return "application/json" in request.headers.get("Accept", "").lower()
+
     async def get(
         self, request: web.Request, entry_id: str, token: str
     ) -> web.Response:
         """Render controls without performing a lock action."""
+        language = self._language(request)
         manager = self._manager(entry_id)
         if manager is None:
-            return GuestyAccessManager._page("Zugang nicht verfügbar", status=404)
-        return await manager.async_get_portal(token)
+            return GuestyAccessManager._page(
+                _portal_text(language, "unavailable"),
+                language=language,
+                status=404,
+            )
+        return await manager.async_get_portal(token, language)
 
     async def post(
         self, request: web.Request, entry_id: str, token: str
     ) -> web.Response:
         """Process a small, CSRF-protected unlock form."""
+        language = self._language(request)
+        as_json = self._wants_json(request)
         manager = self._manager(entry_id)
         if manager is None:
-            return GuestyAccessManager._page("Zugang nicht verfügbar", status=404)
+            return GuestyAccessManager._page(
+                _portal_text(language, "unavailable"),
+                language=language,
+                status=404,
+            )
         if request.content_length is None:
-            return GuestyAccessManager._page("Länge der Anfrage fehlt", status=411)
+            return manager._action_response(
+                token,
+                None,
+                language,
+                "length_required",
+                "length_required",
+                status=411,
+                as_json=as_json,
+            )
         if request.content_length > ACCESS_MAX_REQUEST_BYTES:
-            return GuestyAccessManager._page("Anfrage zu groß", status=413)
+            return manager._action_response(
+                token,
+                None,
+                language,
+                "request_too_large",
+                "request_too_large",
+                status=413,
+                as_json=as_json,
+            )
         try:
             form = await request.post()
         except (ValueError, web.HTTPException):
-            return GuestyAccessManager._page("Ungültige Anfrage", status=400)
+            return manager._action_response(
+                token,
+                None,
+                language,
+                "invalid_request",
+                "invalid_request",
+                status=400,
+                as_json=as_json,
+            )
         return await manager.async_unlock(
             token,
             str(form.get("door", "")),
             str(form.get("nonce", "")),
+            language,
+            as_json=as_json,
         )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,7 +11,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import access
-from custom_components.guesty.access import GuestyAccessManager
+from custom_components.guesty.access import GuestyAccessManager, _preferred_language
 from custom_components.guesty.api import GuestyApiError
 from custom_components.guesty.const import (
     CONF_ACCESS_CUSTOM_FIELD,
@@ -297,12 +298,149 @@ async def test_get_never_unlocks_and_valid_post_uses_server_mapping(
     result = await manager.async_unlock(token, "0", nonce)
 
     assert result.status == 200
+    assert "Haustür wurde geöffnet" in result.text
+    assert "Haustür öffnen" in result.text
+    assert "Bitte kontaktiere deinen Gastgeber." not in result.text
     service_call.assert_awaited_once_with(
         "lock",
         "unlock",
         target={"entity_id": "lock.front_door"},
         blocking=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("de-DE,de;q=0.9,en;q=0.8", "de"),
+        ("es-MX,es;q=0.9,en;q=0.7", "es"),
+        ("fr-CA;q=0.8,en;q=0.9", "en"),
+        ("it-IT,it;q=0.9", "en"),
+        (None, "en"),
+    ],
+)
+def test_portal_language_uses_browser_preference(
+    header: str | None, expected: str
+) -> None:
+    """The portal follows supported browser languages and falls back to English."""
+    assert _preferred_language(header) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "title", "button"),
+    [
+        ("de", "Türzugang", "Haustür öffnen"),
+        ("en", "Door access", "Open Haustür"),
+        ("es", "Acceso a la puerta", "Abrir Haustür"),
+        ("fr", "Accès à la porte", "Ouvrir Haustür"),
+    ],
+)
+async def test_portal_localizes_reusable_ajax_controls(
+    hass, monkeypatch, language: str, title: str, button: str
+) -> None:
+    """All supported languages retain controls while messages auto-hide."""
+    manager, _client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    token = manager._token_for("reservation-1", record["version"])
+
+    page = await manager.async_get_portal(token, language)
+
+    assert page.status == 200
+    assert f'<html lang="{language}">' in page.text
+    assert title in page.text
+    assert button in page.text
+    assert page.text.count('<form method="post">') == 2
+    assert "event.preventDefault()" in page.text
+    assert "fetch(window.location.href" in page.text
+    assert "setTimeout(hideNotice, 5000)" in page.text
+    assert "setInterval" not in page.text
+    assert "Bitte kontaktiere deinen Gastgeber." not in page.text
+    content_security_policy = page.headers["Content-Security-Policy"]
+    assert "connect-src 'self'" in content_security_policy
+    assert "script-src 'nonce-" in content_security_policy
+    assert "script-src 'unsafe-inline'" not in content_security_policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "message"),
+    [
+        ("de", "Haustür wurde geöffnet"),
+        ("en", "Haustür was opened"),
+        ("es", "Se abrió Haustür"),
+        ("fr", "Haustür a été ouverte"),
+    ],
+)
+async def test_ajax_unlock_returns_localized_message_and_fresh_nonces(
+    hass, monkeypatch, language: str, message: str
+) -> None:
+    """Successful AJAX actions keep the page usable without a reload."""
+    manager, _client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    token = manager._token_for("reservation-1", record["version"])
+    service_call = AsyncMock()
+
+    async def _async_call(_registry, *args, **kwargs) -> None:
+        await service_call(*args, **kwargs)
+
+    monkeypatch.setattr(type(hass.services), "async_call", _async_call)
+    hass.states.async_set("lock.front_door", "locked")
+
+    result = await manager.async_unlock(
+        token,
+        "0",
+        manager._action_nonce(token, 0),
+        language,
+        as_json=True,
+    )
+    payload = json.loads(result.text)
+
+    assert result.status == 200
+    assert result.content_type == "application/json"
+    assert payload == {
+        "ok": True,
+        "code": "unlocked",
+        "message": message,
+        "nonces": {
+            "0": manager._action_nonce(token, 0),
+            "1": manager._action_nonce(token, 1),
+        },
+    }
+    service_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ajax_expired_nonce_is_refreshed_without_unlocking(
+    hass, monkeypatch
+) -> None:
+    """The client can retry once with fresh nonces after a page was left open."""
+    manager, _client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    token = manager._token_for("reservation-1", record["version"])
+    service_call = AsyncMock()
+
+    async def _async_call(_registry, *args, **kwargs) -> None:
+        await service_call(*args, **kwargs)
+
+    monkeypatch.setattr(type(hass.services), "async_call", _async_call)
+    hass.states.async_set("lock.front_door", "locked")
+
+    result = await manager.async_unlock(
+        token,
+        "0",
+        "expired",
+        "fr",
+        as_json=True,
+    )
+    payload = json.loads(result.text)
+
+    assert result.status == 403
+    assert payload["ok"] is False
+    assert payload["code"] == "invalid_nonce"
+    assert payload["message"] == "Session actualisée"
+    assert payload["nonces"]["0"] == manager._action_nonce(token, 0)
+    service_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
