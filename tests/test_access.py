@@ -479,6 +479,31 @@ async def test_custom_translated_labels_do_not_rotate_access_link(
 
 
 @pytest.mark.asyncio
+async def test_portal_renders_at_most_six_configured_locks(hass, monkeypatch) -> None:
+    """Six selected locks render, while excess raw configuration is ignored."""
+    manager, _client = await _manager(hass, monkeypatch)
+    raw_doors = [
+        {"entity_id": f"lock.door_{index}", "name": f"Door {index}"}
+        for index in range(1, 8)
+    ]
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={
+            **manager.entry.options,
+            CONF_ACCESS_LOCK_MAPPINGS: {"listing-1": raw_doors},
+        },
+    )
+
+    doors = manager._mappings["listing-1"]
+    page = manager._portal_page("opaque-token", doors, "en")
+
+    assert len(doors) == 6
+    assert page.text.count('<form method="post">') == 6
+    assert "Open Door 6" in page.text
+    assert "Open Door 7" not in page.text
+
+
+@pytest.mark.asyncio
 async def test_portal_renders_safely_scoped_logo_and_favicon(hass, monkeypatch) -> None:
     """Optional branding is escaped, centered, and limited by the CSP."""
     manager, _client = await _manager(hass, monkeypatch)

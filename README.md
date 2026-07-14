@@ -88,10 +88,12 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 
 ## Zeitlich begrenzter Gast-Türzugang
 
-Die Integration kann pro Guesty-Listing ein oder zwei vorhandene
-Home-Assistant-Entitäten aus der Domain `lock` zuordnen. Für jede aktive
-Reservierung wird **ein** geschützter Link erzeugt. Auf der Seite erscheinen
-Schaltflächen wie „Haustür öffnen“ oder „Wohnungstür öffnen“. Die Seite richtet
+Die Integration kann pro Guesty-Listing ein bis sechs vorhandene
+Home-Assistant-Entitäten aus der Domain `lock` zuordnen. Das erste Schloss ist
+erforderlich, die weiteren fünf sind optional. Nicht ausgewählte Schlösser
+erscheinen nicht auf der Gastseite. Für jede aktive Reservierung wird **ein**
+geschützter Link erzeugt. Auf der Seite erscheinen Schaltflächen wie „Haustür
+öffnen“ oder „Wohnungstür öffnen“. Die Seite richtet
 sich automatisch nach der bevorzugten Browser-/Systemsprache; Deutsch,
 Englisch, Spanisch und Französisch werden unterstützt, alle anderen Sprachen
 verwenden Englisch. Für jedes Schloss können in den Integrationsoptionen eigene
@@ -126,9 +128,11 @@ preiszugeben.
    `Door access link` wird automatisch über die Guesty API aufgelöst.
 5. Optional eine direkte HTTPS-URL für ein Logo und ein Favicon eintragen. Das
    Logo wird zentriert und responsiv mit maximal 96 px Höhe dargestellt.
-6. Listings auswählen und jedem Listing ein oder zwei `lock.*`-Entitäten sowie
+6. Listings auswählen und jedem Listing bis zu sechs `lock.*`-Entitäten sowie
    gastfreundliche Türnamen auf Deutsch, Englisch, Spanisch und Französisch
-   zuordnen. Die vorgeschlagenen Übersetzungen können frei angepasst werden.
+   zuordnen. Nur das erste Schloss ist erforderlich. Die weiteren Türnamen sind
+   als „Wohnungstür“ vorbelegt, werden ohne ausgewählte Schloss-Entität aber
+   ignoriert. Die vorgeschlagenen Übersetzungen können frei angepasst werden.
 7. Optional eine Freigabe vor Check-in oder nach Check-out einstellen.
 8. In Guesty die erzeugte Custom-Field-Variable, zum Beispiel
    `{{door_access_link}}`, im Guest-App-Check-in-Text oder in einer

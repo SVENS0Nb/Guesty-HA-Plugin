@@ -60,7 +60,7 @@
       },
       "listing": {
         "title": "Schlösser für {listing}",
-        "description": "Wähle ein oder zwei Home-Assistant-Schlösser und lege die Bezeichnungen für deine Gäste fest. Bekannte allgemeine Türnamen erhalten lokale Übersetzungsvorschläge; jede Sprache kann angepasst werden. Diese serverseitige Zuordnung kann durch einen Gastlink nicht verändert werden.",
+        "description": "Wähle ein bis sechs Home-Assistant-Schlösser und lege die Bezeichnungen für deine Gäste fest. Die Schlösser zwei bis sechs sind optional; auf der Gastseite erscheinen nur tatsächlich ausgewählte Schlösser. Bekannte allgemeine Türnamen erhalten lokale Übersetzungsvorschläge; jede Sprache kann angepasst werden. Diese serverseitige Zuordnung kann durch einen Gastlink nicht verändert werden.",
         "data": {
           "access_lock_1": "Erstes Schloss",
           "access_lock_1_name": "Erste Tür – Deutsch",
@@ -71,7 +71,27 @@
           "access_lock_2_name": "Zweite Tür – Deutsch",
           "access_lock_2_name_en": "Zweite Tür – Englisch",
           "access_lock_2_name_es": "Zweite Tür – Spanisch",
-          "access_lock_2_name_fr": "Zweite Tür – Französisch"
+          "access_lock_2_name_fr": "Zweite Tür – Französisch",
+          "access_lock_3": "Drittes Schloss (optional)",
+          "access_lock_3_name": "Dritte Tür – Deutsch",
+          "access_lock_3_name_en": "Dritte Tür – Englisch",
+          "access_lock_3_name_es": "Dritte Tür – Spanisch",
+          "access_lock_3_name_fr": "Dritte Tür – Französisch",
+          "access_lock_4": "Viertes Schloss (optional)",
+          "access_lock_4_name": "Vierte Tür – Deutsch",
+          "access_lock_4_name_en": "Vierte Tür – Englisch",
+          "access_lock_4_name_es": "Vierte Tür – Spanisch",
+          "access_lock_4_name_fr": "Vierte Tür – Französisch",
+          "access_lock_5": "Fünftes Schloss (optional)",
+          "access_lock_5_name": "Fünfte Tür – Deutsch",
+          "access_lock_5_name_en": "Fünfte Tür – Englisch",
+          "access_lock_5_name_es": "Fünfte Tür – Spanisch",
+          "access_lock_5_name_fr": "Fünfte Tür – Französisch",
+          "access_lock_6": "Sechstes Schloss (optional)",
+          "access_lock_6_name": "Sechste Tür – Deutsch",
+          "access_lock_6_name_en": "Sechste Tür – Englisch",
+          "access_lock_6_name_es": "Sechste Tür – Spanisch",
+          "access_lock_6_name_fr": "Sechste Tür – Französisch"
         }
       },
       "loxone": {

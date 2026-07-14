@@ -15,6 +15,7 @@ from homeassistant.helpers import selector
 
 from .access_branding import MAX_BRANDING_URL_LENGTH, normalize_branding_url
 from .access_names import (
+    ACCESS_DOOR_LANGUAGES,
     DEFAULT_FIRST_DOOR_NAMES,
     DEFAULT_SECOND_DOOR_NAMES,
     localized_door_names,
@@ -33,6 +34,7 @@ from .loxone_api import (
     normalize_loxone_url,
 )
 from .const import (
+    ACCESS_MAX_LOCKS,
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_EARLY_MINUTES,
@@ -41,16 +43,6 @@ from .const import (
     CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LISTINGS,
     CONF_ACCESS_LOGO_URL,
-    CONF_ACCESS_LOCK_1,
-    CONF_ACCESS_LOCK_1_NAME,
-    CONF_ACCESS_LOCK_1_NAME_EN,
-    CONF_ACCESS_LOCK_1_NAME_ES,
-    CONF_ACCESS_LOCK_1_NAME_FR,
-    CONF_ACCESS_LOCK_2,
-    CONF_ACCESS_LOCK_2_NAME,
-    CONF_ACCESS_LOCK_2_NAME_EN,
-    CONF_ACCESS_LOCK_2_NAME_ES,
-    CONF_ACCESS_LOCK_2_NAME_FR,
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -95,20 +87,26 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_LOCK_1_NAME_FIELDS = {
-    "de": CONF_ACCESS_LOCK_1_NAME,
-    "en": CONF_ACCESS_LOCK_1_NAME_EN,
-    "es": CONF_ACCESS_LOCK_1_NAME_ES,
-    "fr": CONF_ACCESS_LOCK_1_NAME_FR,
-}
-_LOCK_2_NAME_FIELDS = {
-    "de": CONF_ACCESS_LOCK_2_NAME,
-    "en": CONF_ACCESS_LOCK_2_NAME_EN,
-    "es": CONF_ACCESS_LOCK_2_NAME_ES,
-    "fr": CONF_ACCESS_LOCK_2_NAME_FR,
-}
-
 CONF_LOXONE_SERVER_COUNT = "loxone_server_count"
+
+
+def _lock_entity_field(position: int) -> str:
+    """Return the options field for one lock position."""
+    return f"access_lock_{position}"
+
+
+def _lock_name_fields(position: int) -> dict[str, str]:
+    """Return localized label fields for one lock position."""
+    base = f"access_lock_{position}_name"
+    return {
+        language: base if language == "de" else f"{base}_{language}"
+        for language in ACCESS_DOOR_LANGUAGES
+    }
+
+
+def _lock_defaults(position: int) -> dict[str, str]:
+    """Return front-door defaults for the first slot and apartment-door defaults later."""
+    return DEFAULT_FIRST_DOOR_NAMES if position == 1 else DEFAULT_SECOND_DOOR_NAMES
 
 
 def _door_mapping_from_input(
@@ -501,35 +499,33 @@ class GuestyOptionsFlow(OptionsFlow):
     async def async_step_listing(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Assign one or two lock entities to one selected listing."""
+        """Assign one to six lock entities to one selected listing."""
         listing_id = self._listing_queue[0]
         coordinator = self.config_entry.runtime_data.coordinator
         listing = coordinator.data.listings[listing_id]
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            lock_1 = user_input[CONF_ACCESS_LOCK_1]
-            lock_2 = user_input.get(CONF_ACCESS_LOCK_2)
-            if lock_2 and lock_1 == lock_2:
-                errors["base"] = "same_lock"
-            else:
-                doors = [
+            doors: list[dict[str, str]] = []
+            selected_entities: set[str] = set()
+            for position in range(1, ACCESS_MAX_LOCKS + 1):
+                entity_id = user_input.get(_lock_entity_field(position))
+                if not entity_id:
+                    continue
+                if entity_id in selected_entities:
+                    errors["base"] = "same_lock"
+                    break
+                selected_entities.add(entity_id)
+                doors.append(
                     _door_mapping_from_input(
-                        lock_1,
+                        entity_id,
                         user_input,
-                        _LOCK_1_NAME_FIELDS,
-                        DEFAULT_FIRST_DOOR_NAMES,
+                        _lock_name_fields(position),
+                        _lock_defaults(position),
                     )
-                ]
-                if lock_2:
-                    doors.append(
-                        _door_mapping_from_input(
-                            lock_2,
-                            user_input,
-                            _LOCK_2_NAME_FIELDS,
-                            DEFAULT_SECOND_DOOR_NAMES,
-                        )
-                    )
+                )
+
+            if not errors:
                 self._pending_mappings[listing_id] = doors
                 self._listing_queue.pop(0)
                 if self._listing_queue:
@@ -545,45 +541,37 @@ class GuestyOptionsFlow(OptionsFlow):
 
         current = self.config_entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
         existing = current.get(listing_id, []) if isinstance(current, dict) else []
-        first = existing[0] if len(existing) > 0 else {}
-        second = existing[1] if len(existing) > 1 else {}
-        first_names = localized_door_names(first, DEFAULT_FIRST_DOOR_NAMES)
-        second_names = localized_door_names(second, DEFAULT_SECOND_DOOR_NAMES)
         lock_selector = selector.EntitySelector(
             selector.EntitySelectorConfig(domain="lock")
         )
         required_label = vol.All(str, vol.Length(min=1, max=80))
         optional_label = vol.All(str, vol.Length(max=80))
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_ACCESS_LOCK_1): lock_selector,
-                vol.Required(CONF_ACCESS_LOCK_1_NAME): required_label,
-                vol.Required(CONF_ACCESS_LOCK_1_NAME_EN): required_label,
-                vol.Required(CONF_ACCESS_LOCK_1_NAME_ES): required_label,
-                vol.Required(CONF_ACCESS_LOCK_1_NAME_FR): required_label,
-                vol.Optional(CONF_ACCESS_LOCK_2): lock_selector,
-                vol.Optional(CONF_ACCESS_LOCK_2_NAME): optional_label,
-                vol.Optional(CONF_ACCESS_LOCK_2_NAME_EN): optional_label,
-                vol.Optional(CONF_ACCESS_LOCK_2_NAME_ES): optional_label,
-                vol.Optional(CONF_ACCESS_LOCK_2_NAME_FR): optional_label,
-            }
-        )
+        schema_fields: dict[Any, Any] = {}
+        suggested_values: dict[str, Any] = {}
+        for position in range(1, ACCESS_MAX_LOCKS + 1):
+            entity_field = _lock_entity_field(position)
+            name_fields = _lock_name_fields(position)
+            existing_door = (
+                existing[position - 1]
+                if isinstance(existing, list) and len(existing) >= position
+                else {}
+            )
+            names = localized_door_names(existing_door, _lock_defaults(position))
+            entity_marker = vol.Required if position == 1 else vol.Optional
+            label_marker = vol.Required if position == 1 else vol.Optional
+            label_validator = required_label if position == 1 else optional_label
+            schema_fields[entity_marker(entity_field)] = lock_selector
+            suggested_values[entity_field] = existing_door.get("entity_id")
+            for language, name_field in name_fields.items():
+                schema_fields[label_marker(name_field)] = label_validator
+                suggested_values[name_field] = names[language]
+
+        schema = vol.Schema(schema_fields)
         return self.async_show_form(
             step_id="listing",
             data_schema=self.add_suggested_values_to_schema(
                 schema,
-                {
-                    CONF_ACCESS_LOCK_1: first.get("entity_id"),
-                    CONF_ACCESS_LOCK_1_NAME: first_names["de"],
-                    CONF_ACCESS_LOCK_1_NAME_EN: first_names["en"],
-                    CONF_ACCESS_LOCK_1_NAME_ES: first_names["es"],
-                    CONF_ACCESS_LOCK_1_NAME_FR: first_names["fr"],
-                    CONF_ACCESS_LOCK_2: second.get("entity_id"),
-                    CONF_ACCESS_LOCK_2_NAME: second_names["de"],
-                    CONF_ACCESS_LOCK_2_NAME_EN: second_names["en"],
-                    CONF_ACCESS_LOCK_2_NAME_ES: second_names["es"],
-                    CONF_ACCESS_LOCK_2_NAME_FR: second_names["fr"],
-                },
+                suggested_values,
             ),
             errors=errors,
             description_placeholders={"listing": listing.display_name},

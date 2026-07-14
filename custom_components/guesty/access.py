@@ -36,6 +36,7 @@ from .access_names import (
 from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
 from .const import (
     ACCESS_ACTION_NONCE_SECONDS,
+    ACCESS_MAX_LOCKS,
     ACCESS_MAX_REQUEST_BYTES,
     ACCESS_RATE_LIMIT_MAX_ACTIONS,
     ACCESS_RATE_LIMIT_WINDOW_SECONDS,
@@ -1098,7 +1099,7 @@ class GuestyAccessManager:
 
     @property
     def _mappings(self) -> dict[str, list[dict[str, str]]]:
-        """Return only valid one-or-two-lock listing mappings."""
+        """Return only valid listing mappings with at most six unique locks."""
         raw = self.entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
         if not isinstance(raw, Mapping):
             return {}
@@ -1107,7 +1108,8 @@ class GuestyAccessManager:
             if not isinstance(listing_id, str) or not isinstance(value, list):
                 continue
             doors: list[dict[str, str]] = []
-            for index, item in enumerate(value[:2]):
+            seen_entities: set[str] = set()
+            for index, item in enumerate(value[:ACCESS_MAX_LOCKS]):
                 if not isinstance(item, Mapping):
                     continue
                 entity_id = item.get("entity_id")
@@ -1115,7 +1117,9 @@ class GuestyAccessManager:
                     isinstance(entity_id, str)
                     and entity_id.startswith("lock.")
                     and valid_entity_id(entity_id)
+                    and entity_id not in seen_entities
                 ):
+                    seen_entities.add(entity_id)
                     defaults = (
                         DEFAULT_FIRST_DOOR_NAMES
                         if index == 0

@@ -60,7 +60,7 @@
       },
       "listing": {
         "title": "Locks for {listing}",
-        "description": "Select one or two Home Assistant lock entities and configure their guest-facing labels. Known generic door names receive local translation suggestions; every language can be customized. These server-side assignments cannot be changed by a guest link.",
+        "description": "Select one to six Home Assistant lock entities and configure their guest-facing labels. Locks two through six are optional and only selected locks appear on the guest page. Known generic door names receive local translation suggestions; every language can be customized. These server-side assignments cannot be changed by a guest link.",
         "data": {
           "access_lock_1": "First lock",
           "access_lock_1_name": "First door – German",
@@ -71,7 +71,27 @@
           "access_lock_2_name": "Second door – German",
           "access_lock_2_name_en": "Second door – English",
           "access_lock_2_name_es": "Second door – Spanish",
-          "access_lock_2_name_fr": "Second door – French"
+          "access_lock_2_name_fr": "Second door – French",
+          "access_lock_3": "Third lock (optional)",
+          "access_lock_3_name": "Third door – German",
+          "access_lock_3_name_en": "Third door – English",
+          "access_lock_3_name_es": "Third door – Spanish",
+          "access_lock_3_name_fr": "Third door – French",
+          "access_lock_4": "Fourth lock (optional)",
+          "access_lock_4_name": "Fourth door – German",
+          "access_lock_4_name_en": "Fourth door – English",
+          "access_lock_4_name_es": "Fourth door – Spanish",
+          "access_lock_4_name_fr": "Fourth door – French",
+          "access_lock_5": "Fifth lock (optional)",
+          "access_lock_5_name": "Fifth door – German",
+          "access_lock_5_name_en": "Fifth door – English",
+          "access_lock_5_name_es": "Fifth door – Spanish",
+          "access_lock_5_name_fr": "Fifth door – French",
+          "access_lock_6": "Sixth lock (optional)",
+          "access_lock_6_name": "Sixth door – German",
+          "access_lock_6_name_en": "Sixth door – English",
+          "access_lock_6_name_es": "Sixth door – Spanish",
+          "access_lock_6_name_fr": "Sixth door – French"
         }
       },
       "loxone": {

@@ -25,6 +25,15 @@ from custom_components.guesty.const import (
     CONF_ACCESS_LOCK_1_NAME_EN,
     CONF_ACCESS_LOCK_1_NAME_ES,
     CONF_ACCESS_LOCK_1_NAME_FR,
+    CONF_ACCESS_LOCK_2,
+    CONF_ACCESS_LOCK_3,
+    CONF_ACCESS_LOCK_4,
+    CONF_ACCESS_LOCK_5,
+    CONF_ACCESS_LOCK_6,
+    CONF_ACCESS_LOCK_6_NAME,
+    CONF_ACCESS_LOCK_6_NAME_EN,
+    CONF_ACCESS_LOCK_6_NAME_ES,
+    CONF_ACCESS_LOCK_6_NAME_FR,
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -146,7 +155,7 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
+async def test_options_flow_maps_up_to_six_locks_per_listing(hass) -> None:
     """Secure access configuration stores only server-selected lock entities."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -198,6 +207,28 @@ async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
     )
     assert listing_form["type"] is FlowResultType.FORM
     assert listing_form["step_id"] == "listing"
+    suggestions = {
+        marker.schema: marker.description.get("suggested_value")
+        for marker in listing_form["data_schema"].schema
+    }
+    assert suggestions[CONF_ACCESS_LOCK_6_NAME] == "Wohnungstür"
+    assert suggestions[CONF_ACCESS_LOCK_6_NAME_EN] == "Apartment door"
+    assert suggestions[CONF_ACCESS_LOCK_6_NAME_ES] == "Puerta del apartamento"
+    assert suggestions[CONF_ACCESS_LOCK_6_NAME_FR] == "Porte de l’appartement"
+
+    duplicate = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_ACCESS_LOCK_1: "lock.front_door",
+            CONF_ACCESS_LOCK_1_NAME: "Haustür",
+            CONF_ACCESS_LOCK_1_NAME_EN: "Front door",
+            CONF_ACCESS_LOCK_1_NAME_ES: "Puerta principal",
+            CONF_ACCESS_LOCK_1_NAME_FR: "Porte d’entrée",
+            CONF_ACCESS_LOCK_6: "lock.front_door",
+        },
+    )
+    assert duplicate["type"] is FlowResultType.FORM
+    assert duplicate["errors"] == {"base": "same_lock"}
 
     result = await hass.config_entries.options.async_configure(
         form["flow_id"],
@@ -207,6 +238,11 @@ async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
             CONF_ACCESS_LOCK_1_NAME_EN: "Front door",
             CONF_ACCESS_LOCK_1_NAME_ES: "Puerta principal",
             CONF_ACCESS_LOCK_1_NAME_FR: "Porte d’entrée",
+            CONF_ACCESS_LOCK_2: "lock.apartment_1",
+            CONF_ACCESS_LOCK_3: "lock.apartment_2",
+            CONF_ACCESS_LOCK_4: "lock.apartment_3",
+            CONF_ACCESS_LOCK_5: "lock.apartment_4",
+            CONF_ACCESS_LOCK_6: "lock.apartment_5",
         },
     )
 
@@ -219,18 +255,32 @@ async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
         result["data"][CONF_ACCESS_FAVICON_URL]
         == "https://assets.example.com/favicon.ico"
     )
-    assert result["data"][CONF_ACCESS_LOCK_MAPPINGS] == {
-        "listing-1": [
-            {
-                "entity_id": "lock.front_door",
-                "name": "Haustür",
-                "name_de": "Haustür",
-                "name_en": "Front door",
-                "name_es": "Puerta principal",
-                "name_fr": "Porte d’entrée",
-            }
-        ]
+    doors = result["data"][CONF_ACCESS_LOCK_MAPPINGS]["listing-1"]
+    assert [door["entity_id"] for door in doors] == [
+        "lock.front_door",
+        "lock.apartment_1",
+        "lock.apartment_2",
+        "lock.apartment_3",
+        "lock.apartment_4",
+        "lock.apartment_5",
+    ]
+    assert doors[0] == {
+        "entity_id": "lock.front_door",
+        "name": "Haustür",
+        "name_de": "Haustür",
+        "name_en": "Front door",
+        "name_es": "Puerta principal",
+        "name_fr": "Porte d’entrée",
     }
+    for door in doors[1:]:
+        assert door == {
+            "entity_id": door["entity_id"],
+            "name": "Wohnungstür",
+            "name_de": "Wohnungstür",
+            "name_en": "Apartment door",
+            "name_es": "Puerta del apartamento",
+            "name_fr": "Porte de l’appartement",
+        }
 
 
 @pytest.mark.asyncio
