@@ -8,6 +8,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Belegungs-Sensor pro Listing** – Status `vacant` (frei) oder `occupied` (vermietet)
 - **Punktgenaue Check-in/out Updates** – zeitgesteuerte Neuberechnung ohne API-Polling
 - **Guesty Webhooks** – gebündelte Echtzeit-Updates bei Reservierungs- und Listing-Änderungen
+- **Signierte Webhooks** – eingehende Ereignisse werden mit Guestys Signatur
+  geprüft; Duplikate und veraltete Zustellungen werden verworfen
 - **Inkrementeller Sync** – nur geänderte Reservierungen + täglicher Vollabgleich
 - **Traffic-sparsame Listing-Synchronisierung** – Listing-Payloads werden direkt verarbeitet; neue Listings laden nur ihre eigenen Reservierungen
 - **Individuelle Check-in/Check-out Zeiten** – inkl. UTC-Fallback
@@ -144,6 +146,12 @@ Endpunkt für Reservierungs-Custom-Fields.
 - Veraltete Guesty-Daten: Der Türzugang arbeitet „fail closed“ und verweigert
   die Öffnung, bis wieder aktuelle Reservierungsdaten vorliegen.
 - Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
+- Fehlgeschlagene Veröffentlichungs- und Löschvorgänge verwenden ein
+  persistentes exponentielles Backoff. Dadurch erzeugen Guesty-Ausfälle keine
+  Schreibschleife; lokal widerrufene Links bleiben dabei sofort gesperrt.
+- Nicht mehr benötigte lokale Zugangsdatensätze werden nach erfolgreicher
+  Bereinigung entfernt. Nicht bereinigbare Tombstones laufen nach sieben Tagen
+  aus; ihre alten Links bleiben durch die lokale Token-Prüfung ungültig.
 - „Synchronisiert“ wird erst gemeldet, nachdem der Wert über Guestys separaten
   Reservation-Custom-Field-GET-Endpunkt zurückgelesen wurde. Kurz verzögerte
   Guesty-Antworten werden begrenzt erneut geprüft.
@@ -266,7 +274,11 @@ flowchart TD
 ```
 
 1. **Polling** – inkrementeller Reservierungsabgleich alle 5 Minuten; verpasste Listing-Events werden ohne aktiven Webhook spätestens nach 15 Minuten erkannt
-2. **Webhooks** – Änderungen werden nach einer kurzen 0,75-s-Sammelphase verarbeitet; Duplikate und Ereignis-Bursts erzeugen dadurch möglichst wenige API-Aufrufe
+2. **Webhooks** – Guestys aktuelle Reservierungsereignisse
+   `reservation.created.v2` und `reservation.updated.v2` werden nach einer
+   kurzen 0,75-s-Sammelphase verarbeitet. Die Integration prüft die von Guesty
+   bereitgestellte HMAC-Signatur; Duplikate und Ereignis-Bursts erzeugen dadurch
+   möglichst wenige API-Aufrufe.
 3. **Scheduler** – Belegung wechselt punktgenau bei Check-in/out
 4. **Täglicher Vollsync** – verhindert Drift im Cache
 

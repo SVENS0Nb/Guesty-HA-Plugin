@@ -212,6 +212,37 @@ async def test_failed_recovery_does_not_rotate_on_every_poll(hass, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_failed_publish_uses_persistent_exponential_backoff(
+    hass, monkeypatch
+) -> None:
+    """Repeated coordinator refreshes do not hammer a failing Guesty write."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record["field_synced"] = False
+    record["write_verified"] = False
+    record["url_hash"] = None
+    client.async_update_reservation_custom_field.reset_mock()
+    client.async_update_reservation_custom_field.side_effect = GuestyApiError("offline")
+
+    await manager.async_reconcile()
+    first_attempts = client.async_update_reservation_custom_field.await_count
+
+    assert first_attempts >= 1
+    assert record["publish_retry_count"] == 1
+
+    await manager.async_reconcile()
+
+    assert client.async_update_reservation_custom_field.await_count == first_attempts
+    assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
+
+    record["publish_retry_at"] = (dt_util.utcnow() - timedelta(seconds=1)).isoformat()
+    await manager.async_reconcile()
+
+    assert client.async_update_reservation_custom_field.await_count > first_attempts
+    assert record["publish_retry_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_update_during_reconcile_is_not_lost(hass, monkeypatch) -> None:
     """A coordinator update arriving during a write triggers a second pass."""
     manager, _client = await _manager(hass, monkeypatch)
@@ -601,6 +632,58 @@ async def test_cancellation_revokes_before_remote_field_cleanup(
     await manager.async_reconcile()
 
     assert (await manager.async_get_portal(token)).status == 404
+
+
+@pytest.mark.asyncio
+async def test_failed_cleanup_backs_off_and_eventually_prunes_local_state(
+    hass, monkeypatch
+) -> None:
+    """Failed tombstone cleanup is bounded and old in-memory rate data is pruned."""
+    manager, client = await _manager(hass, monkeypatch)
+    manager._last_action[("reservation-1", 0)] = 1.0
+    manager._action_windows[("reservation-1", 0)].append(1.0)
+    manager._coordinator.data.reservations[0].status = "cancelled"
+    client.async_delete_reservation_custom_field.side_effect = GuestyApiError("offline")
+
+    await manager.async_reconcile()
+
+    client.async_delete_reservation_custom_field.assert_awaited_once()
+    record = manager._records["reservation-1"]
+    assert record["cleanup_retry_count"] == 1
+
+    await manager.async_reconcile()
+
+    client.async_delete_reservation_custom_field.assert_awaited_once()
+    record["revoked_at"] = (dt_util.utcnow() - timedelta(days=8)).isoformat()
+    await manager.async_reconcile()
+
+    assert "reservation-1" not in manager._records
+    assert ("reservation-1", 0) not in manager._last_action
+    assert ("reservation-1", 0) not in manager._action_windows
+
+
+@pytest.mark.asyncio
+async def test_reactivated_deleted_reservation_gets_a_new_random_token(
+    hass, monkeypatch
+) -> None:
+    """Deleting and recreating a record cannot resurrect an old bearer URL."""
+    versions = iter((101, 202))
+    monkeypatch.setattr(access.secrets, "randbits", lambda _bits: next(versions))
+    manager, _client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_token = manager._token_for("reservation-1", record["version"])
+
+    manager._coordinator.data.reservations[0].status = "cancelled"
+    await manager.async_reconcile()
+    assert "reservation-1" not in manager._records
+
+    manager._coordinator.data.reservations[0].status = "confirmed"
+    await manager.async_reconcile()
+    new_record = manager._records["reservation-1"]
+    new_token = manager._token_for("reservation-1", new_record["version"])
+
+    assert new_record["version"] == 202
+    assert new_token != old_token
 
 
 @pytest.mark.asyncio

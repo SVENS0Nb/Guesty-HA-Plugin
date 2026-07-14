@@ -378,24 +378,49 @@ class GuestyApiClient:
 
         webhook_id = candidate.get("_id") or candidate.get("id")
         self._validate_resource_id(webhook_id, "webhook")
-        remote_events = candidate.get("events")
-        matches = (
-            candidate.get("url") == url
-            and isinstance(remote_events, list)
-            and desired_events.issubset(remote_events)
-            and candidate.get("active") is not False
-            and candidate.get("enabled") is not False
+        remote_url = candidate.get("url")
+        is_disabled = (
+            candidate.get("active") is False or candidate.get("enabled") is False
         )
-        if not matches:
+        if remote_url != url or is_disabled:
+            # Guesty no longer permits changing a webhook URL in place. Recreate
+            # disabled subscriptions as well so they are activated predictably.
+            await self.async_unregister_webhook(webhook_id)
+            return await self.async_register_webhook(url)
+
+        remote_events = candidate.get("events")
+        if not (
+            isinstance(remote_events, list) and desired_events.issubset(remote_events)
+        ):
             await self._async_request(
                 "PUT",
                 f"/webhooks/{webhook_id}",
-                json_body={
-                    "url": url,
-                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
-                },
+                json_body={"events": list(WEBHOOK_SUBSCRIPTION_EVENTS)},
             )
         return webhook_id
+
+    async def async_get_webhook_secret(self, url: str) -> str:
+        """Return the signing secret Guesty assigned to a webhook URL."""
+        await self._async_ensure_token()
+        data = await self._async_request(
+            "GET",
+            "/webhooks-v2/secret",
+            params={"url": url},
+        )
+
+        candidates: list[Any] = [data]
+        if isinstance(data, dict):
+            candidates.extend(data.get(key) for key in ("data", "result"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and len(candidate.strip()) >= 16:
+                return candidate.strip()
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("secret", "signingSecret", "signing_secret", "key"):
+                value = candidate.get(key)
+                if isinstance(value, str) and len(value.strip()) >= 16:
+                    return value.strip()
+        raise GuestyApiError("Guesty returned an invalid webhook signing secret")
 
     async def async_webhook_matches(self, webhook_id: str, url: str) -> bool:
         """Return whether the stored remote webhook is still usable."""

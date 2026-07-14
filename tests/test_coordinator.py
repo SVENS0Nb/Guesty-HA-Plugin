@@ -61,6 +61,13 @@ def _coordinator(hass, client=None, storage=None) -> GuestyDataUpdateCoordinator
     )
 
 
+async def _wait_webhook_worker(instance: GuestyDataUpdateCoordinator) -> None:
+    """Wait for the single owned webhook worker to drain its queue."""
+    task = instance._webhook_batch_task
+    if task is not None:
+        await task
+
+
 @pytest.mark.asyncio
 async def test_coordinator_uses_stdlib_timedelta(hass) -> None:
     """Coordinator setup uses a real timedelta accepted by Home Assistant."""
@@ -125,6 +132,7 @@ async def test_sparse_listing_webhook_uses_listing_only_api_fallback(
     instance = _coordinator(hass, client, storage)
 
     await instance.async_handle_webhook({"event": "listing.updated"})
+    await _wait_webhook_worker(instance)
 
     client.async_get_listings.assert_awaited_once_with()
     client.async_get_reservations.assert_not_awaited()
@@ -146,6 +154,7 @@ async def test_duplicate_reservation_webhooks_are_coalesced(hass, monkeypatch) -
         instance.async_handle_webhook(payload),
         instance.async_handle_webhook(payload),
     )
+    await _wait_webhook_worker(instance)
 
     instance._async_apply_reservation_webhook.assert_awaited_once_with(
         "65f19af19824d7e6ff848f11"
@@ -181,6 +190,7 @@ async def test_webhook_arriving_mid_fetch_is_replayed(hass, monkeypatch) -> None
     await asyncio.sleep(0)
     release.set()
     await asyncio.gather(first, second)
+    await _wait_webhook_worker(instance)
 
     assert calls == 2
 
@@ -205,6 +215,7 @@ async def test_reservation_burst_uses_one_incremental_refresh(
             {"event": "reservation.updated", "reservation": {"_id": "res-2"}}
         ),
     )
+    await _wait_webhook_worker(instance)
 
     instance.async_refresh.assert_awaited_once_with()
     instance._async_apply_reservation_webhook.assert_not_awaited()
@@ -227,6 +238,27 @@ async def test_unknown_or_unsafe_webhook_is_ignored(hass) -> None:
 
     instance.async_request_refresh.assert_not_awaited()
     instance._async_apply_reservation_webhook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_the_owned_webhook_worker(hass, monkeypatch) -> None:
+    """Reloading the config entry cannot leave a debounce or API task behind."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 3600
+    )
+    instance = _coordinator(hass)
+
+    await instance.async_handle_webhook(
+        {"event": "reservation.updated.v2", "data": {"reservationId": "res-1"}}
+    )
+    task = instance._webhook_batch_task
+    assert task is not None and not task.done()
+
+    await instance.async_shutdown()
+
+    assert task.cancelled()
+    assert instance._webhook_batch_task is None
+    assert not instance._pending_reservation_ids
 
 
 def test_v2_webhook_id_is_extracted() -> None:

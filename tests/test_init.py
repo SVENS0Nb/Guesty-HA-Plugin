@@ -101,7 +101,8 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
     )
     entry.add_to_hass(hass)
     scheduler = SimpleNamespace(async_unschedule=MagicMock())
-    entry.runtime_data = SimpleNamespace(scheduler=scheduler)
+    coordinator = SimpleNamespace(async_shutdown=AsyncMock())
+    entry.runtime_data = SimpleNamespace(scheduler=scheduler, coordinator=coordinator)
     unregister = MagicMock()
     monkeypatch.setattr(guesty_init.ha_webhook, "async_unregister", unregister)
     monkeypatch.setattr(
@@ -113,4 +114,5 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
     assert await async_unload_entry(hass, entry)
 
     scheduler.async_unschedule.assert_called_once_with()
+    coordinator.async_shutdown.assert_awaited_once_with()
     unregister.assert_called_once_with(hass, "local-webhook")

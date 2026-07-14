@@ -108,6 +108,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._pending_reservation_ids: set[str] = set()
         self._pending_listing_payloads: dict[str, dict[str, Any]] = {}
         self._webhook_batch_task: asyncio.Task[None] | None = None
+        self._unloaded = False
         super().__init__(
             hass,
             _LOGGER,
@@ -361,6 +362,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
 
     async def async_handle_webhook(self, payload: dict[str, Any]) -> None:
         """Queue a Guesty webhook for a traffic-efficient near-real-time update."""
+        if self._unloaded:
+            return
         event = (payload.get("event") or payload.get("type") or "").lower()
         if event not in WEBHOOK_EVENTS:
             _LOGGER.debug("Ignoring unsupported Guesty webhook event %r", event)
@@ -380,40 +383,67 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             # Keep only the newest event for a listing during the debounce window.
             self._pending_listing_payloads[key] = payload
 
+        self._ensure_webhook_batch_task()
+
+    def _ensure_webhook_batch_task(self) -> None:
+        """Own exactly one batch worker without creating per-event waiters."""
+        if self._unloaded:
+            return
         task = self._webhook_batch_task
         if task is None or task.done():
-            task = self.hass.async_create_task(
+            self._webhook_batch_task = self.hass.async_create_task(
                 self._async_process_webhook_batches(),
                 "guesty_process_webhook_batch",
             )
-            self._webhook_batch_task = task
-        await asyncio.shield(task)
 
     async def _async_process_webhook_batches(self) -> None:
         """Collapse webhook bursts without losing changes that arrive mid-sync."""
-        while self._pending_reservation_ids or self._pending_listing_payloads:
-            await asyncio.sleep(WEBHOOK_DEBOUNCE_SECONDS)
-            reservation_ids = set(self._pending_reservation_ids)
-            listing_payloads = list(self._pending_listing_payloads.values())
-            self._pending_reservation_ids.clear()
-            self._pending_listing_payloads.clear()
+        try:
+            while not self._unloaded and (
+                self._pending_reservation_ids or self._pending_listing_payloads
+            ):
+                await asyncio.sleep(WEBHOOK_DEBOUNCE_SECONDS)
+                reservation_ids = set(self._pending_reservation_ids)
+                listing_payloads = list(self._pending_listing_payloads.values())
+                self._pending_reservation_ids.clear()
+                self._pending_listing_payloads.clear()
 
-            if listing_payloads:
-                try:
-                    await self._async_apply_listing_webhooks(listing_payloads)
-                except (GuestyApiError, GuestyAuthError) as err:
-                    _LOGGER.warning(
-                        "Listing webhook refresh failed; using polling fallback: %s",
-                        err,
-                    )
+                if listing_payloads:
+                    try:
+                        await self._async_apply_listing_webhooks(listing_payloads)
+                    except (GuestyApiError, GuestyAuthError) as err:
+                        _LOGGER.warning(
+                            "Listing webhook refresh failed; using polling fallback: %s",
+                            err,
+                        )
+                        await self.async_refresh()
+
+                if len(reservation_ids) == 1:
+                    await self._async_apply_reservation_webhook(reservation_ids.pop())
+                elif reservation_ids:
+                    # One filtered incremental query is cheaper than one request per
+                    # reservation during bulk edits or Guesty retry bursts.
                     await self.async_refresh()
+        finally:
+            self._webhook_batch_task = None
+            # Close the race where a payload arrives after the loop checks its
+            # condition but before the worker marks itself finished.
+            if self._pending_reservation_ids or self._pending_listing_payloads:
+                self._ensure_webhook_batch_task()
 
-            if len(reservation_ids) == 1:
-                await self._async_apply_reservation_webhook(reservation_ids.pop())
-            elif reservation_ids:
-                # One filtered incremental query is cheaper than one request per
-                # reservation during bulk edits or Guesty retry bursts.
-                await self.async_refresh()
+    async def async_shutdown(self) -> None:
+        """Cancel webhook work so reloads and shutdowns cannot leak API tasks."""
+        self._unloaded = True
+        self._pending_reservation_ids.clear()
+        self._pending_listing_payloads.clear()
+        task = self._webhook_batch_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._webhook_batch_task = None
 
     @staticmethod
     def _reservation_id_from_webhook(payload: dict[str, Any]) -> str | None:

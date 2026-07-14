@@ -14,6 +14,7 @@ from custom_components.guesty.const import (
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_GUESTY_WEBHOOK_SECRET,
     DOMAIN,
 )
 from custom_components.guesty.diagnostics import async_get_config_entry_diagnostics
@@ -61,7 +62,11 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     """Exported diagnostics contain counts but no property names or raw errors."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={CONF_CLIENT_ID: "private-client", CONF_CLIENT_SECRET: "private-secret"},
+        data={
+            CONF_CLIENT_ID: "private-client",
+            CONF_CLIENT_SECRET: "private-secret",
+            CONF_GUESTY_WEBHOOK_SECRET: "private-webhook-secret",
+        },
         options={
             CONF_ACCESS_ENABLED: True,
             CONF_ACCESS_CUSTOM_FIELD: "private-field-id",
@@ -122,6 +127,7 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "Private nickname" not in serialized
     assert "legacy response body" not in serialized
     assert "private-secret" not in serialized
+    assert "private-webhook-secret" not in serialized
     assert "private-field-id" not in serialized
     assert "lock.private_door" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1

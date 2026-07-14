@@ -99,14 +99,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 async def async_unload_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bool:
     """Unload a config entry."""
     entry.runtime_data.scheduler.async_unschedule()
-    access_manager = getattr(entry.runtime_data, "access_manager", None)
-    if access_manager is not None:
-        await access_manager.async_unload()
-    async_unregister_access_manager(hass, entry.entry_id)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
     if webhook_id:
         ha_webhook.async_unregister(hass, webhook_id)
+    await entry.runtime_data.coordinator.async_shutdown()
+
+    access_manager = getattr(entry.runtime_data, "access_manager", None)
+    if access_manager is not None:
+        await access_manager.async_unload()
+    async_unregister_access_manager(hass, entry.entry_id)
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok
