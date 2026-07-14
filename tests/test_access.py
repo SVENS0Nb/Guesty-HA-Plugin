@@ -16,6 +16,8 @@ from custom_components.guesty.api import GuestyApiError
 from custom_components.guesty.const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_FAVICON_URL,
+    CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
     DOMAIN,
 )
@@ -328,12 +330,53 @@ def test_portal_language_uses_browser_preference(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("language", "title", "detail"),
+    [
+        (
+            "de",
+            "Zugang nicht verfügbar",
+            "Diese Seite ist nur im Buchungszeitraum verfügbar.",
+        ),
+        (
+            "en",
+            "Access Unavailable",
+            "This page is only available during the booking period.",
+        ),
+        (
+            "es",
+            "Acceso no disponible",
+            "Esta página solo está disponible durante el período de la reserva.",
+        ),
+        (
+            "fr",
+            "Accès indisponible",
+            "Cette page est disponible uniquement pendant la période de réservation.",
+        ),
+    ],
+)
+async def test_unavailable_page_explains_booking_period(
+    hass, monkeypatch, language: str, title: str, detail: str
+) -> None:
+    """Unavailable links show a localized, privacy-safe timing explanation."""
+    manager, _client = await _manager(hass, monkeypatch)
+
+    page = await manager.async_get_portal("x" * 40, language)
+
+    assert page.status == 404
+    assert f'<html lang="{language}">' in page.text
+    assert f"<h1>{title}</h1>" in page.text
+    assert f"<p>{detail}</p>" in page.text
+    assert "reservation-1" not in page.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("language", "title", "button"),
     [
         ("de", "Türzugang", "Haustür öffnen"),
-        ("en", "Door access", "Open Haustür"),
-        ("es", "Acceso a la puerta", "Abrir Haustür"),
-        ("fr", "Accès à la porte", "Ouvrir Haustür"),
+        ("en", "Door Access", "Open Front door"),
+        ("es", "Acceso a la puerta", "Abrir Puerta principal"),
+        ("fr", "Accès à la porte", "Ouvrir Porte d’entrée"),
     ],
 )
 async def test_portal_localizes_reusable_ajax_controls(
@@ -363,13 +406,95 @@ async def test_portal_localizes_reusable_ajax_controls(
 
 
 @pytest.mark.asyncio
+async def test_custom_translated_labels_do_not_rotate_access_link(
+    hass, monkeypatch
+) -> None:
+    """Changing presentation labels keeps permissions and the bearer URL stable."""
+    manager, _client = await _manager(hass, monkeypatch)
+    reservation = manager._coordinator.data.reservations[0]
+    record = manager._records["reservation-1"]
+    token = manager._token_for("reservation-1", record["version"])
+    fingerprint = manager._reservation_fingerprint(reservation)
+    mappings = {
+        "listing-1": [
+            {
+                "entity_id": "lock.front_door",
+                "name": "Haustür",
+                "name_de": "Haustür",
+                "name_en": "Main entrance",
+                "name_es": "Entrada de huéspedes",
+                "name_fr": "Entrée des invités",
+            },
+            {
+                "entity_id": "lock.apartment",
+                "name": "Wohnungstür",
+            },
+        ]
+    }
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={
+            **manager.entry.options,
+            CONF_ACCESS_LOCK_MAPPINGS: mappings,
+        },
+    )
+
+    assert manager._reservation_fingerprint(reservation) == fingerprint
+    page = await manager.async_get_portal(token, "en")
+
+    assert page.status == 200
+    assert "Open Main entrance" in page.text
+    assert "Haustür" not in page.text
+
+
+@pytest.mark.asyncio
+async def test_portal_renders_safely_scoped_logo_and_favicon(hass, monkeypatch) -> None:
+    """Optional branding is escaped, centered, and limited by the CSP."""
+    manager, _client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    token = manager._token_for("reservation-1", record["version"])
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={
+            **manager.entry.options,
+            CONF_ACCESS_LOGO_URL: (
+                "https://assets.example.com/guest-logo.svg?v=1&theme=light"
+            ),
+            CONF_ACCESS_FAVICON_URL: "https://icons.example.net/favicon.png",
+        },
+    )
+
+    page = await manager.async_get_portal(token, "en")
+    unavailable = await manager.async_get_portal("x" * 40, "en")
+
+    for response in (page, unavailable):
+        assert (
+            'src="https://assets.example.com/guest-logo.svg?v=1&amp;theme=light"'
+            in response.text
+        )
+        assert (
+            '<link rel="icon" href="https://icons.example.net/favicon.png"'
+            in response.text
+        )
+        assert response.text.index('class="brand"') < response.text.index("<h1>")
+        assert "max-height:6rem" in response.text
+        assert 'referrerpolicy="no-referrer"' in response.text
+        content_security_policy = response.headers["Content-Security-Policy"]
+        assert (
+            "img-src https://assets.example.com https://icons.example.net"
+            in content_security_policy
+        )
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("language", "message"),
     [
         ("de", "Haustür wurde geöffnet"),
-        ("en", "Haustür was opened"),
-        ("es", "Se abrió Haustür"),
-        ("fr", "Haustür a été ouverte"),
+        ("en", "Front door was opened"),
+        ("es", "Se abrió Puerta principal"),
+        ("fr", "Porte d’entrée a été ouverte"),
     ],
 )
 async def test_ajax_unlock_returns_localized_message_and_fresh_nonces(

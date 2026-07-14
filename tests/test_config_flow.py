@@ -16,10 +16,15 @@ from custom_components.guesty.const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_FAVICON_URL,
     CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LISTINGS,
+    CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_1,
     CONF_ACCESS_LOCK_1_NAME,
+    CONF_ACCESS_LOCK_1_NAME_EN,
+    CONF_ACCESS_LOCK_1_NAME_ES,
+    CONF_ACCESS_LOCK_1_NAME_FR,
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -171,6 +176,8 @@ async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
         form["flow_id"],
         {
             CONF_ACCESS_CUSTOM_FIELD: "Door access link",
+            CONF_ACCESS_LOGO_URL: "https://assets.example.com/guest-logo.png",
+            CONF_ACCESS_FAVICON_URL: "https://assets.example.com/favicon.ico",
             CONF_ACCESS_EARLY_MINUTES: 0,
             CONF_ACCESS_LATE_MINUTES: 0,
             CONF_ACCESS_LISTINGS: ["listing-1"],
@@ -184,10 +191,84 @@ async def test_options_flow_maps_one_or_two_locks_per_listing(hass) -> None:
         {
             CONF_ACCESS_LOCK_1: "lock.front_door",
             CONF_ACCESS_LOCK_1_NAME: "Haustür",
+            CONF_ACCESS_LOCK_1_NAME_EN: "Front door",
+            CONF_ACCESS_LOCK_1_NAME_ES: "Puerta principal",
+            CONF_ACCESS_LOCK_1_NAME_FR: "Porte d’entrée",
         },
     )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert (
+        result["data"][CONF_ACCESS_LOGO_URL]
+        == "https://assets.example.com/guest-logo.png"
+    )
+    assert (
+        result["data"][CONF_ACCESS_FAVICON_URL]
+        == "https://assets.example.com/favicon.ico"
+    )
     assert result["data"][CONF_ACCESS_LOCK_MAPPINGS] == {
-        "listing-1": [{"entity_id": "lock.front_door", "name": "Haustür"}]
+        "listing-1": [
+            {
+                "entity_id": "lock.front_door",
+                "name": "Haustür",
+                "name_de": "Haustür",
+                "name_en": "Front door",
+                "name_es": "Puerta principal",
+                "name_fr": "Porte d’entrée",
+            }
+        ]
     }
+
+
+@pytest.mark.asyncio
+async def test_options_flow_rejects_insecure_branding_url(hass) -> None:
+    """Public portal branding cannot weaken HTTPS or CSP protections."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={CONF_SCAN_INTERVAL: 300},
+    )
+    entry.add_to_hass(hass)
+    listing = GuestyListing(
+        id="listing-1",
+        title="Apartment",
+        nickname=None,
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data=SimpleNamespace(listings={listing.id: listing})
+        )
+    )
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_SCAN_INTERVAL: 300,
+            "listing_sync_interval": 86400,
+            "reservation_days_past": 30,
+            "reservation_days_future": 365,
+            "stale_threshold_hours": 6,
+            CONF_EXPOSE_GUEST_DETAILS: False,
+            CONF_ACCESS_ENABLED: True,
+        },
+    )
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_ACCESS_CUSTOM_FIELD: "Door access link",
+            CONF_ACCESS_LOGO_URL: "http://assets.example.com/logo.png",
+            CONF_ACCESS_FAVICON_URL: "https://assets.example.com/favicon.ico",
+            CONF_ACCESS_EARLY_MINUTES: 0,
+            CONF_ACCESS_LATE_MINUTES: 0,
+            CONF_ACCESS_LISTINGS: ["listing-1"],
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "access"
+    assert result["errors"] == {"base": "invalid_branding_url"}
