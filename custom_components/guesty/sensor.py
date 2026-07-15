@@ -496,7 +496,10 @@ class _GuestyLoxoneStatusSensor(
         reservation_status = snapshot.get("reservation_status")
         if isinstance(reservation_status, str):
             attributes["reservation_status"] = reservation_status
-        for key in ("access_start", "access_end", "provision_at"):
+        error_reason = snapshot.get("error_reason")
+        if isinstance(error_reason, str):
+            attributes["error_reason"] = error_reason
+        for key in ("access_start", "access_end", "provision_at", "retry_at"):
             value = snapshot.get(key)
             if isinstance(value, datetime):
                 attributes[key] = value.isoformat()

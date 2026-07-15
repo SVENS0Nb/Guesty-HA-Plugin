@@ -50,7 +50,7 @@
         "title": "Guest door access",
         "description": "Create a Guesty reservation custom field of type Text first. The integration writes one protected access link per active reservation. Optional branding images must use direct HTTPS URLs.",
         "data": {
-          "access_custom_field": "Guesty custom field name or ID",
+          "access_custom_field": "Guesty reservation field for the door link (name, variable, or ID)",
           "access_logo_url": "Logo image URL (optional, HTTPS)",
           "access_favicon_url": "Favicon image URL (optional, HTTPS)",
           "access_early_minutes": "Enable access before check-in (minutes)",
@@ -100,7 +100,7 @@
         "data": {
           "loxone_provision_lead_minutes": "Create Loxone user before access starts (minutes)",
           "loxone_code_prefix": "Reserved PIN prefix (1–2 digits)",
-          "loxone_custom_field": "Guesty code custom field name, {{variable}}, or ID",
+          "loxone_custom_field": "Guesty reservation field for the door code (name, variable, or ID)",
           "access_early_minutes": "Enable access before check-in (minutes)",
           "access_late_minutes": "Keep access after check-out (minutes)",
           "loxone_server_count": "Number of Loxone Miniservers",
