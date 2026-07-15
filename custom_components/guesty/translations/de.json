@@ -96,10 +96,11 @@
       },
       "loxone": {
         "title": "Loxone Reservierungs-PINs",
-        "description": "Pro Reservierung wird ein sechsstelliger Guesty-Keycode erzeugt. Guesty ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und in einem konfigurierbaren Guesty-Reservierungs-Custom-Field gespeichert. Das Custom Field ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
+          "loxone_custom_field": "Name, {{Variable}} oder ID des Guesty-Code-Custom-Fields",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
           "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
           "loxone_server_count": "Anzahl der Loxone-Miniserver",
@@ -129,6 +130,7 @@
       "invalid_branding_url": "Logo und Favicon müssen gültige direkte HTTPS-URLs verwenden",
       "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden",
       "invalid_code_prefix": "Der PIN-Präfix muss aus 1 oder 2 Ziffern bestehen",
+      "custom_field_not_found": "Trage Name, Variable oder ID eines Guesty-Reservierungs-Custom-Fields ein",
       "loxone_invalid_auth": "Loxone lehnt das Konto ab oder das Recht Benutzerverwaltung fehlt",
       "loxone_cannot_connect": "Zu diesem Loxone-Miniserver konnte keine sichere Verbindung hergestellt werden",
       "duplicate_loxone_server": "Diese Miniserver-Verbindung wurde mehrfach konfiguriert",
@@ -162,7 +164,7 @@
         }
       },
       "guesty_keycode_status": {
-        "name": "Guesty-Keycode-Status",
+        "name": "Guesty-Code-Status",
         "state": {
           "not_configured": "Nicht konfiguriert",
           "no_reservation": "Keine Reservierung",

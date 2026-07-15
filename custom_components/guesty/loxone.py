@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timedelta
 import hashlib
 import logging
@@ -17,12 +17,18 @@ from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
+from .api import (
+    GuestyApiClient,
+    GuestyApiError,
+    GuestyAuthError,
+    is_safe_resource_id,
+)
 from .const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
     CONF_LOXONE_LISTING_MAPPINGS,
@@ -37,6 +43,7 @@ from .const import (
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LOXONE_CODE_PREFIX,
+    DEFAULT_LOXONE_CUSTOM_FIELD,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
     LOXONE_ACCESS_CODE_LENGTH,
     LOXONE_RETRY_BASE_SECONDS,
@@ -104,7 +111,7 @@ class GuestyLoxoneStorage:
         """Load a validated top-level state object."""
         data = await self._store.async_load()
         if not isinstance(data, dict):
-            return {"records": {}}
+            return {"records": {}, "resolved_field": {}}
         if not isinstance(data.get("records"), dict):
             data["records"] = {}
         else:
@@ -113,6 +120,8 @@ class GuestyLoxoneStorage:
                 for reservation_id, record in data["records"].items()
                 if isinstance(reservation_id, str) and isinstance(record, dict)
             }
+        if not isinstance(data.get("resolved_field"), dict):
+            data["resolved_field"] = {}
         return data
 
     async def async_save(self, data: dict[str, Any]) -> None:
@@ -125,7 +134,7 @@ class GuestyLoxoneStorage:
 
 
 class GuestyLoxoneManager:
-    """Synchronize Guesty Keycodes with short-lived Loxone users."""
+    """Synchronize a Guesty reservation field with short-lived Loxone users."""
 
     def __init__(
         self,
@@ -252,6 +261,18 @@ class GuestyLoxoneManager:
                     and reservation.listing_id in data.listings
                 }
 
+            field_id: str | None = None
+            if eligible and not data_stale:
+                try:
+                    field_id = await self._async_custom_field_id()
+                except (GuestyApiError, GuestyAuthError) as err:
+                    errors.append(type(err).__name__)
+                else:
+                    self._hydrate_observed_custom_fields(
+                        eligible.values(),
+                        field_id,
+                    )
+
             for reservation_id in list(self._records):
                 if reservation_id in eligible:
                     continue
@@ -323,8 +344,22 @@ class GuestyLoxoneManager:
                 record["listing_id"] = reservation.listing_id
                 record["access_start"] = start.isoformat()
                 record["access_end"] = end.isoformat()
+                if field_id is None:
+                    record["last_error"] = "custom_field_unavailable"
+                    continue
                 try:
-                    await self._async_ensure_key_code(reservation, record, now)
+                    field_changed = await self._async_observe_custom_field(
+                        reservation,
+                        record,
+                        field_id,
+                    )
+                    await self._async_ensure_key_code(
+                        reservation,
+                        record,
+                        now,
+                        field_id,
+                        field_changed=field_changed,
+                    )
                 except (GuestyApiError, GuestyAuthError) as err:
                     self._record_retry_failure(record, "guesty", now)
                     errors.append(type(err).__name__)
@@ -408,6 +443,7 @@ class GuestyLoxoneManager:
                                     start,
                                     end,
                                     now,
+                                    field_id,
                                 )
                             except LoxoneCodeConflictError:
                                 record["conflict"] = True
@@ -441,13 +477,85 @@ class GuestyLoxoneManager:
             self._last_error = errors[0] if errors else None
             self._notify_listeners()
 
+    async def _async_custom_field_id(self) -> str:
+        """Resolve and cache the configurable Guesty reservation field."""
+        reference = str(
+            self.entry.options.get(
+                CONF_LOXONE_CUSTOM_FIELD,
+                DEFAULT_LOXONE_CUSTOM_FIELD,
+            )
+        ).strip()
+        if not reference:
+            raise GuestyApiError("Guesty PIN custom field is not configured")
+
+        cached = self._data.get("resolved_field")
+        if (
+            isinstance(cached, dict)
+            and cached.get("reference") == reference
+            and is_safe_resource_id(cached.get("id"))
+        ):
+            return cached["id"]
+
+        field_id = await self._client.async_resolve_custom_field(reference)
+        self._data["resolved_field"] = {"reference": reference, "id": field_id}
+        await self._storage.async_save(self._data)
+        return field_id
+
+    @staticmethod
+    def _hydrate_observed_custom_fields(
+        reservations: Collection[GuestyReservation],
+        field_id: str,
+    ) -> None:
+        """Select the configured value from already-fetched reservation data."""
+        for reservation in reservations:
+            if not reservation.custom_fields_observed:
+                continue
+            value = reservation.custom_fields.get(field_id)
+            reservation.key_code = str(value).strip() if value is not None else None
+            reservation.key_code_observed = True
+
+    async def _async_observe_custom_field(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        field_id: str,
+    ) -> bool:
+        """Observe the authoritative field, reusing the shared reservation fetch."""
+        field_changed = record.get("field_id") != field_id
+        if not reservation.key_code_observed:
+            source_version = reservation.last_updated_at
+            if (
+                not field_changed
+                and record.get("field_synced")
+                and isinstance(source_version, str)
+                and record.get("source_last_updated_at") == source_version
+                and not record.get("replacement_pending")
+            ):
+                # The normal Guesty poll strips private values before disk cache.
+                # An unchanged reservation version means the private stored code
+                # is still current, so no per-reservation API request is needed.
+                return False
+
+            value = await self._client.async_get_reservation_custom_field(
+                reservation.id,
+                field_id,
+            )
+            reservation.key_code = str(value).strip() if value is not None else None
+            reservation.key_code_observed = True
+
+        record["source_last_updated_at"] = reservation.last_updated_at
+        return field_changed
+
     async def _async_ensure_key_code(
         self,
         reservation: GuestyReservation,
         record: dict[str, Any],
         now: datetime,
+        field_id: str,
+        *,
+        field_changed: bool,
     ) -> None:
-        """Use a valid unique Guesty Keycode or replace a known duplicate."""
+        """Use a valid unique Guesty custom-field code or replace a duplicate."""
         local_code = record.get("code")
         remote_observed = bool(reservation.key_code_observed)
         remote_code = (
@@ -456,9 +564,9 @@ class GuestyLoxoneManager:
             else None
         )
 
-        # Cached reservations deliberately do not contain Keycodes. Absence is
-        # authoritative only when this particular reservation was just read
-        # from Guesty; otherwise preserving the private record prevents churn.
+        # Cached reservations deliberately do not contain custom-field codes.
+        # Absence is authoritative only when this reservation field was read;
+        # otherwise preserving the private record prevents unnecessary churn.
         if not remote_observed and not record.get("replacement_pending"):
             return
 
@@ -470,9 +578,14 @@ class GuestyLoxoneManager:
                 and remote_code not in {local_code, rejected_code}
                 and not self._code_is_used_elsewhere(remote_code, reservation.id)
             ):
-                await self._async_adopt_guesty_code(record, remote_code)
+                await self._async_adopt_guesty_code(record, remote_code, field_id)
                 return
-            await self._async_publish_replacement_code(reservation, record, now)
+            await self._async_publish_replacement_code(
+                reservation,
+                record,
+                now,
+                field_id,
+            )
             return
 
         if remote_code:
@@ -481,6 +594,7 @@ class GuestyLoxoneManager:
                     reservation,
                     record,
                     now,
+                    field_id,
                     rejected_code=remote_code,
                 )
                 return
@@ -489,13 +603,15 @@ class GuestyLoxoneManager:
                     reservation,
                     record,
                     now,
+                    field_id,
                     rejected_code=remote_code,
                 )
                 return
             if local_code != remote_code:
-                await self._async_adopt_guesty_code(record, remote_code)
+                await self._async_adopt_guesty_code(record, remote_code, field_id)
                 return
             record["field_synced"] = True
+            record["field_id"] = field_id
             self._clear_retry(record, "guesty")
             if record.get("last_error") in {
                 "guesty_keycode_changed",
@@ -505,23 +621,52 @@ class GuestyLoxoneManager:
                 record.pop("last_error", None)
             return
 
+        if local_code is not None and field_changed:
+            if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(
+                local_code
+            ):
+                local_code = self._generate_code()
+                record["code"] = local_code
+                self._last_rotated += 1
+            record["field_synced"] = False
+            await self._async_write_custom_field(
+                reservation,
+                record,
+                field_id,
+                local_code,
+            )
+            return
+
         if local_code is not None:
             await self._async_replace_invalid_or_missing_guesty_code(
                 reservation,
                 record,
                 now,
+                field_id,
                 rejected_code=None,
             )
             return
 
         if local_code is None:
-            local_code = self._generate_code()
+            legacy_code = (
+                reservation.legacy_key_code.strip()
+                if isinstance(reservation.legacy_key_code, str)
+                else None
+            )
+            if (
+                legacy_code
+                and _CODE_PATTERN.fullmatch(legacy_code)
+                and not self._code_is_used_elsewhere(legacy_code, reservation.id)
+            ):
+                local_code = legacy_code
+            else:
+                local_code = self._generate_code()
+                self._last_generated += 1
             record["code"] = local_code
             record["field_synced"] = False
             record["created_at"] = now.isoformat()
             record.pop("conflict", None)
             record.pop("last_error", None)
-            self._last_generated += 1
             await self._storage.async_save(self._data)
 
         if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(local_code):
@@ -533,14 +678,38 @@ class GuestyLoxoneManager:
         if self._retry_is_deferred(record, "guesty", now):
             return
 
-        await self._client.async_update_reservation_key_code(
-            reservation.id,
+        await self._async_write_custom_field(
+            reservation,
+            record,
+            field_id,
             local_code,
         )
-        reservation.key_code = local_code
-        record["field_synced"] = True
         record.pop("last_error", None)
         self._clear_retry(record, "guesty")
+        await self._storage.async_save(self._data)
+
+    async def _async_write_custom_field(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        field_id: str,
+        code: str,
+    ) -> None:
+        """Write and locally confirm the authoritative reservation field."""
+        if not _CODE_PATTERN.fullmatch(code):
+            raise ValueError("Guesty reservation access code must contain six digits")
+        await self._client.async_update_reservation_custom_field(
+            reservation.id,
+            field_id,
+            code,
+        )
+        reservation.key_code = code
+        reservation.key_code_observed = True
+        reservation.custom_fields[field_id] = code
+        reservation.custom_fields_observed = True
+        record["field_id"] = field_id
+        record["field_synced"] = True
+        record["source_last_updated_at"] = reservation.last_updated_at
         await self._storage.async_save(self._data)
 
     async def _async_replace_invalid_or_missing_guesty_code(
@@ -548,6 +717,7 @@ class GuestyLoxoneManager:
         reservation: GuestyReservation,
         record: dict[str, Any],
         now: datetime,
+        field_id: str,
         *,
         rejected_code: str | None,
     ) -> None:
@@ -569,6 +739,7 @@ class GuestyLoxoneManager:
             reservation,
             record,
             now,
+            field_id,
             rejected_code=rejected_code,
         )
 
@@ -576,10 +747,12 @@ class GuestyLoxoneManager:
         self,
         record: dict[str, Any],
         remote_code: str,
+        field_id: str,
     ) -> None:
         """Adopt one valid, unique Guesty code and mark Loxone for update."""
         record["code"] = remote_code
         record["field_synced"] = True
+        record["field_id"] = field_id
         record["code_set"] = False
         for key in (
             "provisioned_at",
@@ -598,6 +771,7 @@ class GuestyLoxoneManager:
         reservation: GuestyReservation,
         record: dict[str, Any],
         now: datetime,
+        field_id: str,
         *,
         rejected_code: str | None,
     ) -> None:
@@ -620,13 +794,19 @@ class GuestyLoxoneManager:
         self._clear_retry(record, "loxone")
         self._last_rotated += 1
         await self._storage.async_save(self._data)
-        await self._async_publish_replacement_code(reservation, record, now)
+        await self._async_publish_replacement_code(
+            reservation,
+            record,
+            now,
+            field_id,
+        )
 
     async def _async_publish_replacement_code(
         self,
         reservation: GuestyReservation,
         record: dict[str, Any],
         now: datetime,
+        field_id: str,
     ) -> None:
         """Finish a crash-safe Guesty write for a generated replacement code."""
         code = record.get("code")
@@ -635,12 +815,14 @@ class GuestyLoxoneManager:
         if reservation.key_code != code:
             if self._retry_is_deferred(record, "guesty", now):
                 return
-            await self._client.async_update_reservation_key_code(
-                reservation.id,
+            await self._async_write_custom_field(
+                reservation,
+                record,
+                field_id,
                 code,
             )
-            reservation.key_code = code
         record["field_synced"] = True
+        record["field_id"] = field_id
         record.pop("replacement_pending", None)
         record.pop("replacement_rejected_code", None)
         record.pop("last_error", None)
@@ -655,6 +837,7 @@ class GuestyLoxoneManager:
         start: datetime,
         end: datetime,
         now: datetime,
+        field_id: str,
     ) -> None:
         """Provision Loxone, rotating Guesty immediately after code collisions."""
         for attempt in range(_MAX_CODE_ROTATIONS_PER_RECONCILE):
@@ -675,6 +858,7 @@ class GuestyLoxoneManager:
                     reservation,
                     record,
                     now,
+                    field_id,
                     rejected_code=rejected_code,
                 )
                 if attempt == _MAX_CODE_ROTATIONS_PER_RECONCILE - 1:
@@ -961,7 +1145,7 @@ class GuestyLoxoneManager:
             listener()
 
     def listing_status_snapshot(self, listing_id: str) -> dict[str, Any]:
-        """Return privacy-safe Guesty Keycode and Loxone PIN status."""
+        """Return privacy-safe Guesty custom-field and Loxone PIN status."""
         if (
             not self.entry.options.get(CONF_LOXONE_ENABLED, False)
             or listing_id not in self._mappings
@@ -1029,6 +1213,7 @@ class GuestyLoxoneManager:
                 last_error
                 in {
                     "code_generation_failed",
+                    "custom_field_unavailable",
                     "invalid_mapping",
                     "source_change_cleanup_failed",
                 }
@@ -1086,6 +1271,7 @@ class GuestyLoxoneManager:
             snapshot["guesty_status"] = "conflict"
         elif self._retry_at(record, "guesty") is not None or last_error in {
             "code_generation_failed",
+            "custom_field_unavailable",
             "source_change_cleanup_failed",
         }:
             snapshot["guesty_status"] = "error"
@@ -1146,7 +1332,7 @@ class GuestyLoxoneManager:
             "provisioned_during_last_reconcile": self._last_provisioned,
             "deleted_during_last_reconcile": self._last_deleted,
             "local_records": len(records),
-            "keycodes_synced": sum(
+            "custom_field_codes_synced": sum(
                 1
                 for record in records.values()
                 if isinstance(record, dict) and record.get("field_synced")

@@ -664,7 +664,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         *,
         reservation_overrides: dict[str, GuestyReservation] | None = None,
     ) -> None:
-        """Publish targeted data while keeping Keycodes out of disk storage."""
+        """Publish targeted data while keeping access codes out of disk storage."""
         listings = GuestyStorage.listings_from_cache(cache)
         reservations = GuestyStorage.reservations_from_cache(cache)
         if reservation_overrides:

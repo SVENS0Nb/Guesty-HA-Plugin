@@ -198,75 +198,6 @@ class GuestyApiClient:
             return GuestyReservation.from_api(data)
         return None
 
-    async def async_update_reservation_key_code(
-        self,
-        reservation_id: str,
-        key_code: str,
-    ) -> None:
-        """Set and verify Guesty's built-in reservation Keycode field."""
-        self._validate_resource_id(reservation_id, "reservation")
-        if not re.fullmatch(r"\d{6}", key_code):
-            raise ValueError("Guesty reservation key code must contain six digits")
-
-        # Guesty's PUT contract exposes all reservation-note fields but does not
-        # promise partial-update semantics. Read and merge the mutable notes so
-        # setting a Keycode cannot erase cleaning, guest, or request notes.
-        current = await self._async_request(
-            "GET",
-            f"/reservations/{reservation_id}",
-            params={"fields": "_id notes"},
-        )
-        notes = self._extract_reservation_notes(current)
-        notes["keyCode"] = key_code
-        data = await self._async_request(
-            "PUT",
-            f"/reservations-v3/{reservation_id}/notes",
-            json_body={"notes": notes},
-        )
-        if self._extract_reservation_key_code(data) == key_code:
-            return
-
-        # The v3 endpoint occasionally returns only an acknowledgement. Avoid a
-        # read after every write, but verify when the acknowledgement is incomplete.
-        verification = await self._async_request(
-            "GET",
-            f"/reservations/{reservation_id}",
-            params={"fields": "_id notes.keyCode"},
-        )
-        if self._extract_reservation_key_code(verification) != key_code:
-            raise GuestyApiError("Guesty did not persist the reservation key code")
-
-    @classmethod
-    def _extract_reservation_notes(cls, data: Any) -> dict[str, Any]:
-        """Return a safe copy of mutable reservation notes from an API envelope."""
-        if not isinstance(data, dict):
-            return {}
-        notes = data.get("notes")
-        if isinstance(notes, dict):
-            allowed = {"other", "cleaning", "guest", "specialRequests", "keyCode"}
-            return {key: value for key, value in notes.items() if key in allowed}
-        for key in ("data", "result", "reservation"):
-            nested = data.get(key)
-            extracted = cls._extract_reservation_notes(nested)
-            if extracted:
-                return extracted
-        return {}
-
-    @classmethod
-    def _extract_reservation_key_code(cls, data: Any) -> str | None:
-        """Extract a Keycode from supported Guesty response envelopes."""
-        if not isinstance(data, dict):
-            return None
-        notes = data.get("notes")
-        if isinstance(notes, dict) and notes.get("keyCode") is not None:
-            return str(notes["keyCode"]).strip()
-        for key in ("data", "result", "reservation"):
-            nested = data.get(key)
-            value = cls._extract_reservation_key_code(nested)
-            if value is not None:
-                return value
-        return None
-
     async def async_resolve_custom_field(self, reference: str) -> str:
         """Resolve a Guesty custom field name, variable, or id."""
         value = reference.strip()
@@ -351,6 +282,34 @@ class GuestyApiClient:
             field_id,
             value,
         )
+
+    async def async_get_reservation_custom_field(
+        self,
+        reservation_id: str,
+        field_id: str,
+    ) -> Any | None:
+        """Return one populated reservation custom-field value."""
+        self._validate_resource_id(reservation_id, "reservation")
+        self._validate_resource_id(field_id, "custom field")
+        try:
+            data = await self._async_request(
+                "GET",
+                f"/reservations-v3/{reservation_id}/custom-fields/{field_id}",
+            )
+        except GuestyNotFoundError:
+            # Guesty uses 404 for an existing reservation whose optional field
+            # has no populated value.
+            return None
+
+        if not isinstance(data, dict) or data.get("reservationId") != reservation_id:
+            raise GuestyApiError("Guesty returned an invalid custom field response")
+        custom_field = data.get("customField")
+        if (
+            not isinstance(custom_field, dict)
+            or custom_field.get("fieldId") != field_id
+        ):
+            raise GuestyApiError("Guesty returned an invalid custom field response")
+        return custom_field.get("value")
 
     async def _async_verify_reservation_custom_field(
         self,

@@ -21,12 +21,13 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **API Retries** – exponentielles Backoff bei temporären Fehlern
 - **Datenschutzmodus** – Gastnamen und Bestätigungscodes sind standardmäßig verborgen
 - **Sicherer Gast-Türzugang** – ein zeitlich begrenzter Link pro Reservierung mit
-  bis zu zwei serverseitig zugeordneten Home-Assistant-Schlössern und
+  bis zu sechs serverseitig zugeordneten Home-Assistant-Schlössern und
   automatischer Browser-Sprache (Deutsch, Englisch, Spanisch oder Französisch)
 - **Zugangslink-Diagnose pro Listing** – zeigt Link und Guesty-Syncstatus ohne
   den sensiblen Link in der Recorder-Historie zu speichern
-- **Loxone Reservierungs-PINs** – sechsstelliger Guesty-Keycode als maßgebliche
-  Quelle und kurzlebige Loxone-Benutzer mit listingabhängigen Gruppen
+- **Loxone Reservierungs-PINs** – sechsstelliger Code in einem konfigurierbaren
+  Guesty-Reservierungs-Custom-Field und kurzlebige Loxone-Benutzer mit
+  listingabhängigen Gruppen
 
 ## Voraussetzungen
 
@@ -82,7 +83,7 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Stale-Schwellenwert | 6 h | Ab wann Daten als veraltet gelten |
 | Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Entitäten anzeigen; sensible Attribute werden nicht im Recorder gespeichert |
 | Sicherer Gast-Türzugang | Aus | Erst nach weiterer Konfiguration werden Reservierungslinks erzeugt |
-| Loxone Reservierungs-PINs | Aus | Erzeugt Guesty-Keycodes und zeitlich begrenzte Loxone-Benutzer |
+| Loxone Reservierungs-PINs | Aus | Erzeugt Codes im konfigurierten Guesty-Reservierungs-Custom-Field und zeitlich begrenzte Loxone-Benutzer |
 | Logo-URL | Leer | Optionales Logo oberhalb des Türportals; direkte HTTPS-Bild-URL |
 | Favicon-URL | Leer | Optionales Browser-Icon des Türportals; direkte HTTPS-Bild-URL |
 
@@ -190,9 +191,13 @@ Schloss-Entity und Ergebnis, aber weder Gastnamen noch Zugriffstoken.
 
 Optional kann die Integration zusätzlich für jede aktive Guesty-Reservierung
 einen sechsstelligen Zahlencode verwalten. Der Code wird beim ersten Erkennen
-der Reservierung erzeugt und in Guestys eingebautes Reservierungsfeld
-**Keycode** geschrieben. In Guesty Guest App und Nachrichten kann er über
-`{{key_code}}` verwendet werden. Es ist kein zusätzliches Custom Field nötig.
+der Reservierung erzeugt und in ein frei konfigurierbares
+**Reservierungs-Custom-Field** geschrieben. Standardmäßig erwartet die
+Integration die Variable `{{door_code}}`. Der Name, die Variable mit oder ohne
+doppelte geschweifte Klammern oder die interne 24-stellige Feld-ID können in den
+Home-Assistant-Optionen eingetragen und später geändert werden. In Guesty Guest
+App und Nachrichten wird die von Guesty angezeigte Variable des Feldes
+verwendet.
 
 Die Funktion prüft keinen Zahlungsstatus. Sie arbeitet mit denselben aktiven
 Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
@@ -200,9 +205,11 @@ Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
 für eine zukünftige Reservierung unmittelbar nach Webhook oder spätestens beim
 nächsten normalen Reservierungsabgleich erzeugt. Der gemeinsame Guesty-Client,
 OAuth-Token, Webhook, Reservierungs-Cache und 5-Minuten-Abgleich werden
-wiederverwendet; es gibt keinen zweiten Poller. Pro neuem Code entsteht genau
-ein Guesty-Schreibzugriff, eine gezielte Kontrolle nur bei einer unvollständigen
-Guesty-Antwort.
+wiederverwendet; es gibt keinen zweiten Poller. Die Custom-Field-Werte werden
+nach Möglichkeit direkt aus demselben Reservierungsabruf übernommen. Nur wenn
+Guesty sie dort nicht liefert, erfolgt ein gezielter Lesezugriff für die
+betroffene Reservierung. Pro neuem Code entsteht ein verifizierter
+Guesty-Schreibzugriff.
 
 Der Loxone-Benutzer wird dagegen erst kurz vor dem erlaubten Zeitraum angelegt.
 Standardmäßig beträgt der Vorlauf sechs Stunden. Seine Gültigkeit ist:
@@ -266,32 +273,41 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 
 #### 3. Guesty vorbereiten
 
-1. Der Guesty-Open-API-Anwendung Lese- und Schreibzugriff auf Reservierungen
-   und Reservierungsnotizen geben, damit `notes.keyCode` gelesen und gesetzt
-   werden kann.
-2. In der Guest App beziehungsweise Nachrichtenvorlage `{{key_code}}`
-   verwenden. Ein eigenes Custom Field und der kostenpflichtige Guesty Locks
-   Manager sind dafür nicht erforderlich.
+1. Unter **Operations → Portfolio → Custom fields → Reservations** ein
+   Reservierungs-Custom-Field vom Typ **Text** anlegen, zum Beispiel `Door
+   code`. Das Feld darf nicht als Property-Custom-Field angelegt werden.
+2. Die in Guesty angezeigte Variable notieren. Bei der hier beschriebenen
+   Einrichtung ist das `{{door_code}}`.
+3. Der Guesty-Open-API-Anwendung Lese- und Schreibzugriff auf Reservierungen und
+   Reservierungs-Custom-Fields geben.
+4. In der Guest App beziehungsweise Nachrichtenvorlage genau die von Guesty
+   angezeigte Variable verwenden. Der kostenpflichtige Guesty Locks Manager ist
+   dafür nicht erforderlich.
 
 #### 4. Integration in Home Assistant konfigurieren
 
 1. **Einstellungen → Geräte & Dienste → Guesty → Konfigurieren → Loxone
    Reservierungs-PINs** öffnen und die Funktion aktivieren.
-2. Den Vorlauf festlegen. Erst so viele Minuten vor dem erlaubten Zugangsbeginn
+2. Unter **Guesty-Code-Custom-Field** `{{door_code}}` eintragen. Alternativ
+   können der sichtbare Feldname, die Variable ohne Klammern oder die interne
+   Feld-ID verwendet werden. Wird später ein anderes Feld gewählt, übernimmt
+   ein leeres Zielfeld den vorhandenen Code ohne Rotation; ein bereits
+   ausgefülltes Zielfeld bleibt als neue maßgebliche Quelle erhalten.
+3. Den Vorlauf festlegen. Erst so viele Minuten vor dem erlaubten Zugangsbeginn
    wird der Loxone-Benutzer angelegt. Weit entfernte Buchungen belegen dadurch
    keinen Platz in der Loxone-Benutzerdatenbank.
-3. Einen reservierten PIN-Präfix mit ein oder zwei Ziffern wählen, standardmäßig
+4. Einen reservierten PIN-Präfix mit ein oder zwei Ziffern wählen, standardmäßig
    `7`. Damit bleiben mindestens 10.000 automatisch nutzbare Codes für alle
    Listings und zukünftigen Buchungen gemeinsam verfügbar. Automatisch erzeugte
    und wegen Kollision ersetzte Codes verwenden diesen Präfix. Manuell in Guesty
    gesetzte, eindeutige sechsstellige Codes dürfen davon abweichen.
-4. Nur die Listings auswählen, die tatsächlich Loxone verwenden. Nicht
-   ausgewählte Listings erhalten weder einen automatisch erzeugten Keycode noch
+5. Nur die Listings auswählen, die tatsächlich Loxone verwenden. Nicht
+   ausgewählte Listings erhalten weder einen automatisch erzeugten Code noch
    einen Loxone-Benutzer.
-5. Anzahl der Miniserver angeben und pro Server Anzeigename, HTTPS-URL,
+6. Anzahl der Miniserver angeben und pro Server Anzeigename, HTTPS-URL,
    Dienstkonto und Passwort eintragen. Beim Bestätigen prüft die Integration die
    Verbindung und lädt die zulässigen normalen Benutzergruppen.
-6. Jedem ausgewählten Guesty-Listing eine oder mehrere Gruppen von genau einem
+7. Jedem ausgewählten Guesty-Listing eine oder mehrere Gruppen von genau einem
    Miniserver zuordnen. Die gewählten Gruppen bestimmen vollständig, welche
    Türen der Buchungscode öffnen darf. Die Integration blendet eingebaute,
    administrative sowie Gruppen mit Loxone-Config- oder
@@ -300,9 +316,9 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 #### 5. Funktion prüfen
 
 1. Eine zukünftige Testreservierung anlegen. Kurz nach Webhook beziehungsweise
-   spätestens nach dem normalen Abgleich muss Guesty im eingebauten Feld
-   **Keycode** einen sechsstelligen Wert anzeigen.
-2. Der Sensor **Guesty-Keycode-Status** muss `Synchronisiert` anzeigen. Vor dem
+   spätestens nach dem normalen Abgleich muss Guesty im Reservierungs-Custom-
+   Field `{{door_code}}` einen sechsstelligen Wert anzeigen.
+2. Der Sensor **Guesty-Code-Status** muss `Synchronisiert` anzeigen. Vor dem
    eingestellten Loxone-Vorlauf zeigt **Loxone-PIN-Status** zunächst `Geplant`.
 3. Innerhalb des Vorlaufs muss in Loxone ein zeitlich begrenzter Benutzer mit
    der richtigen Buchungs-ID beziehungsweise – bei aktivierten Gastdetails –
@@ -317,11 +333,13 @@ abgelehnt.
 
 ### Lebenszyklus und Sicherheit
 
-- Existiert bereits ein gültiger sechsstelliger Guesty-Keycode, wird er
-  übernommen. Andernfalls wird kryptografisch zufällig ein Code im reservierten
-  Präfixbereich erzeugt.
-- Ein gültiger, eindeutiger sechsstelliger Keycode in Guesty ist die maßgebliche
-  Quelle. Manuelle Änderungen werden nach dem Reservierungs-Webhook
+- Existiert bereits ein gültiger sechsstelliger Code im konfigurierten
+  Guesty-Custom-Field, wird er übernommen. Andernfalls wird kryptografisch
+  zufällig ein Code im reservierten Präfixbereich erzeugt. Beim ersten Wechsel
+  von der früheren Keycode-Implementierung wird ein bereits gespeicherter Code
+  ohne Rotation in ein leeres Custom Field übernommen.
+- Ein gültiger, eindeutiger sechsstelliger Code im Guesty-Custom-Field ist die
+  maßgebliche Quelle. Manuelle Änderungen werden nach dem Reservierungs-Webhook
   beziehungsweise dem nächsten Abgleich übernommen und auch bei einem bereits
   existierenden Loxone-Benutzer aktualisiert. Wird das Feld ausdrücklich
   geleert oder enthält es einen ungültigen Wert, wird ein eventuell vorhandener
@@ -338,13 +356,17 @@ abgelehnt.
 - Änderungen an Gastname, Zeitraum oder Gruppen aktualisieren den bestehenden
   Loxone-Benutzer. Bei einem Listing-/Miniserver-Wechsel wird zuerst der alte
   Benutzer entfernt und der aktuelle Guesty-Code am Ziel neu bereitgestellt.
+- Wird die Custom-Field-Referenz in den Integrationsoptionen geändert, löst die
+  Integration das neue Feld erneut zur internen Guesty-ID auf. Ein vorhandener
+  Wert im neuen Feld gewinnt; ist das Feld leer, wird der bisherige Code
+  übernommen. Dadurch ändert ein reiner Konfigurationswechsel keinen Gastcode.
 - Ist „Gastdetails anzeigen“ deaktiviert, verwendet der Loxone-Benutzer die
   Guesty-Buchungs-ID statt des Gastnamens. Nur nach ausdrücklicher Aktivierung
   wird der Name an Loxone übermittelt.
 - Storno oder Zugangsende entfernen zuerst den Klartextcode aus dem privaten
-  Home-Assistant-Speicher und danach den Loxone-Benutzer. Das Guesty-Keycode-
-  Feld bleibt zur Buchungsdokumentation erhalten; der allgemeine Guesty-Cache
-  speichert Keycodes ausdrücklich nicht dauerhaft.
+  Home-Assistant-Speicher und danach den Loxone-Benutzer. Das Guesty-Custom-
+  Field bleibt zur Buchungsdokumentation erhalten; der allgemeine Guesty-Cache
+  speichert Codes ausdrücklich nicht dauerhaft.
 - Loxones Ergebnisse `201` (nicht eindeutig) und `409` (bereits in einem
   NFC-Authentifizierungsbaustein verwendet) werden niemals als Erfolg
   akzeptiert. Der möglicherweise angelegte Benutzer wird sofort entfernt, der
@@ -373,7 +395,7 @@ abgelehnt.
 | Sensor | `sensor.ferienwohnung_belegung` | `vacant` oder `occupied` |
 | Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_aktueller_gast` | Name des Gastes der aktuell laufenden Reservierung |
 | Diagnose-Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_gast_zugangslink` | Status des aktuellen beziehungsweise nächsten Links; die erzeugte URL steht im Attribut `access_url` |
-| Diagnose-Sensor | `sensor.ferienwohnung_guesty_keycode_status` | `Nicht konfiguriert`, `Keine Reservierung`, `Ausstehend`, `Synchronisiert`, `Konflikt` oder `Fehler` |
+| Diagnose-Sensor | `sensor.ferienwohnung_guesty_keycode_status` | Guesty-Code-Custom-Field: `Nicht konfiguriert`, `Keine Reservierung`, `Ausstehend`, `Synchronisiert`, `Konflikt` oder `Fehler` |
 | Diagnose-Sensor | `sensor.ferienwohnung_loxone_pin_status` | Zeigt zusätzlich `Geplant`, `Bereitgestellt` oder `Löschung ausstehend` für den Loxone-Benutzer |
 | Kalender | `calendar.ferienwohnung_reservierungen` | Alle Reservierungen |
 

@@ -57,10 +57,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
     await coordinator.async_config_entry_first_refresh()
 
-    # The general cache intentionally strips Keycodes. When Loxone is enabled
-    # after a restart, perform one shared full read instead of issuing one
-    # reservation request per cached booking or treating an unknown value as an
-    # explicit deletion.
+    # The general cache intentionally strips reservation custom-field values.
+    # When Loxone is enabled after a restart, perform one shared full read so
+    # every code is available from the normal reservation response instead of
+    # issuing one custom-field request per cached booking.
     mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
     mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
     if (
@@ -69,7 +69,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
         and any(
             reservation.is_active_status()
             and reservation.listing_id in mapped_listing_ids
-            and not reservation.key_code_observed
+            and not reservation.custom_fields_observed
             for reservation in coordinator.data.reservations
         )
     ):

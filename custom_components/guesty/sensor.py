@@ -439,7 +439,7 @@ class GuestyAccessLinkSensor(
 class _GuestyLoxoneStatusSensor(
     CoordinatorEntity[GuestyDataUpdateCoordinator], SensorEntity
 ):
-    """Base for privacy-safe per-listing Keycode delivery status sensors."""
+    """Base for privacy-safe per-listing code-delivery status sensors."""
 
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_entity_registry_enabled_default = True

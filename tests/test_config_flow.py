@@ -39,6 +39,7 @@ from custom_components.guesty.const import (
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
     CONF_LOXONE_LISTING_MAPPINGS,
@@ -358,7 +359,12 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
     entry.runtime_data = SimpleNamespace(
         coordinator=SimpleNamespace(
             data=SimpleNamespace(listings={listing.id: listing})
-        )
+        ),
+        client=SimpleNamespace(
+            async_resolve_custom_field=AsyncMock(
+                return_value="65fab102a5284d73c6206db0"
+            )
+        ),
     )
     loxone_client = SimpleNamespace(
         async_get_groups=AsyncMock(
@@ -395,6 +401,7 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
         {
             CONF_LOXONE_PROVISION_LEAD_MINUTES: 360,
             CONF_LOXONE_CODE_PREFIX: "7",
+            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
             CONF_ACCESS_EARLY_MINUTES: 15,
             CONF_ACCESS_LATE_MINUTES: 30,
             config_flow.CONF_LOXONE_SERVER_COUNT: 1,
@@ -432,6 +439,7 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
             CONF_LOXONE_GROUP_UUIDS: ["group-front", "group-flat"],
         }
     }
+    assert result["data"][CONF_LOXONE_CUSTOM_FIELD] == "{{door_code}}"
     assert (
         result["data"][CONF_LOXONE_MINISERVERS][0][CONF_LOXONE_SERVER_PASSWORD]
         == "secret"

@@ -340,79 +340,50 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reservation_keycode_preserves_existing_reservation_notes(
-    monkeypatch,
-) -> None:
-    """A Keycode update never replaces unrelated reservation notes."""
+async def test_reservation_custom_field_value_uses_v3_endpoint(monkeypatch) -> None:
+    """The Loxone manager can read a manually changed reservation code."""
     client = _client()
     request = AsyncMock(
-        side_effect=[
-            {
-                "_id": "reservation-1",
-                "notes": {
-                    "cleaning": "Keep this",
-                    "specialRequests": "Late arrival",
-                    "doneBy": "read-only metadata",
-                },
+        return_value={
+            "reservationId": "reservation-1",
+            "customField": {
+                "fieldId": "65fab102a5284d73c6206db0",
+                "value": "712345",
             },
-            {
-                "reservationId": "reservation-1",
-                "notes": {"keyCode": "712345"},
-            },
-        ]
+        }
     )
     monkeypatch.setattr(client, "_async_request", request)
 
-    await client.async_update_reservation_key_code("reservation-1", "712345")
-
-    request.assert_any_await(
+    assert (
+        await client.async_get_reservation_custom_field(
+            "reservation-1",
+            "65fab102a5284d73c6206db0",
+        )
+        == "712345"
+    )
+    request.assert_awaited_once_with(
         "GET",
-        "/reservations/reservation-1",
-        params={"fields": "_id notes"},
-    )
-    request.assert_any_await(
-        "PUT",
-        "/reservations-v3/reservation-1/notes",
-        json_body={
-            "notes": {
-                "cleaning": "Keep this",
-                "specialRequests": "Late arrival",
-                "keyCode": "712345",
-            }
-        },
-    )
-    assert request.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_reservation_keycode_reads_back_incomplete_acknowledgement(
-    monkeypatch,
-) -> None:
-    """Only an ambiguous write acknowledgement causes a targeted read."""
-    client = _client()
-    request = AsyncMock(
-        side_effect=[
-            {"_id": "reservation-1", "notes": {}},
-            {"reservationId": "reservation-1"},
-            {"_id": "reservation-1", "notes": {"keyCode": "712345"}},
-        ]
-    )
-    monkeypatch.setattr(client, "_async_request", request)
-
-    await client.async_update_reservation_key_code("reservation-1", "712345")
-
-    request.assert_any_await(
-        "GET",
-        "/reservations/reservation-1",
-        params={"fields": "_id notes.keyCode"},
+        "/reservations-v3/reservation-1/custom-fields/65fab102a5284d73c6206db0",
     )
 
 
 @pytest.mark.asyncio
-async def test_reservation_keycode_rejects_invalid_value() -> None:
-    """Only the promised six-digit Keycode format can be published."""
-    with pytest.raises(ValueError, match="six digits"):
-        await _client().async_update_reservation_key_code("reservation-1", "12345")
+async def test_unpopulated_reservation_custom_field_returns_none(monkeypatch) -> None:
+    """An optional empty code field is not treated as an API outage."""
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_async_request",
+        AsyncMock(side_effect=GuestyNotFoundError("not populated")),
+    )
+
+    assert (
+        await client.async_get_reservation_custom_field(
+            "reservation-1",
+            "65fab102a5284d73c6206db0",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

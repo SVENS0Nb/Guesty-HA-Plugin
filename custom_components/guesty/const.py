@@ -56,6 +56,7 @@ CONF_ACCESS_LOCK_6_NAME_EN: Final = "access_lock_6_name_en"
 CONF_ACCESS_LOCK_6_NAME_ES: Final = "access_lock_6_name_es"
 CONF_ACCESS_LOCK_6_NAME_FR: Final = "access_lock_6_name_fr"
 CONF_LOXONE_ENABLED: Final = "loxone_enabled"
+CONF_LOXONE_CUSTOM_FIELD: Final = "loxone_custom_field"
 CONF_LOXONE_PROVISION_LEAD_MINUTES: Final = "loxone_provision_lead_minutes"
 CONF_LOXONE_CODE_PREFIX: Final = "loxone_code_prefix"
 CONF_LOXONE_MINISERVERS: Final = "loxone_miniservers"
@@ -86,6 +87,7 @@ DEFAULT_ACCESS_FAVICON_URL: Final = ""
 DEFAULT_ACCESS_EARLY_MINUTES: Final = 0
 DEFAULT_ACCESS_LATE_MINUTES: Final = 0
 DEFAULT_LOXONE_ENABLED: Final = False
+DEFAULT_LOXONE_CUSTOM_FIELD: Final = "{{door_code}}"
 DEFAULT_LOXONE_PROVISION_LEAD_MINUTES: Final = 360
 DEFAULT_LOXONE_CODE_PREFIX: Final = "7"
 
@@ -143,7 +145,7 @@ RESERVATION_FIELDS: Final = (
     "checkIn checkOut checkInDateLocalized checkOutDateLocalized "
     "plannedArrival plannedDeparture lastUpdatedAt "
     "listing.defaultCheckInTime listing.defaultCheckOutTime "
-    "guest.fullName notes.keyCode"
+    "guest.fullName customFields notes.keyCode"
 )
 
 WEBHOOK_SUBSCRIPTION_EVENTS: Final = (
