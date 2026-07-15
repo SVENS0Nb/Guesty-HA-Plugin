@@ -49,6 +49,7 @@ from .const import (
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_LISTING_SYNC_INTERVAL,
     CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
     CONF_LOXONE_LISTING_MAPPINGS,
@@ -74,6 +75,7 @@ from .const import (
     DEFAULT_ACCESS_LOGO_URL,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_LOXONE_CODE_PREFIX,
+    DEFAULT_LOXONE_CUSTOM_FIELD,
     DEFAULT_LOXONE_ENABLED,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
     DEFAULT_RESERVATION_DAYS_FUTURE,
@@ -604,23 +606,36 @@ class GuestyOptionsFlow(OptionsFlow):
         if user_input is not None:
             selected = user_input.get(CONF_LOXONE_LISTINGS)
             prefix = str(user_input.get(CONF_LOXONE_CODE_PREFIX, "")).strip()
+            custom_field = str(user_input.get(CONF_LOXONE_CUSTOM_FIELD, "")).strip()
             if not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
             elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
                 errors["base"] = "invalid_code_prefix"
+            elif not custom_field:
+                errors["base"] = "custom_field_not_found"
             else:
-                selected_ids = list(
-                    dict.fromkeys(item for item in selected if item in listings)
+                try:
+                    await self.config_entry.runtime_data.client.async_resolve_custom_field(
+                        custom_field
+                    )
+                except (GuestyApiError, GuestyAuthError):
+                    errors["base"] = "custom_field_not_found"
+
+                selected_ids = (
+                    list(dict.fromkeys(item for item in selected if item in listings))
+                    if not errors
+                    else []
                 )
-                if not selected_ids:
+                if not errors and not selected_ids:
                     errors["base"] = "select_listing"
-                else:
+                elif not errors:
                     self._pending_options.update(
                         {
                             CONF_LOXONE_PROVISION_LEAD_MINUTES: int(
                                 user_input[CONF_LOXONE_PROVISION_LEAD_MINUTES]
                             ),
                             CONF_LOXONE_CODE_PREFIX: prefix,
+                            CONF_LOXONE_CUSTOM_FIELD: custom_field,
                             CONF_ACCESS_EARLY_MINUTES: int(
                                 user_input[CONF_ACCESS_EARLY_MINUTES]
                             ),
@@ -646,6 +661,9 @@ class GuestyOptionsFlow(OptionsFlow):
                 ),
                 vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
                     str, vol.Length(min=1, max=2)
+                ),
+                vol.Required(CONF_LOXONE_CUSTOM_FIELD): vol.All(
+                    str, vol.Length(min=1, max=128)
                 ),
                 vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=180)
@@ -676,6 +694,9 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                     CONF_LOXONE_CODE_PREFIX: self.config_entry.options.get(
                         CONF_LOXONE_CODE_PREFIX, DEFAULT_LOXONE_CODE_PREFIX
+                    ),
+                    CONF_LOXONE_CUSTOM_FIELD: self.config_entry.options.get(
+                        CONF_LOXONE_CUSTOM_FIELD, DEFAULT_LOXONE_CUSTOM_FIELD
                     ),
                     CONF_ACCESS_EARLY_MINUTES: self._pending_options.get(
                         CONF_ACCESS_EARLY_MINUTES,

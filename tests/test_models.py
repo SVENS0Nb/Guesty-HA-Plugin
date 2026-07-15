@@ -78,8 +78,8 @@ def test_occupancy_boundaries(moment, expected) -> None:
     assert occupancy.status == expected
 
 
-def test_reservation_keycode_is_parsed_but_not_written_to_general_cache() -> None:
-    """Sensitive Keycodes live only in the private, expiring Loxone store."""
+def test_reservation_codes_are_parsed_but_not_written_to_general_cache() -> None:
+    """Sensitive custom fields and legacy codes stay out of the general cache."""
     reservation = models.GuestyReservation.from_api(
         {
             "_id": "res-keycode",
@@ -87,17 +87,26 @@ def test_reservation_keycode_is_parsed_but_not_written_to_general_cache() -> Non
             "status": "confirmed",
             "checkIn": "2026-07-20T13:00:00Z",
             "checkOut": "2026-07-22T09:00:00Z",
+            "customFields": [
+                {"fieldId": "65fab102a5284d73c6206db0", "value": "712346"}
+            ],
             "notes": {"keyCode": 712345},
         }
     )
 
     assert reservation is not None
-    assert reservation.key_code == "712345"
-    assert reservation.key_code_observed is True
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is False
+    assert reservation.custom_fields == {"65fab102a5284d73c6206db0": "712346"}
+    assert reservation.custom_fields_observed is True
+    assert reservation.legacy_key_code == "712345"
     assert "key_code" not in reservation.to_dict()
     cached = models.GuestyReservation.from_dict(reservation.to_dict())
     assert cached.key_code is None
     assert cached.key_code_observed is False
+    assert cached.custom_fields == {}
+    assert cached.custom_fields_observed is False
+    assert cached.legacy_key_code is None
 
 
 def test_planned_arrival_overrides_default() -> None:

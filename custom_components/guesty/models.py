@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 import logging
 from typing import Any
@@ -173,6 +173,9 @@ class GuestyReservation:
     last_updated_at: str | None
     key_code: str | None = None
     key_code_observed: bool = False
+    custom_fields: dict[str, Any] = field(default_factory=dict)
+    custom_fields_observed: bool = False
+    legacy_key_code: str | None = None
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
@@ -195,6 +198,15 @@ class GuestyReservation:
         notes = data.get("notes") or {}
         if not isinstance(notes, dict):
             notes = {}
+        raw_custom_fields = data.get("customFields")
+        custom_fields: dict[str, Any] = {}
+        if isinstance(raw_custom_fields, list):
+            for item in raw_custom_fields:
+                if not isinstance(item, dict):
+                    continue
+                field_id = item.get("fieldId")
+                if isinstance(field_id, str) and field_id:
+                    custom_fields[field_id] = item.get("value")
         return cls(
             id=str(reservation_id),
             listing_id=str(listing_id),
@@ -210,12 +222,19 @@ class GuestyReservation:
             listing_default_check_out=listing.get("defaultCheckOutTime"),
             guest_name=guest.get("fullName"),
             last_updated_at=data.get("lastUpdatedAt"),
-            key_code=(
+            # The configured reservation custom field is selected only after its
+            # reference has been resolved to an account-specific field ID.
+            key_code=None,
+            key_code_observed=False,
+            custom_fields=custom_fields,
+            custom_fields_observed=isinstance(raw_custom_fields, list),
+            # Keep the former built-in Keycode only in memory for a one-time,
+            # non-rotating migration into the configured custom field.
+            legacy_key_code=(
                 str(notes["keyCode"]).strip()
                 if notes.get("keyCode") is not None
                 else None
             ),
-            key_code_observed=True,
         )
 
     def is_active_status(self) -> bool:
@@ -320,10 +339,13 @@ class GuestyReservation:
             listing_default_check_out=data.get("listing_default_check_out"),
             guest_name=data.get("guest_name"),
             last_updated_at=data.get("last_updated_at"),
-            # Keycodes are intentionally never restored from the general Guesty
-            # cache. The private Loxone store owns them only until access expires.
+            # Access codes are intentionally never restored from the general
+            # Guesty cache. The private Loxone store owns them until access expires.
             key_code=None,
             key_code_observed=False,
+            custom_fields={},
+            custom_fields_observed=False,
+            legacy_key_code=None,
         )
 
 
