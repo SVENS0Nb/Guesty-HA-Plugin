@@ -50,7 +50,7 @@
         "title": "Gast-Türzugang",
         "description": "Lege zuerst in Guesty ein Reservierungs-Custom-Field vom Typ Text an. Die Integration schreibt pro aktiver Reservierung einen geschützten Zugangslink. Optionale Branding-Bilder müssen direkte HTTPS-URLs verwenden.",
         "data": {
-          "access_custom_field": "Name oder ID des Guesty-Custom-Fields",
+          "access_custom_field": "Guesty-Reservierungsfeld für den Türlink (Name, Variable oder ID)",
           "access_logo_url": "Logo-Bild-URL (optional, HTTPS)",
           "access_favicon_url": "Favicon-Bild-URL (optional, HTTPS)",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
@@ -100,7 +100,7 @@
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
-          "loxone_custom_field": "Name, {{Variable}} oder ID des Guesty-Code-Custom-Fields",
+          "loxone_custom_field": "Guesty-Reservierungsfeld für den Türcode (Name, Variable oder ID)",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
           "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
           "loxone_server_count": "Anzahl der Loxone-Miniserver",

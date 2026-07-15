@@ -288,9 +288,10 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 
 1. **Einstellungen → Geräte & Dienste → Guesty → Konfigurieren → Loxone
    Reservierungs-PINs** öffnen und die Funktion aktivieren.
-2. Unter **Guesty-Code-Custom-Field** `{{door_code}}` eintragen. Alternativ
-   können der sichtbare Feldname, die Variable ohne Klammern oder die interne
-   Feld-ID verwendet werden. Wird später ein anderes Feld gewählt, übernimmt
+2. Unter **Guesty-Reservierungsfeld für den Türcode (Name, Variable oder ID)**
+   wahlweise `Door Code`, `door_code`, `{{door_code}}` oder die interne Feld-ID
+   eintragen. Das Feld für den Türlink akzeptiert dieselben Referenzarten. Wird
+   später ein anderes Feld gewählt, übernimmt
    ein leeres Zielfeld den vorhandenen Code ohne Rotation; ein bereits
    ausgefülltes Zielfeld bleibt als neue maßgebliche Quelle erhalten.
 3. Den Vorlauf festlegen. Erst so viele Minuten vor dem erlaubten Zugangsbeginn
@@ -317,7 +318,12 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 
 1. Eine zukünftige Testreservierung anlegen. Kurz nach Webhook beziehungsweise
    spätestens nach dem normalen Abgleich muss Guesty im Reservierungs-Custom-
-   Field `{{door_code}}` einen sechsstelligen Wert anzeigen.
+   Field `{{door_code}}` einen sechsstelligen Wert anzeigen. Bei der erstmaligen
+   Aktivierung mit vielen vorhandenen Reservierungen werden aktuelle und nahe
+   Buchungen zuerst und danach jeweils höchstens zwei weitere Feldwerte pro
+   Durchlauf geschrieben. Der nächste Teil der Warteschlange folgt automatisch
+   nach etwa 30 Sekunden; dadurch bleibt Guestys API auch während der Migration
+   für normale Reservierungsabgleiche verfügbar.
 2. Der Sensor **Guesty-Code-Status** muss `Synchronisiert` anzeigen. Vor dem
    eingestellten Loxone-Vorlauf zeigt **Loxone-PIN-Status** zunächst `Geplant`.
 3. Innerhalb des Vorlaufs muss in Loxone ein zeitlich begrenzter Benutzer mit
@@ -379,6 +385,11 @@ abgelehnt.
   Codes erzeugt. Bereits bekannte Benutzer werden am fest gespeicherten
   Zugangsende trotzdem entfernt. API-Fehler verwenden persistentes,
   begrenztes Backoff statt einer Anfrageschleife.
+- Guesty-Schreibfehler werden am Sensor **Guesty-Code-Status** als `Fehler`
+  ausgegeben. Das Attribut `error_reason` unterscheidet unter anderem fehlende
+  Berechtigungen, Authentifizierungsfehler und vorübergehende API-Probleme,
+  ohne Reservierungsdaten oder API-Antworttexte offenzulegen. Eine planmäßig
+  wartende Migration bleibt `Ausstehend` und wird nicht als Fehler behandelt.
 - Loxone-Zugangsdaten, PINs und Gastnamen erscheinen nicht in Home-Assistant-
   Diagnosedaten. Die Miniserver-Passwörter liegen – wie andere
   Integrations-Zugangsdaten – im Config-Entry-Speicher. Solange ein verwalteter
@@ -483,7 +494,7 @@ flowchart TD
     B --> E[Belegungs-Sensoren]
     B --> F[Kalender]
     B --> H[Loxone PIN Manager]
-    H -->|ein PUT pro neuem Code| A
+    H -->|begrenzte PUT/GET-bestätigte Feldwerte| A
     H -->|Anlegen/Ändern/Löschen nur bei Übergängen| I[Loxone Miniserver]
     G[Transition Scheduler] -->|Check-in/out Zeit| B
 ```

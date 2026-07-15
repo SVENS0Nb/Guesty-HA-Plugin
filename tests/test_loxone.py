@@ -10,7 +10,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import loxone
-from custom_components.guesty.api import GuestyApiError
+from custom_components.guesty.api import GuestyApiError, GuestyPermissionError
 from custom_components.guesty.const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
@@ -173,6 +173,118 @@ async def test_future_booking_gets_stable_guesty_code_without_early_loxone_user(
     )
     remote.async_add_or_update_user.assert_not_awaited()
     assert manager._records[reservation.id]["field_synced"] is True
+
+
+@pytest.mark.asyncio
+async def test_bulk_custom_field_migration_is_prioritized_and_bounded(
+    hass, monkeypatch
+) -> None:
+    """Nearest stays migrate first without exhausting Guesty's API allowance."""
+    reservations = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-{days}",
+        )
+        for days in (4, 1, 3, 2)
+    ]
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservations[0]
+    )
+    coordinator.data.reservations = reservations
+
+    await manager.async_reconcile()
+
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+    ] == ["reservation-1", "reservation-2"]
+    assert manager._records["reservation-3"]["last_error"] == "guesty_sync_queued"
+    assert manager._records["reservation-4"]["last_error"] == "guesty_sync_queued"
+    assert manager.diagnostics()["custom_field_codes_synced"] == 2
+    assert manager.diagnostics()["custom_field_codes_queued"] == 2
+    assert manager.diagnostics()["custom_field_code_failures"] == 0
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=31),
+    )
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_custom_field.await_count == 4
+    assert all(
+        manager._records[reservation.id]["field_synced"] for reservation in reservations
+    )
+    assert manager.diagnostics()["custom_field_codes_pending"] == 0
+    assert manager.diagnostics()["custom_field_codes_queued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_guesty_write_failure_is_visible_and_stops_the_batch(
+    hass, monkeypatch
+) -> None:
+    """One rejected write is reported safely and later writes are queued."""
+    first = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+        reservation_id="reservation-1",
+    )
+    second = _reservation(
+        check_in=NOW + timedelta(days=3),
+        check_out=NOW + timedelta(days=4),
+        reservation_id="reservation-2",
+    )
+    manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, first)
+    coordinator.data.reservations.append(second)
+    guesty_client.async_update_reservation_custom_field.side_effect = (
+        GuestyPermissionError("private Guesty response")
+    )
+
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_custom_field.await_count == 1
+    snapshot = manager.listing_status_snapshot("listing-1")
+    assert snapshot["guesty_status"] == "error"
+    assert snapshot["error_reason"] == "guesty_permission_denied"
+    assert "private Guesty response" not in str(manager.diagnostics())
+    assert manager.diagnostics()["custom_field_code_failures"] == 1
+    assert manager.diagnostics()["custom_field_codes_queued"] == 1
+
+
+@pytest.mark.asyncio
+async def test_setup_recovers_reasonless_v180_guesty_backoff(hass, monkeypatch) -> None:
+    """The affected v1.8.0 retry state is moved into the fast bounded queue."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    retry_at = NOW + timedelta(hours=1)
+    manager._storage.async_load = AsyncMock(
+        return_value={
+            "records": {
+                reservation.id: {
+                    "field_synced": False,
+                    "guesty_retry_at": retry_at.isoformat(),
+                    "guesty_retry_count": 4,
+                }
+            },
+            "resolved_field": {},
+        }
+    )
+    manager.async_schedule_reconcile = MagicMock()
+
+    await manager.async_setup()
+
+    record = manager._records[reservation.id]
+    assert "guesty_retry_at" not in record
+    assert "guesty_retry_count" not in record
+    assert record["last_error"] == "guesty_sync_queued"
+    manager._storage.async_save.assert_awaited_once()
+    manager.async_schedule_reconcile.assert_called_once_with()
 
 
 @pytest.mark.asyncio

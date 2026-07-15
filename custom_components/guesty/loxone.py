@@ -21,6 +21,9 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyNotFoundError,
+    GuestyPermissionError,
+    GuestyRetryableError,
     is_safe_resource_id,
 )
 from .const import (
@@ -63,6 +66,9 @@ _LOGGER = logging.getLogger(__name__)
 
 LOXONE_STORAGE_KEY = "guesty_loxone"
 _MAX_CODE_ROTATIONS_PER_RECONCILE = 3
+_GUESTY_FIELD_WRITE_BATCH_SIZE = 2
+_GUESTY_FIELD_QUEUE_DELAY_SECONDS = 30
+_GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _CODE_PATTERN = re.compile(r"^\d{6}$")
 _SERVER_SNAPSHOT_KEY = "server_snapshot"
 _SERVER_SNAPSHOT_FIELDS = (
@@ -163,6 +169,9 @@ class GuestyLoxoneManager:
         self._last_rotated = 0
         self._last_provisioned = 0
         self._last_deleted = 0
+        self._last_guesty_writes = 0
+        self._last_queued = 0
+        self._guesty_writes_remaining = 0
         self._listeners: set[Callable[[], None]] = set()
 
     @property
@@ -193,6 +202,22 @@ class GuestyLoxoneManager:
     async def async_setup(self) -> None:
         """Load private state and start one reconciliation pass."""
         self._data = await self._storage.async_load()
+        # Version 1.8.0 could put every booking into an independent exponential
+        # retry after a bulk custom-field migration exhausted Guesty's request
+        # allowance. Convert those reason-less retries into the bounded queue so
+        # the nearest stays recover immediately after upgrading.
+        recovered_retry = False
+        for record in self._records.values():
+            if (
+                not record.get("field_synced")
+                and self._retry_at(record, "guesty") is not None
+                and not record.get("last_error")
+            ):
+                self._clear_retry(record, "guesty")
+                record["last_error"] = _GUESTY_SYNC_QUEUED
+                recovered_retry = True
+        if recovered_retry:
+            await self._storage.async_save(self._data)
         self.async_schedule_reconcile()
 
     async def async_unload(self) -> None:
@@ -246,6 +271,9 @@ class GuestyLoxoneManager:
             self._last_rotated = 0
             self._last_provisioned = 0
             self._last_deleted = 0
+            self._last_guesty_writes = 0
+            self._last_queued = 0
+            self._guesty_writes_remaining = self._guesty_write_budget()
             next_run: datetime | None = None
             errors: list[str] = []
             data = self._coordinator.data
@@ -311,7 +339,14 @@ class GuestyLoxoneManager:
                         next_run = self._earlier(next_run, retry_at)
                     errors.append(type(err).__name__)
 
-            for reservation in sorted(eligible.values(), key=lambda item: item.id):
+            for reservation in sorted(
+                eligible.values(),
+                key=lambda item: self._reservation_sync_order(
+                    item,
+                    data.listings[item.listing_id],
+                    now,
+                ),
+            ):
                 listing = data.listings[reservation.listing_id]
                 record = self._records.get(reservation.id, {})
                 try:
@@ -353,6 +388,17 @@ class GuestyLoxoneManager:
                         record,
                         field_id,
                     )
+                    if (
+                        self._guesty_writes_remaining <= 0
+                        and not self._retry_is_deferred(record, "guesty", now)
+                        and self._custom_field_write_required(
+                            reservation,
+                            record,
+                        )
+                    ):
+                        retry_at = self._queue_custom_field_write(record, now)
+                        next_run = self._earlier(next_run, retry_at)
+                        continue
                     await self._async_ensure_key_code(
                         reservation,
                         record,
@@ -361,8 +407,19 @@ class GuestyLoxoneManager:
                         field_changed=field_changed,
                     )
                 except (GuestyApiError, GuestyAuthError) as err:
+                    reason = self._guesty_error_reason(err)
+                    record["last_error"] = reason
+                    self._guesty_writes_remaining = 0
                     self._record_retry_failure(record, "guesty", now)
-                    errors.append(type(err).__name__)
+                    retry_at = self._retry_at(record, "guesty")
+                    if retry_at:
+                        next_run = self._earlier(next_run, retry_at)
+                    errors.append(reason)
+                    _LOGGER.warning(
+                        "Guesty reservation code synchronization failed for %s: %s",
+                        self._reservation_marker(reservation.id),
+                        reason,
+                    )
                 except (RuntimeError, ValueError) as err:
                     record["last_error"] = "code_generation_failed"
                     errors.append(type(err).__name__)
@@ -451,9 +508,11 @@ class GuestyLoxoneManager:
                                 self._record_retry_failure(record, "loxone", now)
                                 errors.append("code_conflict")
                             except (GuestyApiError, GuestyAuthError) as err:
+                                reason = self._guesty_error_reason(err)
                                 self._record_retry_failure(record, "guesty", now)
-                                record["last_error"] = type(err).__name__
-                                errors.append(type(err).__name__)
+                                record["last_error"] = reason
+                                self._guesty_writes_remaining = 0
+                                errors.append(reason)
                             except (LoxoneApiError, LoxoneAuthError) as err:
                                 self._record_retry_failure(record, "loxone", now)
                                 record["last_error"] = type(err).__name__
@@ -466,6 +525,10 @@ class GuestyLoxoneManager:
                 guesty_retry_at = self._retry_at(record, "guesty")
                 if guesty_retry_at:
                     next_run = self._earlier(next_run, guesty_retry_at)
+                    if record.get("last_error") != _GUESTY_SYNC_QUEUED:
+                        errors.append(
+                            str(record.get("last_error") or "guesty_sync_retry_pending")
+                        )
                 cleanup_retry_at = self._retry_at(record, "cleanup")
                 if cleanup_retry_at:
                     next_run = self._earlier(next_run, cleanup_retry_at)
@@ -500,6 +563,83 @@ class GuestyLoxoneManager:
         self._data["resolved_field"] = {"reference": reference, "id": field_id}
         await self._storage.async_save(self._data)
         return field_id
+
+    def _guesty_write_budget(self) -> int:
+        """Return a small write budget while reserving normal API capacity."""
+        remaining = getattr(self._client, "last_rate_limit_remaining", None)
+        if not isinstance(remaining, int):
+            return _GUESTY_FIELD_WRITE_BATCH_SIZE
+        # A verified write normally uses one PUT and one GET. Keep several
+        # requests available for reservation/webhook traffic and still allow a
+        # single probe after Guesty's allowance has reset.
+        capacity = max(1, (remaining - 4) // 2)
+        return min(_GUESTY_FIELD_WRITE_BATCH_SIZE, capacity)
+
+    def _reservation_sync_order(
+        self,
+        reservation: GuestyReservation,
+        listing: GuestyListing,
+        now: datetime,
+    ) -> tuple[int, datetime, str]:
+        """Prioritize current and nearest stays during a bulk migration."""
+        try:
+            start, _end = self._access_window(reservation, listing)
+        except (TypeError, ValueError):
+            start = datetime.max.replace(tzinfo=dt_util.UTC)
+        return (0 if start <= now else 1, start, reservation.id)
+
+    def _custom_field_write_required(
+        self,
+        reservation: GuestyReservation,
+        record: Mapping[str, Any],
+    ) -> bool:
+        """Return whether reconciliation is expected to write Guesty."""
+        if not reservation.key_code_observed:
+            return False
+        remote_code = (
+            reservation.key_code.strip()
+            if isinstance(reservation.key_code, str)
+            else None
+        )
+        local_code = record.get("code")
+        if record.get("replacement_pending"):
+            return remote_code != local_code
+        if remote_code:
+            return not _CODE_PATTERN.fullmatch(
+                remote_code
+            ) or self._code_is_used_elsewhere(remote_code, reservation.id)
+        return True
+
+    def _queue_custom_field_write(
+        self,
+        record: dict[str, Any],
+        now: datetime,
+    ) -> datetime:
+        """Queue one unsynchronized field without exponential error backoff."""
+        self._clear_retry(record, "guesty")
+        retry_at = now + timedelta(seconds=_GUESTY_FIELD_QUEUE_DELAY_SECONDS)
+        record["guesty_retry_at"] = retry_at.isoformat()
+        record["last_error"] = _GUESTY_SYNC_QUEUED
+        self._last_queued += 1
+        return retry_at
+
+    @staticmethod
+    def _guesty_error_reason(error: Exception) -> str:
+        """Return a stable privacy-safe reason for UI and diagnostics."""
+        if isinstance(error, GuestyAuthError):
+            return "guesty_authentication_failed"
+        if isinstance(error, GuestyPermissionError):
+            return "guesty_permission_denied"
+        if isinstance(error, GuestyNotFoundError):
+            return "guesty_reservation_or_field_not_found"
+        if isinstance(error, GuestyRetryableError):
+            return "guesty_temporarily_unavailable"
+        return "guesty_custom_field_rejected"
+
+    @staticmethod
+    def _reservation_marker(reservation_id: str) -> str:
+        """Return a non-reversible marker for safe operational logging."""
+        return hashlib.sha256(reservation_id.encode()).hexdigest()[:12]
 
     @staticmethod
     def _hydrate_observed_custom_fields(
@@ -613,10 +753,11 @@ class GuestyLoxoneManager:
             record["field_synced"] = True
             record["field_id"] = field_id
             self._clear_retry(record, "guesty")
-            if record.get("last_error") in {
-                "guesty_keycode_changed",
-                "invalid_existing_keycode",
-            }:
+            last_error = record.get("last_error")
+            if isinstance(last_error, str) and (
+                last_error.startswith("guesty_")
+                or last_error == "invalid_existing_keycode"
+            ):
                 record.pop("conflict", None)
                 record.pop("last_error", None)
             return
@@ -698,6 +839,8 @@ class GuestyLoxoneManager:
         """Write and locally confirm the authoritative reservation field."""
         if not _CODE_PATTERN.fullmatch(code):
             raise ValueError("Guesty reservation access code must contain six digits")
+        self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
+        self._last_guesty_writes += 1
         await self._client.async_update_reservation_custom_field(
             reservation.id,
             field_id,
@@ -710,6 +853,10 @@ class GuestyLoxoneManager:
         record["field_id"] = field_id
         record["field_synced"] = True
         record["source_last_updated_at"] = reservation.last_updated_at
+        self._clear_retry(record, "guesty")
+        last_error = record.get("last_error")
+        if isinstance(last_error, str) and last_error.startswith("guesty_"):
+            record.pop("last_error", None)
         await self._storage.async_save(self._data)
 
     async def _async_replace_invalid_or_missing_guesty_code(
@@ -1217,7 +1364,10 @@ class GuestyLoxoneManager:
                     "invalid_mapping",
                     "source_change_cleanup_failed",
                 }
-                or self._retry_at(record, "guesty") is not None
+                or (
+                    self._retry_at(record, "guesty") is not None
+                    and last_error != _GUESTY_SYNC_QUEUED
+                )
                 or self._retry_at(record, "loxone") is not None
                 or self._retry_at(record, "cleanup") is not None
             ):
@@ -1267,9 +1417,16 @@ class GuestyLoxoneManager:
         }
         field_synced = bool(record.get("field_synced"))
         snapshot["field_synced"] = field_synced
+        guesty_retry_at = self._retry_at(record, "guesty")
+        if guesty_retry_at is not None:
+            snapshot["retry_at"] = guesty_retry_at
+        if isinstance(last_error, str) and last_error != _GUESTY_SYNC_QUEUED:
+            snapshot["error_reason"] = last_error
         if guesty_conflict:
             snapshot["guesty_status"] = "conflict"
-        elif self._retry_at(record, "guesty") is not None or last_error in {
+        elif (
+            guesty_retry_at is not None and last_error != _GUESTY_SYNC_QUEUED
+        ) or last_error in {
             "code_generation_failed",
             "custom_field_unavailable",
             "source_change_cleanup_failed",
@@ -1331,11 +1488,33 @@ class GuestyLoxoneManager:
             "rotated_during_last_reconcile": self._last_rotated,
             "provisioned_during_last_reconcile": self._last_provisioned,
             "deleted_during_last_reconcile": self._last_deleted,
+            "guesty_writes_during_last_reconcile": self._last_guesty_writes,
+            "queued_during_last_reconcile": self._last_queued,
             "local_records": len(records),
             "custom_field_codes_synced": sum(
                 1
                 for record in records.values()
                 if isinstance(record, dict) and record.get("field_synced")
+            ),
+            "custom_field_codes_pending": sum(
+                1
+                for record in records.values()
+                if isinstance(record, dict)
+                and not record.get("retired")
+                and not record.get("field_synced")
+            ),
+            "custom_field_codes_queued": sum(
+                1
+                for record in records.values()
+                if isinstance(record, dict)
+                and record.get("last_error") == _GUESTY_SYNC_QUEUED
+            ),
+            "custom_field_code_failures": sum(
+                1
+                for record in records.values()
+                if isinstance(record, dict)
+                and self._retry_at(record, "guesty") is not None
+                and record.get("last_error") != _GUESTY_SYNC_QUEUED
             ),
             "remote_users": sum(
                 1
