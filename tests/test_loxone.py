@@ -385,6 +385,37 @@ async def test_user_is_provisioned_once_with_reservation_window(
 
 
 @pytest.mark.asyncio
+async def test_manual_guesty_arrival_change_updates_existing_loxone_user(
+    hass, monkeypatch
+) -> None:
+    """A same-day plannedArrival edit updates the existing user's validity."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+    )
+    reservation.check_in_date = NOW.date().isoformat()
+    manager, _coordinator, _guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.planned_arrival = "14:00"
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    assert remote.async_add_or_update_user.await_count == 2
+    first_update, second_update = remote.async_add_or_update_user.await_args_list
+    assert first_update.kwargs["user_uuid"] is None
+    assert second_update.kwargs["user_uuid"] == "user-uuid"
+    assert second_update.kwargs["valid_from"] == NOW + timedelta(hours=2)
+    assert second_update.kwargs["valid_until"] == reservation.check_out_datetime(
+        _listing()
+    )
+    assert remote.async_set_access_code.await_count == 2
+    assert manager._records[reservation.id]["code_set"] is True
+
+
+@pytest.mark.asyncio
 async def test_guest_name_is_used_in_loxone_only_after_privacy_opt_in(
     hass, monkeypatch
 ) -> None:
