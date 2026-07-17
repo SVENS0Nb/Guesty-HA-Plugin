@@ -126,6 +126,48 @@ def test_planned_arrival_overrides_default() -> None:
     assert after.status == "occupied"
 
 
+def test_planned_times_override_stale_utc_timestamps() -> None:
+    """Manual Guesty time changes win even if checkIn/checkOut stay unchanged."""
+    reservation = _reservation(
+        check_in_utc="2026-07-13T13:00:00Z",
+        check_out_utc="2026-07-16T09:00:00Z",
+        planned_arrival="12:00",
+        planned_departure="14:00",
+    )
+
+    assert reservation.check_in_datetime(_listing()) == datetime(
+        2026, 7, 13, 12, 0, tzinfo=TZ
+    )
+    assert reservation.check_out_datetime(_listing()) == datetime(
+        2026, 7, 16, 14, 0, tzinfo=TZ
+    )
+
+
+def test_invalid_planned_time_falls_back_to_utc_timestamp() -> None:
+    """One malformed optional override cannot replace a valid Guesty timestamp."""
+    reservation = _reservation(
+        check_in_utc="2026-07-13T13:00:00Z",
+        planned_arrival="invalid",
+    )
+
+    assert reservation.check_in_datetime(_listing()) == datetime(
+        2026, 7, 13, 13, 0, tzinfo=zoneinfo.ZoneInfo("UTC")
+    )
+
+
+def test_invalid_local_date_with_planned_time_falls_back_to_utc() -> None:
+    """A malformed localized date cannot hide a valid UTC timestamp."""
+    reservation = _reservation(
+        check_in_date="invalid",
+        check_in_utc="2026-07-13T13:00:00Z",
+        planned_arrival="12:00",
+    )
+
+    assert reservation.check_in_datetime(_listing()) == datetime(
+        2026, 7, 13, 13, 0, tzinfo=zoneinfo.ZoneInfo("UTC")
+    )
+
+
 def test_utc_timestamps_are_supported_without_localized_dates() -> None:
     """UTC-only reservations drive occupancy and survive cache pruning."""
     reservation = _reservation(

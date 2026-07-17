@@ -31,6 +31,18 @@ def _parse_time(value: str | None, default: str) -> time:
         return time(int(hour), int(minute))
 
 
+def _parse_optional_time(value: str | None) -> time | None:
+    """Parse an explicit Guesty time without inventing a fallback value."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        # Guesty documents HH:MM, while accepting seconds here makes the parser
+        # robust to equivalent ISO time responses.
+        return time.fromisoformat(value.strip()).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 def _combine_date_time(
     day: date,
     clock: time,
@@ -247,6 +259,20 @@ class GuestyReservation:
 
     def check_in_datetime(self, listing: GuestyListing) -> datetime:
         """Return check-in datetime with UTC and localized fallbacks."""
+        planned_time = _parse_optional_time(self.planned_arrival)
+        if self.check_in_date and planned_time is not None:
+            # Guesty exposes manual check-in time changes through
+            # plannedArrival. It overrides the otherwise useful checkIn UTC
+            # timestamp, which can still contain the former default time.
+            try:
+                return _combine_date_time(
+                    date.fromisoformat(self.check_in_date),
+                    planned_time,
+                    listing.timezone,
+                )
+            except (TypeError, ValueError):
+                pass
+
         utc_dt = _parse_utc_datetime(self.check_in_utc)
         if utc_dt is not None:
             return utc_dt
@@ -268,6 +294,18 @@ class GuestyReservation:
 
     def check_out_datetime(self, listing: GuestyListing) -> datetime:
         """Return check-out datetime with UTC and localized fallbacks."""
+        planned_time = _parse_optional_time(self.planned_departure)
+        if self.check_out_date and planned_time is not None:
+            # plannedDeparture has the same override semantics as arrival.
+            try:
+                return _combine_date_time(
+                    date.fromisoformat(self.check_out_date),
+                    planned_time,
+                    listing.timezone,
+                )
+            except (TypeError, ValueError):
+                pass
+
         utc_dt = _parse_utc_datetime(self.check_out_utc)
         if utc_dt is not None:
             return utc_dt
