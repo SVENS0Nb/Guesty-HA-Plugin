@@ -606,14 +606,21 @@ class GuestyOptionsFlow(OptionsFlow):
         if user_input is not None:
             selected = user_input.get(CONF_LOXONE_LISTINGS)
             prefix = str(user_input.get(CONF_LOXONE_CODE_PREFIX, "")).strip()
-            legacy_custom_field = str(
-                user_input.get(CONF_LOXONE_CUSTOM_FIELD, "")
-            ).strip()
+            custom_field = str(user_input.get(CONF_LOXONE_CUSTOM_FIELD, "")).strip()
             if not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
             elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
                 errors["base"] = "invalid_code_prefix"
+            elif not custom_field:
+                errors["base"] = "custom_field_not_found"
             else:
+                try:
+                    await self.config_entry.runtime_data.client.async_resolve_custom_field(
+                        custom_field
+                    )
+                except (GuestyApiError, GuestyAuthError):
+                    errors["base"] = "custom_field_not_found"
+
                 selected_ids = (
                     list(dict.fromkeys(item for item in selected if item in listings))
                     if not errors
@@ -628,7 +635,7 @@ class GuestyOptionsFlow(OptionsFlow):
                                 user_input[CONF_LOXONE_PROVISION_LEAD_MINUTES]
                             ),
                             CONF_LOXONE_CODE_PREFIX: prefix,
-                            CONF_LOXONE_CUSTOM_FIELD: legacy_custom_field,
+                            CONF_LOXONE_CUSTOM_FIELD: custom_field,
                             CONF_ACCESS_EARLY_MINUTES: int(
                                 user_input[CONF_ACCESS_EARLY_MINUTES]
                             ),
@@ -655,8 +662,8 @@ class GuestyOptionsFlow(OptionsFlow):
                 vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
                     str, vol.Length(min=1, max=2)
                 ),
-                vol.Optional(CONF_LOXONE_CUSTOM_FIELD): vol.All(
-                    str, vol.Length(max=128)
+                vol.Required(CONF_LOXONE_CUSTOM_FIELD): vol.All(
+                    str, vol.Length(min=1, max=128)
                 ),
                 vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=180)
@@ -688,8 +695,9 @@ class GuestyOptionsFlow(OptionsFlow):
                     CONF_LOXONE_CODE_PREFIX: self.config_entry.options.get(
                         CONF_LOXONE_CODE_PREFIX, DEFAULT_LOXONE_CODE_PREFIX
                     ),
-                    CONF_LOXONE_CUSTOM_FIELD: self.config_entry.options.get(
-                        CONF_LOXONE_CUSTOM_FIELD, DEFAULT_LOXONE_CUSTOM_FIELD
+                    CONF_LOXONE_CUSTOM_FIELD: (
+                        self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
+                        or DEFAULT_LOXONE_CUSTOM_FIELD
                     ),
                     CONF_ACCESS_EARLY_MINUTES: self._pending_options.get(
                         CONF_ACCESS_EARLY_MINUTES,

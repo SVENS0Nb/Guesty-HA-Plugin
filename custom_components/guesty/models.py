@@ -207,8 +207,9 @@ class GuestyReservation:
 
         listing = data.get("listing") or {}
         guest = data.get("guest") or {}
-        raw_notes = data.get("notes")
-        notes = raw_notes if isinstance(raw_notes, dict) else {}
+        notes = data.get("notes") or {}
+        if not isinstance(notes, dict):
+            notes = {}
         raw_custom_fields = data.get("customFields")
         custom_fields: dict[str, Any] = {}
         if isinstance(raw_custom_fields, list):
@@ -233,23 +234,19 @@ class GuestyReservation:
             listing_default_check_out=listing.get("defaultCheckOutTime"),
             guest_name=guest.get("fullName"),
             last_updated_at=data.get("lastUpdatedAt"),
-            # Guesty's built-in third-party lock field is exposed as
-            # notes.keyCode and rendered through the standard Key code variable.
-            key_code=(
+            # The configured reservation custom field is selected only after its
+            # reference has been resolved to an account-specific field ID.
+            key_code=None,
+            key_code_observed=False,
+            custom_fields=custom_fields,
+            custom_fields_observed=isinstance(raw_custom_fields, list),
+            # Keep the former built-in Keycode only in memory for a one-time,
+            # non-rotating migration into the configured custom field.
+            legacy_key_code=(
                 str(notes["keyCode"]).strip()
                 if notes.get("keyCode") is not None
                 else None
             ),
-            # Live reservation responses are requested with ``notes.keyCode``.
-            # Guesty may omit the parent object when the value is empty, which
-            # is still an authoritative observation. Disk-cache hydration uses
-            # ``from_dict`` and explicitly resets this flag to False.
-            key_code_observed=(raw_notes is None or isinstance(raw_notes, dict)),
-            custom_fields=custom_fields,
-            custom_fields_observed=isinstance(raw_custom_fields, list),
-            # Populated later from the optional legacy custom field. It remains
-            # memory-only so codes never enter the general Home Assistant cache.
-            legacy_key_code=None,
         )
 
     def is_active_status(self) -> bool:
