@@ -87,10 +87,7 @@ DEFAULT_ACCESS_FAVICON_URL: Final = ""
 DEFAULT_ACCESS_EARLY_MINUTES: Final = 0
 DEFAULT_ACCESS_LATE_MINUTES: Final = 0
 DEFAULT_LOXONE_ENABLED: Final = False
-# Optional one-time migration source used by installations that previously
-# stored reservation PINs in a custom field. New installations use Guesty's
-# built-in notes.keyCode field and therefore need no custom-field reference.
-DEFAULT_LOXONE_CUSTOM_FIELD: Final = ""
+DEFAULT_LOXONE_CUSTOM_FIELD: Final = "{{door_code}}"
 DEFAULT_LOXONE_PROVISION_LEAD_MINUTES: Final = 360
 DEFAULT_LOXONE_CODE_PREFIX: Final = "7"
 
