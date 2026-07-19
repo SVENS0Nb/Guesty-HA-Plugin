@@ -96,11 +96,11 @@
       },
       "loxone": {
         "title": "Loxone Reservierungs-PINs",
-        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und in einem konfigurierbaren Guesty-Reservierungs-Custom-Field gespeichert. Das Custom Field ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und im integrierten Guesty-Feld Keycode gespeichert. Der native Keycode ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Ein bisheriges Custom Field kann optional einmalig verwendet werden, um bereits ausgegebene Codes unverändert zu übernehmen. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht.",
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
-          "loxone_custom_field": "Guesty-Reservierungsfeld für den Türcode (Name, Variable oder ID)",
+          "loxone_custom_field": "Bisheriges Türcode-Custom-Field zur einmaligen Migration (optional)",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
           "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
           "loxone_server_count": "Anzahl der Loxone-Miniserver",

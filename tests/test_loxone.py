@@ -10,7 +10,11 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import loxone
-from custom_components.guesty.api import GuestyApiError, GuestyPermissionError
+from custom_components.guesty.api import (
+    GuestyApiError,
+    GuestyNotFoundError,
+    GuestyPermissionError,
+)
 from custom_components.guesty.const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
@@ -62,6 +66,7 @@ def _reservation(
     check_in: datetime,
     check_out: datetime,
     key_code: str | None = None,
+    legacy_code: str | None = None,
     reservation_id: str = "reservation-1",
 ) -> GuestyReservation:
     result = GuestyReservation.from_api(
@@ -74,7 +79,7 @@ def _reservation(
             "guest": {"fullName": "Max Mustermann"},
             "lastUpdatedAt": "2026-07-14T11:59:00+00:00",
             "customFields": (
-                [{"fieldId": FIELD_ID, "value": key_code}] if key_code else []
+                [{"fieldId": FIELD_ID, "value": legacy_code}] if legacy_code else []
             ),
             "notes": {"keyCode": key_code} if key_code else {},
         }
@@ -129,6 +134,7 @@ def _manager(
     guesty_client = SimpleNamespace(
         async_resolve_custom_field=AsyncMock(return_value=FIELD_ID),
         async_get_reservation_custom_field=AsyncMock(return_value=None),
+        async_update_reservation_key_code=AsyncMock(),
         async_update_reservation_custom_field=AsyncMock(),
     )
     manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
@@ -168,15 +174,15 @@ async def test_future_booking_gets_stable_guesty_code_without_early_loxone_user(
 
     code = manager._records[reservation.id]["code"]
     assert len(code) == 6 and code.startswith("7") and code.isdigit()
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
-        reservation.id, FIELD_ID, code
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id, code
     )
     remote.async_add_or_update_user.assert_not_awaited()
     assert manager._records[reservation.id]["field_synced"] is True
 
 
 @pytest.mark.asyncio
-async def test_bulk_custom_field_migration_is_prioritized_and_bounded(
+async def test_bulk_keycode_generation_is_prioritized_and_bounded(
     hass, monkeypatch
 ) -> None:
     """Nearest stays migrate first without exhausting Guesty's API allowance."""
@@ -197,13 +203,13 @@ async def test_bulk_custom_field_migration_is_prioritized_and_bounded(
 
     assert [
         item.args[0]
-        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+        for item in guesty_client.async_update_reservation_key_code.await_args_list
     ] == ["reservation-1", "reservation-2"]
     assert manager._records["reservation-3"]["last_error"] == "guesty_sync_queued"
     assert manager._records["reservation-4"]["last_error"] == "guesty_sync_queued"
-    assert manager.diagnostics()["custom_field_codes_synced"] == 2
-    assert manager.diagnostics()["custom_field_codes_queued"] == 2
-    assert manager.diagnostics()["custom_field_code_failures"] == 0
+    assert manager.diagnostics()["guesty_keycodes_synced"] == 2
+    assert manager.diagnostics()["guesty_keycodes_queued"] == 2
+    assert manager.diagnostics()["guesty_keycode_failures"] == 0
 
     monkeypatch.setattr(
         loxone.dt_util,
@@ -212,12 +218,12 @@ async def test_bulk_custom_field_migration_is_prioritized_and_bounded(
     )
     await manager.async_reconcile()
 
-    assert guesty_client.async_update_reservation_custom_field.await_count == 4
+    assert guesty_client.async_update_reservation_key_code.await_count == 4
     assert all(
         manager._records[reservation.id]["field_synced"] for reservation in reservations
     )
-    assert manager.diagnostics()["custom_field_codes_pending"] == 0
-    assert manager.diagnostics()["custom_field_codes_queued"] == 0
+    assert manager.diagnostics()["guesty_keycodes_pending"] == 0
+    assert manager.diagnostics()["guesty_keycodes_queued"] == 0
 
 
 @pytest.mark.asyncio
@@ -237,19 +243,19 @@ async def test_guesty_write_failure_is_visible_and_stops_the_batch(
     )
     manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, first)
     coordinator.data.reservations.append(second)
-    guesty_client.async_update_reservation_custom_field.side_effect = (
-        GuestyPermissionError("private Guesty response")
+    guesty_client.async_update_reservation_key_code.side_effect = GuestyPermissionError(
+        "private Guesty response"
     )
 
     await manager.async_reconcile()
 
-    assert guesty_client.async_update_reservation_custom_field.await_count == 1
+    assert guesty_client.async_update_reservation_key_code.await_count == 1
     snapshot = manager.listing_status_snapshot("listing-1")
     assert snapshot["guesty_status"] == "error"
     assert snapshot["error_reason"] == "guesty_permission_denied"
     assert "private Guesty response" not in str(manager.diagnostics())
-    assert manager.diagnostics()["custom_field_code_failures"] == 1
-    assert manager.diagnostics()["custom_field_codes_queued"] == 1
+    assert manager.diagnostics()["guesty_keycode_failures"] == 1
+    assert manager.diagnostics()["guesty_keycodes_queued"] == 1
 
 
 @pytest.mark.asyncio
@@ -288,7 +294,7 @@ async def test_setup_recovers_reasonless_v180_guesty_backoff(hass, monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_existing_private_code_migrates_to_empty_custom_field_without_rotation(
+async def test_existing_private_code_migrates_to_native_keycode_without_rotation(
     hass, monkeypatch
 ) -> None:
     """Upgrading from notes.Keycode keeps the already-issued guest code stable."""
@@ -308,11 +314,68 @@ async def test_existing_private_code_migrates_to_empty_custom_field_without_rota
     await manager.async_reconcile()
 
     assert manager._records[reservation.id]["code"] == "712345"
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
         reservation.id,
-        FIELD_ID,
         "712345",
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_custom_field_migrates_to_native_keycode_without_rotation(
+    hass, monkeypatch
+) -> None:
+    """The former {{door_code}} value is copied exactly when Keycode is empty."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        legacy_code="712346",
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712346"
+    assert record["native_keycode_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        "712346",
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_private_codes_are_deduplicated_during_native_migration(
+    hass, monkeypatch
+) -> None:
+    """Only the established owner keeps a duplicated pre-upgrade PIN."""
+    first = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        reservation_id="reservation-1",
+    )
+    second = _reservation(
+        check_in=NOW + timedelta(days=11),
+        check_out=NOW + timedelta(days=13),
+        reservation_id="reservation-2",
+    )
+    manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, first)
+    coordinator.data.reservations.append(second)
+    manager._records.update(
+        {
+            first.id: {"listing_id": "listing-1", "code": "712345"},
+            second.id: {"listing_id": "listing-1", "code": "712345"},
+        }
+    )
+
+    await manager.async_reconcile()
+
+    first_code = manager._records[first.id]["code"]
+    second_code = manager._records[second.id]["code"]
+    assert first_code == "712345"
+    assert second_code != first_code
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -340,6 +403,50 @@ async def test_configured_custom_field_variable_is_resolved(hass, monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_new_install_does_not_resolve_a_custom_field(hass, monkeypatch) -> None:
+    """Native Keycode needs no account custom-field lookup."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+    )
+    options = _options()
+    options.pop(CONF_LOXONE_CUSTOM_FIELD)
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        options=options,
+    )
+
+    await manager.async_reconcile()
+
+    guesty_client.async_resolve_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_legacy_field_does_not_block_native_keycode(
+    hass, monkeypatch
+) -> None:
+    """A deleted migration field cannot break current Keycode synchronization."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    guesty_client.async_resolve_custom_field.side_effect = GuestyNotFoundError(
+        "deleted"
+    )
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_awaited_once()
+    assert manager._records[reservation.id]["field_synced"] is True
+
+
+@pytest.mark.asyncio
 async def test_existing_guesty_keycode_is_adopted_without_rewrite(
     hass, monkeypatch
 ) -> None:
@@ -356,7 +463,7 @@ async def test_existing_guesty_keycode_is_adopted_without_rewrite(
     await manager.async_reconcile()
 
     assert manager._records[reservation.id]["code"] == "712345"
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -453,13 +560,12 @@ async def test_manual_guesty_keycode_change_updates_existing_loxone_user(
     await manager.async_reconcile()
     original_code = manager._records[reservation.id]["code"]
 
-    reservation.custom_fields[FIELD_ID] = "799999"
     reservation.key_code = "799999"
     await manager.async_reconcile()
 
     assert manager._records[reservation.id]["code"] == "799999"
     assert original_code != manager._records[reservation.id]["code"]
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once()
+    guesty_client.async_update_reservation_key_code.assert_awaited_once()
     assert remote.async_set_access_code.await_args_list == [
         call("user-uuid", original_code),
         call("user-uuid", "799999"),
@@ -496,8 +602,8 @@ async def test_duplicate_guesty_codes_are_replaced_before_loxone_provisioning(
     assert first_code != second_code
     assert first_code == "799999"
     assert second_code != "799999"
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
-        second.id, FIELD_ID, second_code
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        second.id, second_code
     )
     remote.async_add_or_update_user.assert_not_awaited()
 
@@ -535,8 +641,8 @@ async def test_manual_duplicate_rotates_new_editor_not_established_owner(
     assert manager._records[established.id]["code"] == "711111"
     replacement = manager._records[edited.id]["code"]
     assert replacement not in {"711111", "722222"}
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
-        edited.id, FIELD_ID, replacement
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        edited.id, replacement
     )
 
 
@@ -603,7 +709,7 @@ async def test_stale_data_never_provisions_but_still_enforces_stored_end(
 
     await manager.async_reconcile()
 
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
     remote.async_add_or_update_user.assert_not_awaited()
 
     manager._records[reservation.id] = {
@@ -638,7 +744,7 @@ async def test_already_ended_active_reservation_does_not_create_local_state(
 
     assert reservation.key_code is None
     assert reservation.id not in manager._records
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
     remote.async_add_or_update_user.assert_not_awaited()
 
 
@@ -665,12 +771,12 @@ async def test_loxone_collision_rotates_guesty_and_retries_immediately(
     record = manager._records[reservation.id]
     assert remote.async_add_or_update_user.await_count == 2
     assert remote.async_set_access_code.await_count == 2
-    first_code = guesty_client.async_update_reservation_custom_field.await_args_list[
+    first_code = guesty_client.async_update_reservation_key_code.await_args_list[
         0
-    ].args[2]
-    replacement = guesty_client.async_update_reservation_custom_field.await_args_list[
+    ].args[1]
+    replacement = guesty_client.async_update_reservation_key_code.await_args_list[
         1
-    ].args[2]
+    ].args[1]
     assert replacement != first_code
     assert reservation.key_code == replacement
     assert record["code"] == replacement
@@ -697,7 +803,7 @@ async def test_repeated_loxone_collisions_are_bounded_and_backed_off(
     record = manager._records[reservation.id]
     assert remote.async_set_access_code.await_count == 3
     assert remote.async_delete_user.await_count == 3
-    assert guesty_client.async_update_reservation_custom_field.await_count == 4
+    assert guesty_client.async_update_reservation_key_code.await_count == 4
     assert record["conflict"] is True
     assert record["last_error"] == "code_conflict"
     assert record.get("loxone_retry_at") is not None
@@ -745,7 +851,7 @@ async def test_failed_guesty_rotation_write_retries_same_replacement(
     manager, _coordinator, guesty_client, remote = _manager(
         hass, monkeypatch, reservation
     )
-    guesty_client.async_update_reservation_custom_field.side_effect = [
+    guesty_client.async_update_reservation_key_code.side_effect = [
         None,
         GuestyApiError("offline"),
         None,
@@ -769,9 +875,8 @@ async def test_failed_guesty_rotation_write_retries_same_replacement(
     assert record.get("replacement_pending") is None
     assert record["field_synced"] is True
     assert record["code_set"] is True
-    assert guesty_client.async_update_reservation_custom_field.await_args.args == (
+    assert guesty_client.async_update_reservation_key_code.await_args.args == (
         reservation.id,
-        FIELD_ID,
         replacement,
     )
 
@@ -792,7 +897,6 @@ async def test_empty_or_invalid_guesty_code_revokes_old_user_before_replacement(
     await manager.async_reconcile()
     old_code = manager._records[reservation.id]["code"]
 
-    reservation.custom_fields[FIELD_ID] = edited_value
     reservation.key_code = edited_value
     reservation.key_code_observed = True
     await manager.async_reconcile()
@@ -801,8 +905,8 @@ async def test_empty_or_invalid_guesty_code_revokes_old_user_before_replacement(
     assert replacement != old_code
     assert replacement.isdigit() and len(replacement) == 6
     remote.async_delete_user.assert_awaited_once_with("user-uuid")
-    guesty_client.async_update_reservation_custom_field.assert_awaited_with(
-        reservation.id, FIELD_ID, replacement
+    guesty_client.async_update_reservation_key_code.assert_awaited_with(
+        reservation.id, replacement
     )
     assert manager._records[reservation.id]["code_set"] is True
 
@@ -832,7 +936,7 @@ async def test_unobserved_cached_keycode_never_overwrites_guesty(
     await manager.async_reconcile()
 
     assert manager._records[reservation.id]["code"] == "712345"
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
     remote.async_add_or_update_user.assert_not_awaited()
 
 

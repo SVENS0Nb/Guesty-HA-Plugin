@@ -96,11 +96,11 @@
       },
       "loxone": {
         "title": "Loxone reservation PINs",
-        "description": "Generate one six-digit code per reservation and store it in a configurable Guesty reservation custom field. The custom field is the source of truth, so valid manual changes are synchronized to Loxone; duplicate codes are replaced automatically. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
+        "description": "Generate one six-digit code per reservation and store it in Guesty's built-in Keycode field. Native Keycode is the source of truth, so valid manual changes are synchronized to Loxone; duplicate codes are replaced automatically. An existing custom field can optionally be used once to migrate already-issued codes without changing them. Loxone users are created only shortly before access begins and are automatically deleted after access ends.",
         "data": {
           "loxone_provision_lead_minutes": "Create Loxone user before access starts (minutes)",
           "loxone_code_prefix": "Reserved PIN prefix (1–2 digits)",
-          "loxone_custom_field": "Guesty reservation field for the door code (name, variable, or ID)",
+          "loxone_custom_field": "Previous door-code custom field for one-time migration (optional)",
           "access_early_minutes": "Enable access before check-in (minutes)",
           "access_late_minutes": "Keep access after check-out (minutes)",
           "loxone_server_count": "Number of Loxone Miniservers",

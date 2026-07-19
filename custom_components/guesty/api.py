@@ -198,6 +198,118 @@ class GuestyApiClient:
             return GuestyReservation.from_api(data)
         return None
 
+    async def async_update_reservation_key_code(
+        self,
+        reservation_id: str,
+        key_code: str,
+    ) -> None:
+        """Set and verify Guesty's built-in reservation Keycode field."""
+        self._validate_resource_id(reservation_id, "reservation")
+        if not re.fullmatch(r"\d{6}", key_code):
+            raise ValueError("Guesty reservation key code must contain six digits")
+
+        # Guesty's PUT endpoint accepts the complete notes object. Merge the
+        # mutable note fields so updating a PIN cannot erase unrelated notes.
+        current = await self._async_request(
+            "GET",
+            f"/reservations/{reservation_id}",
+            params={"fields": "_id notes"},
+        )
+        if self._extract_reservation_id(current) != reservation_id:
+            raise GuestyApiError(
+                "Guesty returned an invalid reservation notes response"
+            )
+        notes = self._extract_reservation_notes(current)
+        notes["keyCode"] = key_code
+        data = await self._async_request(
+            "PUT",
+            f"/reservations-v3/{reservation_id}/notes",
+            json_body={"notes": notes},
+        )
+        if not (
+            self._extract_reservation_id(data) == reservation_id
+            and self._extract_reservation_key_code(data) == key_code
+        ):
+            # Some successful Guesty writes return only an acknowledgement.
+            # Verify the authoritative reservation with bounded retries because
+            # the read model can lag briefly behind the write endpoint.
+            await self._async_verify_reservation_key_code(
+                reservation_id,
+                key_code,
+            )
+
+    @classmethod
+    def _extract_reservation_notes(cls, data: Any) -> dict[str, Any]:
+        """Return a safe copy of mutable reservation notes from an API envelope."""
+        if not isinstance(data, dict):
+            return {}
+        notes = data.get("notes")
+        if isinstance(notes, dict):
+            allowed = {
+                "other",
+                "cleaning",
+                "guest",
+                "specialRequests",
+                "keyCode",
+                "doneBy",
+            }
+            return {key: value for key, value in notes.items() if key in allowed}
+        for key in ("data", "result", "reservation"):
+            extracted = cls._extract_reservation_notes(data.get(key))
+            if extracted:
+                return extracted
+        return {}
+
+    @classmethod
+    def _extract_reservation_key_code(cls, data: Any) -> str | None:
+        """Extract a Keycode from supported Guesty response envelopes."""
+        if not isinstance(data, dict):
+            return None
+        notes = data.get("notes")
+        if isinstance(notes, dict) and notes.get("keyCode") is not None:
+            return str(notes["keyCode"]).strip()
+        for key in ("data", "result", "reservation"):
+            value = cls._extract_reservation_key_code(data.get(key))
+            if value is not None:
+                return value
+        return None
+
+    @classmethod
+    def _extract_reservation_id(cls, data: Any) -> str | None:
+        """Extract a reservation ID from supported Guesty response envelopes."""
+        if not isinstance(data, dict):
+            return None
+        for key in ("reservationId", "_id", "id"):
+            value = data.get(key)
+            if is_safe_resource_id(value):
+                return value
+        for key in ("data", "result", "reservation"):
+            value = cls._extract_reservation_id(data.get(key))
+            if value is not None:
+                return value
+        return None
+
+    async def _async_verify_reservation_key_code(
+        self,
+        reservation_id: str,
+        expected_value: str,
+    ) -> None:
+        """Verify a Keycode write with bounded eventual-consistency retries."""
+        for attempt in range(3):
+            data = await self._async_request(
+                "GET",
+                f"/reservations/{reservation_id}",
+                params={"fields": "_id notes.keyCode"},
+            )
+            if (
+                self._extract_reservation_id(data) == reservation_id
+                and self._extract_reservation_key_code(data) == expected_value
+            ):
+                return
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
+        raise GuestyApiError("Guesty did not persist the reservation key code")
+
     async def async_resolve_custom_field(self, reference: str) -> str:
         """Resolve a Guesty custom field name, variable, or id."""
         value = reference.strip()
