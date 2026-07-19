@@ -12,6 +12,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.guesty import loxone
 from custom_components.guesty.api import (
     GuestyApiError,
+    GuestyKeyCodeReadError,
+    GuestyKeyCodeVerifyError,
+    GuestyKeyCodeWriteError,
     GuestyNotFoundError,
     GuestyPermissionError,
 )
@@ -47,6 +50,19 @@ from custom_components.guesty.models import GuestyListing, GuestyReservation
 
 NOW = datetime.fromisoformat("2026-07-14T12:00:00+00:00")
 FIELD_ID = "65fab102a5284d73c6206db0"
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (GuestyKeyCodeReadError("private"), "guesty_keycode_read_failed"),
+        (GuestyKeyCodeWriteError("private"), "guesty_keycode_write_failed"),
+        (GuestyKeyCodeVerifyError("private"), "guesty_keycode_verify_failed"),
+    ],
+)
+def test_keycode_api_stage_is_reported_safely(error, reason) -> None:
+    """Diagnostics distinguish the failed Keycode operation without API details."""
+    assert GuestyLoxoneManager._guesty_error_reason(error) == reason
 
 
 def _listing() -> GuestyListing:

@@ -21,6 +21,9 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyKeyCodeReadError,
+    GuestyKeyCodeVerifyError,
+    GuestyKeyCodeWriteError,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
@@ -629,6 +632,12 @@ class GuestyLoxoneManager:
             return "guesty_authentication_failed"
         if isinstance(error, GuestyPermissionError):
             return "guesty_permission_denied"
+        if isinstance(error, GuestyKeyCodeReadError):
+            return "guesty_keycode_read_failed"
+        if isinstance(error, GuestyKeyCodeWriteError):
+            return "guesty_keycode_write_failed"
+        if isinstance(error, GuestyKeyCodeVerifyError):
+            return "guesty_keycode_verify_failed"
         if isinstance(error, GuestyNotFoundError):
             return "guesty_reservation_not_found"
         if isinstance(error, GuestyRetryableError):
