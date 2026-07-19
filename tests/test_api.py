@@ -439,21 +439,92 @@ async def test_reservation_keycode_labels_v3_read_failure(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_reservation_keycode_labels_v3_write_failure(monkeypatch) -> None:
-    """A missing v3 notes route is reported as a write failure."""
+    """A missing v3 and legacy notes route is reported as a write failure."""
     client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [{"_id": "reservation-1", "notes": {}}],
+            GuestyNotFoundError("v3 not found"),
+            GuestyNotFoundError("legacy not found"),
+        ]
+    )
     monkeypatch.setattr(
         client,
         "_async_request",
-        AsyncMock(
-            side_effect=[
-                [{"_id": "reservation-1", "notes": {}}],
-                GuestyNotFoundError("not found"),
-            ]
-        ),
+        request,
     )
 
-    with pytest.raises(GuestyKeyCodeWriteError, match="rejected"):
+    with pytest.raises(GuestyKeyCodeWriteError, match="fallback"):
         await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    assert request.await_args_list[-1] == call(
+        "PUT",
+        "/reservations/reservation-1",
+        json_body={"notes": {"keyCode": "712345"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_falls_back_on_v3_not_found(monkeypatch) -> None:
+    """An account-specific v3 404 uses the general reservation updater."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": "reservation-1",
+                    "notes": {"guest": "Keep this private note"},
+                }
+            ],
+            GuestyNotFoundError("v3 route unavailable"),
+            {"_id": "reservation-1", "notes": {"keyCode": "712345"}},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    assert request.await_args_list == [
+        call(
+            "GET",
+            "/reservations-v3",
+            params={"reservationIds[]": "reservation-1"},
+        ),
+        call(
+            "PUT",
+            "/reservations-v3/reservation-1/notes",
+            json_body={
+                "notes": {"guest": "Keep this private note", "keyCode": "712345"}
+            },
+        ),
+        call(
+            "PUT",
+            "/reservations/reservation-1",
+            json_body={
+                "notes": {"guest": "Keep this private note", "keyCode": "712345"}
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_does_not_bypass_permission_failure(
+    monkeypatch,
+) -> None:
+    """The compatibility fallback cannot bypass a Guesty permission failure."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [{"_id": "reservation-1", "notes": {}}],
+            GuestyPermissionError("forbidden"),
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyPermissionError, match="forbidden"):
+        await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    assert request.await_count == 2
 
 
 @pytest.mark.asyncio

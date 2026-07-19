@@ -235,6 +235,16 @@ class GuestyApiClient:
                 f"/reservations-v3/{reservation_id}/notes",
                 json_body={"notes": notes},
             )
+        except GuestyNotFoundError:
+            # Guesty exposes the v3 notes route in its public API, but some
+            # accounts return 404 for existing reservations. Fall back to the
+            # documented general reservation updater only for that exact
+            # response. Authentication, authorization, validation, and
+            # transient errors must retain their original handling.
+            data = await self._async_update_reservation_key_code_legacy(
+                reservation_id,
+                notes,
+            )
         except (GuestyAuthError, GuestyPermissionError, GuestyRetryableError):
             raise
         except GuestyApiError as err:
@@ -252,6 +262,25 @@ class GuestyApiClient:
                 reservation_id,
                 key_code,
             )
+
+    async def _async_update_reservation_key_code_legacy(
+        self,
+        reservation_id: str,
+        notes: dict[str, Any],
+    ) -> Any:
+        """Update merged notes through Guesty's general reservation route."""
+        try:
+            return await self._async_request(
+                "PUT",
+                f"/reservations/{reservation_id}",
+                json_body={"notes": notes},
+            )
+        except (GuestyAuthError, GuestyPermissionError, GuestyRetryableError):
+            raise
+        except GuestyApiError as err:
+            raise GuestyKeyCodeWriteError(
+                "Guesty rejected the reservation Keycode fallback update"
+            ) from err
 
     async def _async_get_reservation_v3_for_key_code(
         self,
