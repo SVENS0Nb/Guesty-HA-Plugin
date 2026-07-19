@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, call
 
 import aiohttp
 from homeassistant.util import dt as dt_util
@@ -261,6 +261,129 @@ async def test_deleted_reservation_returns_none(monkeypatch) -> None:
     )
 
     assert await client.async_get_reservation("reservation-1") is None
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_preserves_other_notes(monkeypatch) -> None:
+    """Writing Keycode cannot erase unrelated Guesty reservation notes."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {
+                "_id": "reservation-1",
+                "notes": {
+                    "other": "Keep this",
+                    "cleaning": "Also keep this",
+                    "doneBy": "Guesty user",
+                    "unknownFutureProperty": "Do not echo unknown input",
+                },
+            },
+            {
+                "reservationId": "reservation-1",
+                "notes": {"keyCode": "712345"},
+            },
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    assert request.await_args_list == [
+        call(
+            "GET",
+            "/reservations/reservation-1",
+            params={"fields": "_id notes"},
+        ),
+        call(
+            "PUT",
+            "/reservations-v3/reservation-1/notes",
+            json_body={
+                "notes": {
+                    "other": "Keep this",
+                    "cleaning": "Also keep this",
+                    "doneBy": "Guesty user",
+                    "keyCode": "712345",
+                }
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_verification_retries_bounded_lag(
+    monkeypatch,
+) -> None:
+    """An acknowledgement-only response is verified despite brief read lag."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            {"_id": "reservation-1", "notes": {}},
+            {"reservationId": "reservation-1", "notes": {}},
+            {"_id": "reservation-1", "notes": {}},
+            {"_id": "reservation-1", "notes": {"keyCode": "712345"}},
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+    monkeypatch.setattr("custom_components.guesty.api.asyncio.sleep", sleep)
+
+    await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    assert request.await_count == 4
+    sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_requires_persistence_confirmation(
+    monkeypatch,
+) -> None:
+    """A misleading successful response cannot suppress future retries."""
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_async_request",
+        AsyncMock(
+            side_effect=[
+                {"_id": "reservation-1", "notes": {}},
+                {"reservationId": "reservation-1", "notes": {}},
+                {"_id": "reservation-1", "notes": {}},
+                {"_id": "reservation-1", "notes": {}},
+                {"_id": "reservation-1", "notes": {}},
+            ]
+        ),
+    )
+    monkeypatch.setattr("custom_components.guesty.api.asyncio.sleep", AsyncMock())
+
+    with pytest.raises(GuestyApiError, match="did not persist"):
+        await client.async_update_reservation_key_code("reservation-1", "712345")
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_rejects_invalid_value(monkeypatch) -> None:
+    """Only six numeric digits can reach Guesty's Keycode endpoint."""
+    client = _client()
+    request = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(ValueError, match="six digits"):
+        await client.async_update_reservation_key_code("reservation-1", "12A456")
+
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reservation_keycode_rejects_mismatched_read(monkeypatch) -> None:
+    """A malformed preflight response cannot overwrite another note object."""
+    client = _client()
+    request = AsyncMock(
+        return_value={"_id": "reservation-2", "notes": {"guest": "Private"}}
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyApiError, match="invalid reservation notes"):
+        await client.async_update_reservation_key_code("reservation-1", "712345")
+
+    request.assert_awaited_once()
 
 
 @pytest.mark.asyncio
