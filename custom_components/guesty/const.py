@@ -69,6 +69,22 @@ CONF_LOXONE_SERVER_USERNAME: Final = "username"
 CONF_LOXONE_SERVER_PASSWORD: Final = "password"
 CONF_LOXONE_SERVER_GROUPS: Final = "groups"
 CONF_LOXONE_GROUP_UUIDS: Final = "group_uuids"
+CONF_TTLOCK_ENABLED: Final = "ttlock_enabled"
+CONF_TTLOCK_ACCOUNT: Final = "ttlock_account"
+CONF_TTLOCK_REGION: Final = "region"
+CONF_TTLOCK_CLIENT_ID: Final = "client_id"
+CONF_TTLOCK_CLIENT_SECRET: Final = "client_secret"
+CONF_TTLOCK_USERNAME: Final = "username"
+CONF_TTLOCK_ACCESS_TOKEN: Final = "access_token"
+CONF_TTLOCK_REFRESH_TOKEN: Final = "refresh_token"
+CONF_TTLOCK_TOKEN_EXPIRES_AT: Final = "token_expires_at"
+CONF_TTLOCK_LOCKS: Final = "ttlock_locks"
+CONF_TTLOCK_LOCK_ID: Final = "lock_id"
+CONF_TTLOCK_LOCK_NAME: Final = "name"
+CONF_TTLOCK_LISTINGS: Final = "ttlock_listings"
+CONF_TTLOCK_LISTING_MAPPINGS: Final = "ttlock_listing_mappings"
+CONF_TTLOCK_LOCK_IDS: Final = "lock_ids"
+CONF_TTLOCK_PROVISION_LEAD_MINUTES: Final = "ttlock_provision_lead_minutes"
 CONF_WEBHOOK_ID: Final = "webhook_id"
 CONF_GUESTY_WEBHOOK_ID: Final = "guesty_webhook_id"
 CONF_GUESTY_WEBHOOK_SECRET: Final = "guesty_webhook_secret"
@@ -90,6 +106,9 @@ DEFAULT_LOXONE_ENABLED: Final = False
 DEFAULT_LOXONE_CUSTOM_FIELD: Final = "{{door_code}}"
 DEFAULT_LOXONE_PROVISION_LEAD_MINUTES: Final = 360
 DEFAULT_LOXONE_CODE_PREFIX: Final = "7"
+DEFAULT_TTLOCK_ENABLED: Final = False
+DEFAULT_TTLOCK_REGION: Final = "eu"
+DEFAULT_TTLOCK_PROVISION_LEAD_MINUTES: Final = 360
 
 # Use a quicker listing fallback only while push updates are unavailable.
 WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL: Final = 900
@@ -196,11 +215,26 @@ LOXONE_USER_STATE_TIMESPAN: Final = 4
 LOXONE_EXPIRATION_ACTION_DELETE: Final = 1
 LOXONE_EPOCH: Final = "2009-01-01T00:00:00+00:00"
 
+TTLOCK_STORAGE_VERSION: Final = 1
+TTLOCK_MAX_LOCKS_PER_LISTING: Final = 6
+TTLOCK_RETRY_BASE_SECONDS: Final = 300
+TTLOCK_RETRY_MAX_SECONDS: Final = 3600
+TTLOCK_REQUEST_TIMEOUT: Final = 20.0
+TTLOCK_MAX_RESPONSE_BYTES: Final = 1024 * 1024
+TTLOCK_MAX_RETRIES: Final = 2
+TTLOCK_TOKEN_REFRESH_MARGIN_SECONDS: Final = 3600
+TTLOCK_API_BASE_URLS: Final = {
+    "eu": "https://euapi.ttlock.com",
+    "global": "https://api.ttlock.com",
+    "legacy": "https://api.sciener.com",
+}
+
 SENSOR_OCCUPANCY: Final = "occupancy"
 SENSOR_CURRENT_GUEST: Final = "current_guest"
 SENSOR_ACCESS_LINK: Final = "access_link"
 SENSOR_GUESTY_KEYCODE_STATUS: Final = "guesty_keycode_status"
 SENSOR_LOXONE_PIN_STATUS: Final = "loxone_pin_status"
+SENSOR_TTLOCK_PIN_STATUS: Final = "ttlock_pin_status"
 SENSOR_SYNC_STATUS: Final = "sync_status"
 
 SYNC_STATUS_OK: Final = "ok"

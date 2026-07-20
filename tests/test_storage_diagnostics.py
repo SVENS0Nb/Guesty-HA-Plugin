@@ -25,6 +25,9 @@ from custom_components.guesty.const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_TTLOCK_ACCOUNT,
+    CONF_TTLOCK_LISTING_MAPPINGS,
+    CONF_TTLOCK_LOCKS,
     DOMAIN,
 )
 from custom_components.guesty.diagnostics import async_get_config_entry_diagnostics
@@ -104,6 +107,16 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
                     CONF_LOXONE_GROUP_UUIDS: ["private-group-id"],
                 }
             },
+            CONF_TTLOCK_ACCOUNT: {
+                "region": "eu",
+                "client_id": "private-ttlock-client",
+                "client_secret": "private-ttlock-secret",
+                "username": "private-ttlock-user",
+                "access_token": "private-ttlock-access",
+                "refresh_token": "private-ttlock-refresh",
+            },
+            CONF_TTLOCK_LOCKS: [{"lock_id": 12345, "name": "Private TTLock"}],
+            CONF_TTLOCK_LISTING_MAPPINGS: {"private-listing-id": {"lock_ids": [12345]}},
         },
     )
     entry.add_to_hass(hass)
@@ -153,6 +166,13 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
                 "conflicts": 0,
             }
         ),
+        ttlock_manager=SimpleNamespace(
+            diagnostics=lambda: {
+                "enabled": True,
+                "configured_locks": 1,
+                "mapped_listings": 1,
+            }
+        ),
     )
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
@@ -171,7 +191,10 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "private-loxone" not in serialized
     assert "private-server-id" not in serialized
     assert "private-group-id" not in serialized
+    assert "private-ttlock" not in serialized
+    assert "12345" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1
     assert diagnostics["guest_access"]["eligible_reservations"] == 1
     assert diagnostics["guest_access"]["verified_records"] == 1
     assert diagnostics["loxone_pin_access"]["configured_miniservers"] == 1
+    assert diagnostics["ttlock_pin_access"]["configured_locks"] == 1

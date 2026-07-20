@@ -33,6 +33,7 @@ from .loxone_api import (
     loxone_server_id,
     normalize_loxone_url,
 )
+from .ttlock_api import TTLockApiClient, TTLockApiError, TTLockAuthError
 from .const import (
     ACCESS_MAX_LOCKS,
     CONF_ACCESS_TOKEN,
@@ -62,6 +63,22 @@ from .const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_TTLOCK_ACCESS_TOKEN,
+    CONF_TTLOCK_ACCOUNT,
+    CONF_TTLOCK_CLIENT_ID,
+    CONF_TTLOCK_CLIENT_SECRET,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_LISTING_MAPPINGS,
+    CONF_TTLOCK_LISTINGS,
+    CONF_TTLOCK_LOCK_ID,
+    CONF_TTLOCK_LOCK_IDS,
+    CONF_TTLOCK_LOCK_NAME,
+    CONF_TTLOCK_LOCKS,
+    CONF_TTLOCK_PROVISION_LEAD_MINUTES,
+    CONF_TTLOCK_REFRESH_TOKEN,
+    CONF_TTLOCK_REGION,
+    CONF_TTLOCK_TOKEN_EXPIRES_AT,
+    CONF_TTLOCK_USERNAME,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_STALE_THRESHOLD_HOURS,
@@ -78,6 +95,9 @@ from .const import (
     DEFAULT_LOXONE_CUSTOM_FIELD,
     DEFAULT_LOXONE_ENABLED,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
+    DEFAULT_TTLOCK_ENABLED,
+    DEFAULT_TTLOCK_PROVISION_LEAD_MINUTES,
+    DEFAULT_TTLOCK_REGION,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
     DEFAULT_SCAN_INTERVAL,
@@ -85,11 +105,16 @@ from .const import (
     DOMAIN,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
+    TTLOCK_API_BASE_URLS,
+    TTLOCK_MAX_LOCKS_PER_LISTING,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 CONF_LOXONE_SERVER_COUNT = "loxone_server_count"
+CONF_TTLOCK_PASSWORD = "ttlock_password"
+TTLOCK_OPEN_PLATFORM_URL = "https://euopen.ttlock.com/"
+TTLOCK_OAUTH_DOC_URL = "https://euopen.ttlock.com/doc/oauth2"
 
 
 def _lock_entity_field(position: int) -> str:
@@ -165,6 +190,7 @@ OPTIONS_SCHEMA = vol.Schema(
         ): bool,
         vol.Optional(CONF_ACCESS_ENABLED, default=DEFAULT_ACCESS_ENABLED): bool,
         vol.Optional(CONF_LOXONE_ENABLED, default=DEFAULT_LOXONE_ENABLED): bool,
+        vol.Optional(CONF_TTLOCK_ENABLED, default=DEFAULT_TTLOCK_ENABLED): bool,
     }
 )
 
@@ -244,6 +270,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_EXPOSE_GUEST_DETAILS: DEFAULT_EXPOSE_GUEST_DETAILS,
                         CONF_ACCESS_ENABLED: DEFAULT_ACCESS_ENABLED,
                         CONF_LOXONE_ENABLED: DEFAULT_LOXONE_ENABLED,
+                        CONF_TTLOCK_ENABLED: DEFAULT_TTLOCK_ENABLED,
                     },
                 )
 
@@ -308,6 +335,10 @@ class GuestyOptionsFlow(OptionsFlow):
     _pending_loxone_mappings: dict[str, dict[str, Any]]
     _loxone_server_queue: list[int]
     _loxone_listing_queue: list[str]
+    _pending_ttlock_account: dict[str, Any]
+    _pending_ttlock_locks: list[dict[str, Any]]
+    _pending_ttlock_mappings: dict[str, dict[str, list[int]]]
+    _ttlock_listing_queue: list[str]
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -319,6 +350,8 @@ class GuestyOptionsFlow(OptionsFlow):
                 return await self.async_step_access()
             if user_input.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED):
                 return await self.async_step_loxone()
+            if user_input.get(CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED):
+                return await self.async_step_ttlock()
             return self.async_create_entry(title="", data=self._pending_options)
 
         options = self.config_entry.options
@@ -351,6 +384,9 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                     CONF_LOXONE_ENABLED: options.get(
                         CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED
+                    ),
+                    CONF_TTLOCK_ENABLED: options.get(
+                        CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED
                     ),
                 },
             ),
@@ -539,6 +575,10 @@ class GuestyOptionsFlow(OptionsFlow):
                     CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED
                 ):
                     return await self.async_step_loxone()
+                if self._pending_options.get(
+                    CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED
+                ):
+                    return await self.async_step_ttlock()
                 return self.async_create_entry(title="", data=self._pending_options)
 
         current = self.config_entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
@@ -876,6 +916,10 @@ class GuestyOptionsFlow(OptionsFlow):
                 self._pending_options[CONF_LOXONE_LISTING_MAPPINGS] = (
                     self._pending_loxone_mappings
                 )
+                if self._pending_options.get(
+                    CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED
+                ):
+                    return await self.async_step_ttlock()
                 return self.async_create_entry(title="", data=self._pending_options)
 
         current = self.config_entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
@@ -902,6 +946,397 @@ class GuestyOptionsFlow(OptionsFlow):
             step_id="loxone_listing",
             data_schema=self.add_suggested_values_to_schema(
                 schema, {CONF_LOXONE_GROUP_UUIDS: selected_values}
+            ),
+            errors=errors,
+            description_placeholders={"listing": listing.display_name},
+        )
+
+    async def async_step_ttlock(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure and validate one TTLock Open Platform account."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        listings = coordinator.data.listings if coordinator.data else {}
+        if not listings:
+            return self.async_abort(reason="no_listings")
+        listing_choices = [
+            selector.SelectOptionDict(value=listing_id, label=listing.display_name)
+            for listing_id, listing in sorted(
+                listings.items(), key=lambda item: item[1].display_name.lower()
+            )
+        ]
+        existing_account = self.config_entry.options.get(CONF_TTLOCK_ACCOUNT, {})
+        if not isinstance(existing_account, dict):
+            existing_account = {}
+        ttlock_manager = getattr(self.config_entry.runtime_data, "ttlock_manager", None)
+        if ttlock_manager is not None:
+            existing_account = ttlock_manager.account_for_reconfigure()
+        errors: dict[str, str] = {}
+        loxone_configured = bool(
+            self._pending_options.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED)
+        )
+        access_times_configured = loxone_configured or bool(
+            self._pending_options.get(CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED)
+        )
+
+        if user_input is not None:
+            selected = user_input.get(CONF_TTLOCK_LISTINGS)
+            prefix = str(
+                user_input.get(CONF_LOXONE_CODE_PREFIX)
+                or self._pending_options.get(CONF_LOXONE_CODE_PREFIX)
+                or self.config_entry.options.get(CONF_LOXONE_CODE_PREFIX)
+                or DEFAULT_LOXONE_CODE_PREFIX
+            ).strip()
+            custom_field = str(
+                user_input.get(CONF_LOXONE_CUSTOM_FIELD)
+                or self._pending_options.get(CONF_LOXONE_CUSTOM_FIELD)
+                or self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
+                or DEFAULT_LOXONE_CUSTOM_FIELD
+            ).strip()
+            early_minutes = int(
+                user_input.get(
+                    CONF_ACCESS_EARLY_MINUTES,
+                    self._pending_options.get(
+                        CONF_ACCESS_EARLY_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                        ),
+                    ),
+                )
+            )
+            late_minutes = int(
+                user_input.get(
+                    CONF_ACCESS_LATE_MINUTES,
+                    self._pending_options.get(
+                        CONF_ACCESS_LATE_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                        ),
+                    ),
+                )
+            )
+            region = str(user_input.get(CONF_TTLOCK_REGION, "")).strip()
+            client_id = str(user_input.get(CONF_TTLOCK_CLIENT_ID, "")).strip()
+            username = str(user_input.get(CONF_TTLOCK_USERNAME, "")).strip()
+            client_secret = str(user_input.get(CONF_TTLOCK_CLIENT_SECRET, "")).strip()
+            password = str(user_input.get(CONF_TTLOCK_PASSWORD, ""))
+            same_identity = (
+                region == existing_account.get(CONF_TTLOCK_REGION)
+                and client_id == existing_account.get(CONF_TTLOCK_CLIENT_ID)
+                and username == existing_account.get(CONF_TTLOCK_USERNAME)
+            )
+            stored_client_secret = str(
+                existing_account.get(CONF_TTLOCK_CLIENT_SECRET, "")
+            )
+            if not client_secret and same_identity:
+                client_secret = stored_client_secret
+            credentials_unchanged = (
+                same_identity and client_secret == stored_client_secret
+            )
+
+            if not isinstance(selected, list) or not selected:
+                errors["base"] = "select_listing"
+            elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
+                errors["base"] = "invalid_code_prefix"
+            elif not custom_field:
+                errors["base"] = "custom_field_not_found"
+            elif region not in TTLOCK_API_BASE_URLS:
+                errors["base"] = "ttlock_invalid_region"
+            elif not client_id or not client_secret or not username:
+                errors["base"] = "ttlock_invalid_auth"
+            else:
+                try:
+                    await self.config_entry.runtime_data.client.async_resolve_custom_field(
+                        custom_field
+                    )
+                    client = TTLockApiClient.from_hass(
+                        self.hass,
+                        region=region,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        username=username,
+                        access_token=(
+                            str(existing_account.get(CONF_TTLOCK_ACCESS_TOKEN, ""))
+                            if same_identity
+                            else ""
+                        ),
+                        refresh_token=(
+                            str(existing_account.get(CONF_TTLOCK_REFRESH_TOKEN, ""))
+                            if same_identity
+                            else ""
+                        ),
+                        token_expires_at=(
+                            str(existing_account.get(CONF_TTLOCK_TOKEN_EXPIRES_AT, ""))
+                            if same_identity
+                            else ""
+                        ),
+                    )
+                    if password:
+                        await client.async_authenticate(username, password)
+                    elif not same_identity:
+                        raise TTLockAuthError("TTLock password is required")
+                    elif not credentials_unchanged:
+                        # Existing access tokens can make a mistyped replacement
+                        # secret appear valid. Force a refresh with the new
+                        # secret before it is saved.
+                        await client.async_refresh_access_token()
+                    locks = await client.async_list_locks()
+                except (GuestyApiError, GuestyAuthError):
+                    errors["base"] = "custom_field_not_found"
+                except TTLockAuthError:
+                    errors["base"] = "ttlock_invalid_auth"
+                except (TTLockApiError, ValueError, KeyError):
+                    errors["base"] = "ttlock_cannot_connect"
+                else:
+                    compatible: list[dict[str, Any]] = []
+                    for item in locks:
+                        try:
+                            lock_id = int(item.get("lockId"))
+                            password_version = int(item.get("keyboardPwdVersion", 0))
+                            has_gateway = int(item.get("hasGateway", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if password_version != 4 or has_gateway != 1:
+                            continue
+                        name = str(
+                            item.get("lockAlias") or item.get("lockName") or lock_id
+                        ).strip()[:120]
+                        compatible.append(
+                            {
+                                CONF_TTLOCK_LOCK_ID: lock_id,
+                                CONF_TTLOCK_LOCK_NAME: name,
+                            }
+                        )
+                    if not compatible:
+                        errors["base"] = "ttlock_no_compatible_locks"
+                    else:
+                        selected_ids = list(
+                            dict.fromkeys(item for item in selected if item in listings)
+                        )
+                        if not selected_ids:
+                            errors["base"] = "select_listing"
+                        else:
+                            self._pending_options.update(
+                                {
+                                    CONF_LOXONE_CUSTOM_FIELD: custom_field,
+                                    CONF_LOXONE_CODE_PREFIX: prefix,
+                                    CONF_ACCESS_EARLY_MINUTES: early_minutes,
+                                    CONF_ACCESS_LATE_MINUTES: late_minutes,
+                                    CONF_TTLOCK_PROVISION_LEAD_MINUTES: int(
+                                        user_input[CONF_TTLOCK_PROVISION_LEAD_MINUTES]
+                                    ),
+                                }
+                            )
+                            self._pending_ttlock_account = {
+                                CONF_TTLOCK_REGION: region,
+                                CONF_TTLOCK_CLIENT_ID: client_id,
+                                CONF_TTLOCK_CLIENT_SECRET: client_secret,
+                                CONF_TTLOCK_USERNAME: username,
+                                **client.token_snapshot(),
+                            }
+                            self._pending_ttlock_locks = compatible
+                            self._pending_ttlock_mappings = {}
+                            self._ttlock_listing_queue = selected_ids
+                            return await self.async_step_ttlock_listing()
+
+        current_mappings = self.config_entry.options.get(
+            CONF_TTLOCK_LISTING_MAPPINGS, {}
+        )
+        selected_listings = (
+            [listing_id for listing_id in current_mappings if listing_id in listings]
+            if isinstance(current_mappings, dict)
+            else []
+        )
+        region_options = [
+            selector.SelectOptionDict(
+                value="eu", label="EU / Europe (euapi.ttlock.com)"
+            ),
+            selector.SelectOptionDict(value="global", label="Global (api.ttlock.com)"),
+            selector.SelectOptionDict(
+                value="legacy", label="Legacy / Sciener (api.sciener.com)"
+            ),
+        ]
+        password_selector = selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+        )
+        schema_fields: dict[Any, Any] = {
+            vol.Required(CONF_TTLOCK_REGION): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=region_options,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required(CONF_TTLOCK_CLIENT_ID): vol.All(
+                str, vol.Length(min=1, max=256)
+            ),
+            vol.Optional(CONF_TTLOCK_CLIENT_SECRET): password_selector,
+            vol.Required(CONF_TTLOCK_USERNAME): vol.All(
+                str, vol.Length(min=1, max=256)
+            ),
+            vol.Optional(CONF_TTLOCK_PASSWORD): password_selector,
+            vol.Required(CONF_TTLOCK_LISTINGS): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=listing_choices,
+                    multiple=True,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required(CONF_TTLOCK_PROVISION_LEAD_MINUTES): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=10080)
+            ),
+        }
+        if not loxone_configured:
+            schema_fields.update(
+                {
+                    vol.Required(CONF_LOXONE_CUSTOM_FIELD): vol.All(
+                        str, vol.Length(min=1, max=128)
+                    ),
+                    vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
+                        str, vol.Length(min=1, max=2)
+                    ),
+                }
+            )
+        if not access_times_configured:
+            schema_fields.update(
+                {
+                    vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
+                        vol.Coerce(int), vol.Range(min=0, max=180)
+                    ),
+                    vol.Required(CONF_ACCESS_LATE_MINUTES): vol.All(
+                        vol.Coerce(int), vol.Range(min=0, max=180)
+                    ),
+                }
+            )
+        schema = vol.Schema(schema_fields)
+        return self.async_show_form(
+            step_id="ttlock",
+            data_schema=self.add_suggested_values_to_schema(
+                schema,
+                {
+                    CONF_LOXONE_CUSTOM_FIELD: (
+                        self._pending_options.get(CONF_LOXONE_CUSTOM_FIELD)
+                        or self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
+                        or DEFAULT_LOXONE_CUSTOM_FIELD
+                    ),
+                    CONF_LOXONE_CODE_PREFIX: self._pending_options.get(
+                        CONF_LOXONE_CODE_PREFIX,
+                        self.config_entry.options.get(
+                            CONF_LOXONE_CODE_PREFIX, DEFAULT_LOXONE_CODE_PREFIX
+                        ),
+                    ),
+                    CONF_ACCESS_EARLY_MINUTES: self._pending_options.get(
+                        CONF_ACCESS_EARLY_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_EARLY_MINUTES, DEFAULT_ACCESS_EARLY_MINUTES
+                        ),
+                    ),
+                    CONF_ACCESS_LATE_MINUTES: self._pending_options.get(
+                        CONF_ACCESS_LATE_MINUTES,
+                        self.config_entry.options.get(
+                            CONF_ACCESS_LATE_MINUTES, DEFAULT_ACCESS_LATE_MINUTES
+                        ),
+                    ),
+                    CONF_TTLOCK_PROVISION_LEAD_MINUTES: self.config_entry.options.get(
+                        CONF_TTLOCK_PROVISION_LEAD_MINUTES,
+                        DEFAULT_TTLOCK_PROVISION_LEAD_MINUTES,
+                    ),
+                    CONF_TTLOCK_REGION: existing_account.get(
+                        CONF_TTLOCK_REGION, DEFAULT_TTLOCK_REGION
+                    ),
+                    CONF_TTLOCK_CLIENT_ID: existing_account.get(
+                        CONF_TTLOCK_CLIENT_ID, ""
+                    ),
+                    CONF_TTLOCK_CLIENT_SECRET: "",
+                    CONF_TTLOCK_USERNAME: existing_account.get(
+                        CONF_TTLOCK_USERNAME, ""
+                    ),
+                    CONF_TTLOCK_PASSWORD: "",
+                    CONF_TTLOCK_LISTINGS: selected_listings,
+                },
+            ),
+            errors=errors,
+            description_placeholders={
+                "open_platform_url": TTLOCK_OPEN_PLATFORM_URL,
+                "oauth_doc_url": TTLOCK_OAUTH_DOC_URL,
+            },
+        )
+
+    async def async_step_ttlock_listing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Assign one to six compatible TTLock locks to one listing."""
+        listing_id = self._ttlock_listing_queue[0]
+        listing = self.config_entry.runtime_data.coordinator.data.listings[listing_id]
+        choices = [
+            selector.SelectOptionDict(
+                value=str(item[CONF_TTLOCK_LOCK_ID]),
+                label=str(item[CONF_TTLOCK_LOCK_NAME]),
+            )
+            for item in self._pending_ttlock_locks
+        ]
+        valid_ids = {
+            int(item[CONF_TTLOCK_LOCK_ID]) for item in self._pending_ttlock_locks
+        }
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            selected = user_input.get(CONF_TTLOCK_LOCK_IDS)
+            parsed: list[int] = []
+            if isinstance(selected, list):
+                for value in selected:
+                    try:
+                        lock_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if lock_id in valid_ids and lock_id not in parsed:
+                        parsed.append(lock_id)
+            if not parsed:
+                errors["base"] = "select_ttlock_lock"
+            elif len(parsed) > TTLOCK_MAX_LOCKS_PER_LISTING:
+                errors["base"] = "too_many_ttlock_locks"
+            else:
+                self._pending_ttlock_mappings[listing_id] = {
+                    CONF_TTLOCK_LOCK_IDS: parsed
+                }
+                self._ttlock_listing_queue.pop(0)
+                if self._ttlock_listing_queue:
+                    return await self.async_step_ttlock_listing()
+                self._pending_options[CONF_TTLOCK_ACCOUNT] = (
+                    self._pending_ttlock_account
+                )
+                self._pending_options[CONF_TTLOCK_LOCKS] = self._pending_ttlock_locks
+                self._pending_options[CONF_TTLOCK_LISTING_MAPPINGS] = (
+                    self._pending_ttlock_mappings
+                )
+                return self.async_create_entry(title="", data=self._pending_options)
+
+        current = self.config_entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
+        existing = current.get(listing_id, {}) if isinstance(current, dict) else {}
+        raw_selected = (
+            existing.get(CONF_TTLOCK_LOCK_IDS, [])
+            if isinstance(existing, dict)
+            else existing
+        )
+        if not isinstance(raw_selected, list):
+            raw_selected = []
+        valid_choice_values = {item["value"] for item in choices}
+        selected_values = [
+            str(value) for value in raw_selected if str(value) in valid_choice_values
+        ]
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_TTLOCK_LOCK_IDS): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=choices,
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
+            }
+        )
+        return self.async_show_form(
+            step_id="ttlock_listing",
+            data_schema=self.add_suggested_values_to_schema(
+                schema, {CONF_TTLOCK_LOCK_IDS: selected_values}
             ),
             errors=errors,
             description_placeholders={"listing": listing.display_name},

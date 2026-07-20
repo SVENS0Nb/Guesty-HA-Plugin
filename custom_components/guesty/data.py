@@ -14,6 +14,7 @@ from .scheduler import GuestyTransitionScheduler
 if TYPE_CHECKING:
     from .access import GuestyAccessManager
     from .loxone import GuestyLoxoneManager
+    from .ttlock import GuestyTTLockManager
 
 
 @dataclass(slots=True)
@@ -25,6 +26,7 @@ class GuestyRuntimeData:
     scheduler: GuestyTransitionScheduler
     access_manager: GuestyAccessManager
     loxone_manager: GuestyLoxoneManager
+    ttlock_manager: GuestyTTLockManager | None
     sensor_listing_ids: set[str] = field(default_factory=set)
     calendar_listing_ids: set[str] = field(default_factory=set)
 

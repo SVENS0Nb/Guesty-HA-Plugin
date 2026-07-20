@@ -23,6 +23,7 @@ from .const import (
     SENSOR_LOXONE_PIN_STATUS,
     SENSOR_OCCUPANCY,
     SENSOR_SYNC_STATUS,
+    SENSOR_TTLOCK_PIN_STATUS,
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
@@ -47,29 +48,38 @@ def _add_listing_entities(
     if not new_ids:
         return
 
-    entities = [
-        entity
-        for listing_id in new_ids
-        for entity in (
-            GuestyOccupancySensor(coordinator, listing_id),
-            GuestyCurrentGuestSensor(coordinator, listing_id),
-            GuestyAccessLinkSensor(
-                coordinator,
-                entry.runtime_data.access_manager,
-                listing_id,
-            ),
-            GuestyKeycodeStatusSensor(
-                coordinator,
-                entry.runtime_data.loxone_manager,
-                listing_id,
-            ),
-            GuestyLoxonePinStatusSensor(
-                coordinator,
-                entry.runtime_data.loxone_manager,
-                listing_id,
-            ),
+    entities: list[SensorEntity] = []
+    ttlock_manager = getattr(entry.runtime_data, "ttlock_manager", None)
+    for listing_id in new_ids:
+        entities.extend(
+            (
+                GuestyOccupancySensor(coordinator, listing_id),
+                GuestyCurrentGuestSensor(coordinator, listing_id),
+                GuestyAccessLinkSensor(
+                    coordinator,
+                    entry.runtime_data.access_manager,
+                    listing_id,
+                ),
+                GuestyKeycodeStatusSensor(
+                    coordinator,
+                    entry.runtime_data.loxone_manager,
+                    listing_id,
+                ),
+                GuestyLoxonePinStatusSensor(
+                    coordinator,
+                    entry.runtime_data.loxone_manager,
+                    listing_id,
+                ),
+            )
         )
-    ]
+        if ttlock_manager is not None:
+            entities.append(
+                GuestyTTLockPinStatusSensor(
+                    coordinator,
+                    ttlock_manager,
+                    listing_id,
+                )
+            )
     async_add_entities(entities)
     known_ids.update(new_ids)
 
@@ -493,6 +503,10 @@ class _GuestyLoxoneStatusSensor(
             "field_synced": snapshot.get("field_synced", False),
             "loxone_user_created": snapshot.get("loxone_user_created", False),
         }
+        for key in ("mapped_locks", "provisioned_locks"):
+            value = snapshot.get(key)
+            if isinstance(value, int):
+                attributes[key] = value
         reservation_status = snapshot.get("reservation_status")
         if isinstance(reservation_status, str):
             attributes["reservation_status"] = reservation_status
@@ -566,6 +580,27 @@ class GuestyLoxonePinStatusSensor(_GuestyLoxoneStatusSensor):
     _attr_translation_key = SENSOR_LOXONE_PIN_STATUS
     _status_key = "loxone_status"
     _unique_suffix = "loxone_pin_status"
+
+
+class GuestyTTLockPinStatusSensor(_GuestyLoxoneStatusSensor):
+    """Report whether the code is scheduled or provisioned in TTLock."""
+
+    _attr_options = [
+        "not_configured",
+        "no_reservation",
+        "scheduled",
+        "pending",
+        "partial",
+        "provisioned",
+        "cleanup_pending",
+        "gateway_offline",
+        "conflict",
+        "error",
+    ]
+    _attr_icon = "mdi:lock-smart"
+    _attr_translation_key = SENSOR_TTLOCK_PIN_STATUS
+    _status_key = "ttlock_status"
+    _unique_suffix = "ttlock_pin_status"
 
 
 class GuestySyncStatusSensor(

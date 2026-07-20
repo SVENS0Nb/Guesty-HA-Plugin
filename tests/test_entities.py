@@ -26,6 +26,7 @@ from custom_components.guesty.sensor import (
     GuestyCurrentGuestSensor,
     GuestyKeycodeStatusSensor,
     GuestyLoxonePinStatusSensor,
+    GuestyTTLockPinStatusSensor,
     GuestyOccupancySensor,
     _add_listing_entities as add_sensor_entities,
 )
@@ -306,6 +307,29 @@ def test_keycode_status_sensors_report_each_destination_without_secrets() -> Non
     }
     assert "code" not in guesty_entity.extra_state_attributes
     assert "guest_name" not in guesty_entity.extra_state_attributes
+
+
+def test_ttlock_status_sensor_reports_partial_delivery_without_pin() -> None:
+    """TTLock exposes per-lock progress but never the reservation PIN."""
+    coordinator = _coordinator()
+    manager = _loxone_manager(
+        {
+            "ttlock_status": "partial",
+            "mapped_locks": 3,
+            "provisioned_locks": 2,
+            "access_start": datetime(2026, 7, 13, 15, 0, tzinfo=TZ),
+            "access_end": datetime(2026, 7, 16, 11, 0, tzinfo=TZ),
+            "provision_at": datetime(2026, 7, 13, 9, 0, tzinfo=TZ),
+            "reservation_status": "confirmed",
+            "data_stale": False,
+        }
+    )
+    entity = GuestyTTLockPinStatusSensor(coordinator, manager, "listing-1")
+
+    assert entity.native_value == "partial"
+    assert entity.extra_state_attributes["mapped_locks"] == 3
+    assert entity.extra_state_attributes["provisioned_locks"] == 2
+    assert "code" not in entity.extra_state_attributes
 
 
 def test_new_listings_create_entities_once_during_runtime() -> None:

@@ -21,6 +21,10 @@ from .const import (
     CONF_LOXONE_LISTING_MAPPINGS,
     CONF_LOXONE_LISTINGS,
     CONF_LOXONE_MINISERVERS,
+    CONF_TTLOCK_ACCOUNT,
+    CONF_TTLOCK_LISTING_MAPPINGS,
+    CONF_TTLOCK_LISTINGS,
+    CONF_TTLOCK_LOCKS,
     CONF_WEBHOOK_ID,
 )
 from .data import GuestyConfigEntry
@@ -50,6 +54,10 @@ async def async_get_config_entry_diagnostics(
     options.pop(CONF_LOXONE_LISTING_MAPPINGS, None)
     options.pop(CONF_LOXONE_LISTINGS, None)
     options.pop(CONF_ACCESS_CUSTOM_FIELD, None)
+    options.pop(CONF_TTLOCK_ACCOUNT, None)
+    options.pop(CONF_TTLOCK_LISTING_MAPPINGS, None)
+    options.pop(CONF_TTLOCK_LISTINGS, None)
+    options.pop(CONF_TTLOCK_LOCKS, None)
     mapped_listings = len(mappings) if isinstance(mappings, dict) else 0
     mapped_locks = (
         sum(len(value) for value in mappings.values() if isinstance(value, list))
@@ -77,6 +85,9 @@ async def async_get_config_entry_diagnostics(
     loxone_manager = getattr(entry.runtime_data, "loxone_manager", None)
     if loxone_manager is not None:
         diagnostics["loxone_pin_access"] = loxone_manager.diagnostics()
+    ttlock_manager = getattr(entry.runtime_data, "ttlock_manager", None)
+    if ttlock_manager is not None:
+        diagnostics["ttlock_pin_access"] = ttlock_manager.diagnostics()
 
     if data:
         diagnostics["sync"] = {
