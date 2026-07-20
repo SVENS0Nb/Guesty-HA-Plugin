@@ -42,6 +42,8 @@ from .const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_ACCESS_EARLY_MINUTES,
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_EXPOSE_GUEST_DETAILS,
@@ -199,6 +201,29 @@ class GuestyLoxoneManager:
         raw = self.entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
         return raw if isinstance(raw, dict) else {}
 
+    @property
+    def _ttlock_mappings(self) -> dict[str, list[int]]:
+        """Return TTLock mappings used to select shared Guesty PIN bookings."""
+        raw = self.entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
+        return raw if isinstance(raw, dict) else {}
+
+    @property
+    def _pin_listing_ids(self) -> set[str]:
+        """Return listings served by at least one enabled PIN provider."""
+        listing_ids: set[str] = set()
+        if self.entry.options.get(CONF_LOXONE_ENABLED, False):
+            listing_ids.update(self._mappings)
+        if self.entry.options.get(CONF_TTLOCK_ENABLED, False):
+            listing_ids.update(self._ttlock_mappings)
+        return listing_ids
+
+    def _listing_uses_loxone(self, listing_id: str) -> bool:
+        """Return whether this listing retains the existing Loxone behavior."""
+        return bool(
+            self.entry.options.get(CONF_LOXONE_ENABLED, False)
+            and listing_id in self._mappings
+        )
+
     async def async_setup(self) -> None:
         """Load private state and start one reconciliation pass."""
         self._data = await self._storage.async_load()
@@ -280,12 +305,13 @@ class GuestyLoxoneManager:
             data_stale = data is None or bool(getattr(data, "data_stale", False))
 
             eligible: dict[str, GuestyReservation] = {}
-            if self.entry.options.get(CONF_LOXONE_ENABLED, False) and data is not None:
+            pin_listing_ids = self._pin_listing_ids
+            if pin_listing_ids and data is not None:
                 eligible = {
                     reservation.id: reservation
                     for reservation in data.reservations
                     if reservation.is_active_status()
-                    and reservation.listing_id in self._mappings
+                    and reservation.listing_id in pin_listing_ids
                     and reservation.listing_id in data.listings
                 }
 
@@ -318,8 +344,7 @@ class GuestyLoxoneManager:
                 )
                 if (
                     data_stale
-                    and self.entry.options.get(CONF_LOXONE_ENABLED, False)
-                    and listing_id in self._mappings
+                    and listing_id in pin_listing_ids
                     and not record.get("retired")
                     and (stored_end is None or stored_end > now)
                 ):
@@ -428,6 +453,27 @@ class GuestyLoxoneManager:
                 if record.get("conflict"):
                     errors.append(str(record.get("last_error") or "keycode_conflict"))
 
+                if not self._listing_uses_loxone(reservation.listing_id):
+                    # TTLock-only listings still use the exact same Guesty PIN
+                    # lifecycle. Remove a previously configured Loxone user,
+                    # then leave provider delivery to the TTLock manager.
+                    if record.get("user_uuid"):
+                        try:
+                            await self._async_delete_remote_user(record)
+                        except (LoxoneApiError, LoxoneAuthError) as err:
+                            self._record_retry_failure(record, "cleanup", now)
+                            retry_at = self._retry_at(record, "cleanup")
+                            if retry_at:
+                                next_run = self._earlier(next_run, retry_at)
+                            errors.append(type(err).__name__)
+                        else:
+                            self._clear_retry(record, "cleanup")
+                    next_run = self._earlier(next_run, end)
+                    guesty_retry_at = self._retry_at(record, "guesty")
+                    if guesty_retry_at:
+                        next_run = self._earlier(next_run, guesty_retry_at)
+                    continue
+
                 mapping = self._mappings.get(reservation.listing_id, {})
                 server_id = mapping.get(CONF_LOXONE_SERVER_ID)
                 groups = mapping.get(CONF_LOXONE_GROUP_UUIDS)
@@ -482,6 +528,27 @@ class GuestyLoxoneManager:
                 )
                 provision_at = start - lead
                 if now < provision_at:
+                    # A reservation can be moved back outside the provisioning
+                    # lead after its user was already created. Keeping that user
+                    # would preserve the former validity window until the new
+                    # provisioning time and could grant access for a stay that
+                    # no longer exists. Remove only the remote delivery state;
+                    # the authoritative Guesty code remains stable for the later
+                    # recreation.
+                    if record.get("user_uuid"):
+                        cleanup_retry_at = self._retry_at(record, "cleanup")
+                        if cleanup_retry_at is None or cleanup_retry_at <= now:
+                            try:
+                                await self._async_delete_remote_user(record)
+                            except (LoxoneApiError, LoxoneAuthError) as err:
+                                self._record_retry_failure(record, "cleanup", now)
+                                record["last_error"] = type(err).__name__
+                                errors.append(type(err).__name__)
+                            else:
+                                self._clear_retry(record, "cleanup")
+                        cleanup_retry_at = self._retry_at(record, "cleanup")
+                        if cleanup_retry_at:
+                            next_run = self._earlier(next_run, cleanup_retry_at)
                     next_run = self._earlier(next_run, provision_at)
                 else:
                     if (
@@ -1116,6 +1183,7 @@ class GuestyLoxoneManager:
         if not isinstance(record, dict):
             return
         record.pop("code", None)
+        record.pop("external_rejected_codes", None)
         record["retired"] = True
         await self._storage.async_save(self._data)
         await self._async_delete_remote_user(record)
@@ -1191,6 +1259,18 @@ class GuestyLoxoneManager:
             for record in self._records.values()
             if isinstance(record, dict)
         }
+        for record in self._records.values():
+            rejected = (
+                record.get("external_rejected_codes", [])
+                if isinstance(record, dict)
+                else []
+            )
+            if isinstance(rejected, list):
+                existing.update(
+                    code
+                    for code in rejected
+                    if isinstance(code, str) and _CODE_PATTERN.fullmatch(code)
+                )
         data = self._coordinator.data
         if data is not None:
             existing.update(
@@ -1289,12 +1369,80 @@ class GuestyLoxoneManager:
         for listener in tuple(self._listeners):
             listener()
 
+    def reservation_pin_snapshot(self, reservation_id: str) -> dict[str, Any]:
+        """Return private PIN state to another in-process access provider."""
+        record = self._records.get(reservation_id)
+        if not isinstance(record, dict) or record.get("retired"):
+            return {}
+        return {
+            "code": record.get("code"),
+            "field_synced": bool(record.get("field_synced")),
+            "access_start": record.get("access_start"),
+            "access_end": record.get("access_end"),
+        }
+
+    def reservation_access_window(
+        self,
+        reservation: GuestyReservation,
+        listing: GuestyListing,
+    ) -> tuple[datetime, datetime]:
+        """Share the exact existing access-offset calculation with providers."""
+        return self._access_window(reservation, listing)
+
+    async def async_rotate_external_conflict(
+        self,
+        reservation_id: str,
+        rejected_code: str,
+    ) -> bool:
+        """Replace a PIN after another provider proves a remote collision."""
+        async with self._lock:
+            data = self._coordinator.data
+            record = self._records.get(reservation_id)
+            if data is None or not isinstance(record, dict):
+                return False
+            if record.get("code") != rejected_code or not record.get("field_synced"):
+                return False
+            reservation = next(
+                (
+                    item
+                    for item in data.reservations
+                    if item.id == reservation_id and item.is_active_status()
+                ),
+                None,
+            )
+            if reservation is None:
+                return False
+            field_id = record.get("field_id")
+            if not isinstance(field_id, str):
+                field_id = await self._async_custom_field_id()
+            rejected_codes = record.get("external_rejected_codes", [])
+            if not isinstance(rejected_codes, list):
+                rejected_codes = []
+            rejected_codes = [
+                code
+                for code in rejected_codes
+                if isinstance(code, str) and _CODE_PATTERN.fullmatch(code)
+            ]
+            if rejected_code not in rejected_codes:
+                rejected_codes.append(rejected_code)
+            record["external_rejected_codes"] = rejected_codes[-64:]
+            await self._async_rotate_duplicate_code(
+                reservation,
+                record,
+                dt_util.utcnow(),
+                field_id,
+                rejected_code=rejected_code,
+            )
+            await self._storage.async_save(self._data)
+        self.async_schedule_reconcile()
+        self._notify_listeners()
+        return True
+
     def listing_status_snapshot(self, listing_id: str) -> dict[str, Any]:
         """Return privacy-safe Guesty custom-field and Loxone PIN status."""
-        if (
-            not self.entry.options.get(CONF_LOXONE_ENABLED, False)
-            or listing_id not in self._mappings
-        ):
+        pin_configured = listing_id in self._pin_listing_ids
+        loxone_configured = self._listing_uses_loxone(listing_id)
+        if not pin_configured:
             return {
                 "guesty_status": "not_configured",
                 "loxone_status": "not_configured",
@@ -1341,7 +1489,11 @@ class GuestyLoxoneManager:
             return {
                 "guesty_status": "no_reservation",
                 "loxone_status": (
-                    "cleanup_pending" if listing_cleanup_pending else "no_reservation"
+                    "cleanup_pending"
+                    if loxone_configured and listing_cleanup_pending
+                    else "no_reservation"
+                    if loxone_configured
+                    else "not_configured"
                 ),
                 "data_stale": bool(getattr(data, "data_stale", False)),
             }
@@ -1395,7 +1547,13 @@ class GuestyLoxoneManager:
         record = self._records.get(reservation.id)
         snapshot: dict[str, Any] = {
             "guesty_status": "pending",
-            "loxone_status": "scheduled" if now < provision_at else "pending",
+            "loxone_status": (
+                "scheduled"
+                if loxone_configured and now < provision_at
+                else "pending"
+                if loxone_configured
+                else "not_configured"
+            ),
             "access_start": start,
             "access_end": end,
             "provision_at": provision_at,
@@ -1435,7 +1593,9 @@ class GuestyLoxoneManager:
 
         remote_ready = bool(record.get("user_uuid") and record.get("code_set"))
         snapshot["loxone_user_created"] = remote_ready
-        if listing_cleanup_pending or (
+        if not loxone_configured:
+            snapshot["loxone_status"] = "not_configured"
+        elif listing_cleanup_pending or (
             record.get("collision_cleanup_pending")
             or record.get("retired")
             or self._retry_at(record, "cleanup") is not None

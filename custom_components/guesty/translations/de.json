@@ -43,7 +43,8 @@
           "stale_threshold_hours": "Stale-Schwellenwert (Stunden)",
           "expose_guest_details": "Gastnamen und Bestätigungscodes in Entitäten anzeigen",
           "access_enabled": "Sicheren Gast-Türzugang aktivieren",
-          "loxone_enabled": "Reservierungs-PINs für Loxone aktivieren"
+          "loxone_enabled": "Reservierungs-PINs für Loxone aktivieren",
+          "ttlock_enabled": "Reservierungs-PINs für TTLock aktivieren"
         }
       },
       "access": {
@@ -123,6 +124,46 @@
         "data": {
           "group_uuids": "Miniserver und Benutzergruppen"
         }
+      },
+      "ttlock": {
+        "title": "TTLock Reservierungs-PINs",
+        "description": "Lege zuerst eine Anwendung in der [TTLock Open Platform]({open_platform_url}) an. Bei Bedarf hilft die [TTLock-OAuth-Anleitung]({oauth_doc_url}). Verwende anschließend das TTLock-App-Konto, das die Schlösser verwaltet – nicht den Login des Entwicklerportals. Angezeigt werden nur V4-Schlösser mit Online-Gateway.",
+        "data": {
+          "loxone_custom_field": "Guesty-Codefeld",
+          "loxone_code_prefix": "PIN-Präfix",
+          "access_early_minutes": "Zugang vor Check-in (Minuten)",
+          "access_late_minutes": "Zugang nach Check-out (Minuten)",
+          "ttlock_provision_lead_minutes": "TTLock-Vorlauf (Minuten)",
+          "region": "API-Region",
+          "client_id": "Client ID",
+          "client_secret": "Client Secret",
+          "username": "TTLock-App-Login",
+          "ttlock_password": "TTLock-App-Passwort",
+          "ttlock_listings": "Guesty-Listings"
+        },
+        "data_description": {
+          "loxone_custom_field": "Name, Variable oder ID des Guesty-Reservierungs-Custom-Fields, zum Beispiel door_code.",
+          "loxone_code_prefix": "Eine oder zwei führende Ziffern für automatisch erzeugte sechsstellige Codes, zum Beispiel 7.",
+          "access_early_minutes": "So viele Minuten vor dem Guesty-Check-in wird der Code gültig.",
+          "access_late_minutes": "So viele Minuten nach dem Guesty-Check-out bleibt der Code gültig.",
+          "ttlock_provision_lead_minutes": "So früh wird der Code an TTLock gesendet. Empfohlen sind 360 Minuten, damit entfernte Buchungen die Schlösser nicht füllen.",
+          "region": "Normalerweise EU / Europe. Die Region muss zur Open-Platform-Anwendung passen.",
+          "client_id": "Aus der angelegten TTLock-Open-Platform-Anwendung kopieren.",
+          "client_secret": "Aus derselben Anwendung kopieren. Bei späteren Änderungen leer lassen, um das gespeicherte Secret zu behalten.",
+          "username": "Login des TTLock-App-Kontos, das die Schlösser besitzt oder verwaltet.",
+          "ttlock_password": "Wird einmalig für OAuth verwendet und nicht gespeichert. Bei späteren Änderungen leer lassen.",
+          "ttlock_listings": "Nur ausgewählte Listings erhalten TTLock-Codes. Die Schlösser werden im nächsten Schritt zugeordnet."
+        }
+      },
+      "ttlock_listing": {
+        "title": "TTLock-Zugang für {listing}",
+        "description": "Wähle die Türen aus, die Gäste dieses Listings öffnen dürfen.",
+        "data": {
+          "lock_ids": "TTLock-Schlösser"
+        },
+        "data_description": {
+          "lock_ids": "Wähle ein bis sechs Schlösser. Alle erhalten denselben Reservierungs-PIN und Gültigkeitszeitraum."
+        }
       }
     },
     "error": {
@@ -135,7 +176,13 @@
       "loxone_cannot_connect": "Zu diesem Loxone-Miniserver konnte keine sichere Verbindung hergestellt werden",
       "duplicate_loxone_server": "Diese Miniserver-Verbindung wurde mehrfach konfiguriert",
       "select_loxone_group": "Wähle mindestens eine Loxone-Benutzergruppe",
-      "groups_from_one_server": "Alle Gruppen eines Listings müssen zum selben Miniserver gehören"
+      "groups_from_one_server": "Alle Gruppen eines Listings müssen zum selben Miniserver gehören",
+      "ttlock_invalid_region": "Wähle eine unterstützte TTLock-API-Region",
+      "ttlock_invalid_auth": "TTLock lehnt die Open-Platform-Anwendung oder das App-Konto ab",
+      "ttlock_cannot_connect": "Die TTLock Open Platform API ist nicht erreichbar",
+      "ttlock_no_compatible_locks": "Es wurde kein V4-Passcode-Schloss mit TTLock-Gateway gefunden",
+      "select_ttlock_lock": "Wähle mindestens ein TTLock-Schloss",
+      "too_many_ttlock_locks": "Wähle höchstens sechs TTLock-Schlösser pro Listing"
     },
     "abort": {
       "no_listings": "Derzeit sind keine Guesty-Listings verfügbar"
@@ -183,6 +230,21 @@
           "pending": "Ausstehend",
           "provisioned": "Bereitgestellt",
           "cleanup_pending": "Löschung ausstehend",
+          "conflict": "Konflikt",
+          "error": "Fehler"
+        }
+      },
+      "ttlock_pin_status": {
+        "name": "TTLock-PIN-Status",
+        "state": {
+          "not_configured": "Nicht konfiguriert",
+          "no_reservation": "Keine Reservierung",
+          "scheduled": "Geplant",
+          "pending": "Ausstehend",
+          "partial": "Teilweise synchronisiert",
+          "provisioned": "Bereitgestellt",
+          "cleanup_pending": "Löschung ausstehend",
+          "gateway_offline": "Gateway offline",
           "conflict": "Konflikt",
           "error": "Fehler"
         }

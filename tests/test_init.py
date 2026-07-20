@@ -83,6 +83,7 @@ async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) 
         123456.0,
     )
     assert entry.runtime_data.client is client
+    assert entry.runtime_data.ttlock_manager is None
     assert CONF_ACCESS_TOKEN not in entry.data
     assert CONF_TOKEN_EXPIRES_AT not in entry.data
     coordinator.set_webhook_active.assert_called_once_with(True)

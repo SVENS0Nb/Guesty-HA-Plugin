@@ -28,6 +28,9 @@ from custom_components.guesty.const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_LISTING_MAPPINGS,
+    CONF_TTLOCK_LOCK_IDS,
     DEFAULT_LOXONE_CUSTOM_FIELD,
     DOMAIN,
 )
@@ -174,6 +177,32 @@ async def test_future_booking_gets_stable_guesty_code_without_early_loxone_user(
     )
     remote.async_add_or_update_user.assert_not_awaited()
     assert manager._records[reservation.id]["field_synced"] is True
+
+
+@pytest.mark.asyncio
+async def test_ttlock_only_listing_reuses_guesty_pin_without_loxone_side_effects(
+    hass, monkeypatch
+) -> None:
+    """The shared PIN owner also serves TTLock-only listings."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=2),
+        check_out=NOW + timedelta(days=4),
+    )
+    options = _options()
+    options[CONF_LOXONE_ENABLED] = False
+    options[CONF_TTLOCK_ENABLED] = True
+    options[CONF_TTLOCK_LISTING_MAPPINGS] = {"listing-1": {CONF_TTLOCK_LOCK_IDS: [101]}}
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once()
+    remote.async_add_or_update_user.assert_not_awaited()
+    snapshot = manager.listing_status_snapshot("listing-1")
+    assert snapshot["guesty_status"] == "synced"
+    assert snapshot["loxone_status"] == "not_configured"
 
 
 @pytest.mark.asyncio
@@ -467,6 +496,35 @@ async def test_manual_guesty_arrival_change_updates_existing_loxone_user(
 
 
 @pytest.mark.asyncio
+async def test_moving_provisioned_booking_outside_lead_removes_loxone_user(
+    hass, monkeypatch
+) -> None:
+    """A postponed stay cannot retain its former Loxone access window."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    original_code = manager._records[reservation.id]["code"]
+
+    reservation.check_in_utc = (NOW + timedelta(days=10)).isoformat()
+    reservation.check_out_utc = (NOW + timedelta(days=12)).isoformat()
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    remote.async_delete_user.assert_awaited_once_with("user-uuid")
+    remote.async_add_or_update_user.assert_awaited_once()
+    assert manager._records[reservation.id]["code"] == original_code
+    assert manager._records[reservation.id]["field_synced"] is True
+    assert "user_uuid" not in manager._records[reservation.id]
+    assert "fingerprint" not in manager._records[reservation.id]
+    assert "code_set" not in manager._records[reservation.id]
+
+
+@pytest.mark.asyncio
 async def test_guest_name_is_used_in_loxone_only_after_privacy_opt_in(
     hass, monkeypatch
 ) -> None:
@@ -624,12 +682,14 @@ async def test_cancel_removes_plaintext_before_retrying_remote_cleanup(
         hass, monkeypatch, reservation
     )
     await manager.async_reconcile()
+    manager._records[reservation.id]["external_rejected_codes"] = ["700001"]
     coordinator.data.reservations = []
     remote.async_delete_user.side_effect = LoxoneApiError("offline")
 
     await manager.async_reconcile()
 
     assert "code" not in manager._records[reservation.id]
+    assert "external_rejected_codes" not in manager._records[reservation.id]
     assert manager._records[reservation.id]["retired"] is True
 
     remote.async_delete_user.side_effect = None
@@ -992,6 +1052,24 @@ def test_prefix_reserves_at_least_ten_thousand_codes(hass, monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="prefix"):
         manager._generate_code()
+
+
+def test_external_conflict_codes_are_not_generated_again(hass, monkeypatch) -> None:
+    """Previously rejected provider codes remain excluded for the reservation."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    manager._records[reservation.id] = {
+        "code": "799999",
+        "external_rejected_codes": ["712345"],
+    }
+    monkeypatch.setattr(loxone.secrets, "randbelow", lambda _capacity: 12345)
+
+    assert manager._generate_code() == "712346"
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,9 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - **Loxone Reservierungs-PINs** – sechsstelliger Code in einem konfigurierbaren
   Guesty-Reservierungs-Custom-Field und kurzlebige Loxone-Benutzer mit
   listingabhängigen Gruppen
+- **TTLock Reservierungs-PINs** – derselbe Guesty-Code wird optional und
+  zeitlich begrenzt auf bis zu sechs gatewayfähige TTLock-Schlösser pro Listing
+  übertragen
 
 ## Voraussetzungen
 
@@ -39,6 +42,8 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 - Für Loxone-PINs: ein per **HTTPS** erreichbarer Miniserver (direkt oder über
   einen Reverse Proxy) und ein eigenes Loxone-Dienstkonto mit dem Recht
   **Benutzerverwaltung**
+- Für TTLock-PINs: eine TTLock-Open-Platform-Anwendung, ein TTLock-App-Konto mit
+  Verwaltungsrecht für die Schlösser sowie V4-Schlösser mit Online-Gateway
 
 ### API-Schlüssel erstellen
 
@@ -84,6 +89,7 @@ Home Assistant Custom Component zur Anbindung der [Guesty Open API](https://open
 | Gastdetails anzeigen | Aus | Gastname und Bestätigungscode in Entitäten anzeigen; sensible Attribute werden nicht im Recorder gespeichert |
 | Sicherer Gast-Türzugang | Aus | Erst nach weiterer Konfiguration werden Reservierungslinks erzeugt |
 | Loxone Reservierungs-PINs | Aus | Erzeugt Codes im konfigurierten Guesty-Reservierungs-Custom-Field und zeitlich begrenzte Loxone-Benutzer |
+| TTLock Reservierungs-PINs | Aus | Überträgt denselben Guesty-Code zeitlich begrenzt auf zugeordnete TTLock-Schlösser |
 | Logo-URL | Leer | Optionales Logo oberhalb des Türportals; direkte HTTPS-Bild-URL |
 | Favicon-URL | Leer | Optionales Browser-Icon des Türportals; direkte HTTPS-Bild-URL |
 
@@ -360,8 +366,12 @@ abgelehnt.
   Buchungen erfolgt diese Prüfung daher erst innerhalb des konfigurierten
   Loxone-Vorlaufs; ein nötiger Ersatz erscheint dann automatisch in Guesty.
 - Änderungen an Gastname, Zeitraum oder Gruppen aktualisieren den bestehenden
-  Loxone-Benutzer. Bei einem Listing-/Miniserver-Wechsel wird zuerst der alte
-  Benutzer entfernt und der aktuelle Guesty-Code am Ziel neu bereitgestellt.
+  Loxone-Benutzer. Wird eine bereits bereitgestellte Buchung so weit in die
+  Zukunft verschoben, dass sie wieder außerhalb des Vorlaufs liegt, wird der
+  bisherige Benutzer sofort entfernt und erst im neuen Vorlauf mit demselben
+  Guesty-Code neu angelegt. Bei einem Listing-/Miniserver-Wechsel wird zuerst
+  der alte Benutzer entfernt und der aktuelle Guesty-Code am Ziel neu
+  bereitgestellt.
 - Wird die Custom-Field-Referenz in den Integrationsoptionen geändert, löst die
   Integration das neue Feld erneut zur internen Guesty-ID auf. Ein vorhandener
   Wert im neuen Feld gewinnt; ist das Feld leer, wird der bisherige Code
@@ -397,6 +407,110 @@ abgelehnt.
   Gruppen- oder Gastdaten gehalten, damit er auch nach einer URL- oder
   Kontoumstellung noch auf dem alten Miniserver gelöscht werden kann.
 
+## TTLock Reservierungs-PINs
+
+TTLock ist ein eigener, optionaler Zielanbieter und kann unabhängig von Loxone
+oder zusammen mit Loxone aktiviert werden. Die Integration verwendet dabei
+dieselbe Reservierung, dasselbe Guesty-Custom-Field und denselben sechsstelligen
+Code. Es entsteht kein zweiter Guesty-Poller: Webhooks, Reservierungs-Cache,
+OAuth-Token und regulärer Abgleich werden gemeinsam genutzt.
+
+Der Code wird unmittelbar nach dem Erkennen einer aktiven Reservierung in
+Guesty angelegt. Auf den TTLock-Schlössern erscheint er erst innerhalb des
+konfigurierten Bereitstellungsvorlaufs. Seine Gültigkeit entspricht exakt den
+bereits verwendeten Zugangsgrenzen:
+
+```text
+Beginn = Check-in − „Zugang vor Check-in"
+Ende   = Check-out + „Zugang nach Check-out"
+```
+
+### TTLock vorbereiten und verbinden
+
+1. Im [TTLock Open Platform Portal](https://euopen.ttlock.com/) eine Anwendung
+   anlegen und deren Client-ID und Client-Secret bereithalten.
+2. Ein TTLock-App-Konto verwenden, das die gewünschten Schlösser verwaltet.
+   Das App-Passwort wird beim Einrichten nur zum OAuth-Austausch verwendet und
+   nicht gespeichert. Danach arbeitet die Integration mit Access- und
+   Refresh-Token.
+3. Sicherstellen, dass jedes gewünschte Schloss `keyboardPwdVersion=4` meldet
+   und über ein erreichbares Gateway verfügt (`hasGateway=1`). Nur solche
+   Schlösser werden in der Auswahl angezeigt.
+4. In **Einstellungen → Geräte & Dienste → Guesty → Konfigurieren** die Option
+   **TTLock Reservierungs-PINs** einschalten. Region, Open-Platform-Zugang,
+   TTLock-App-Benutzer und Passwort eingeben.
+5. Das Guesty-Reservierungsfeld, den PIN-Präfix sowie Vor-/Nachlauf festlegen.
+   Wenn Loxone ebenfalls aktiv ist, werden diese gemeinsamen Einstellungen in
+   beiden Abschnitten identisch verwendet; der zuletzt bestätigte Wert gilt für
+   beide Anbieter.
+6. Nur die gewünschten Guesty-Listings auswählen und jedem Listing ein bis
+   sechs TTLock-Schlösser zuordnen. Ein Schloss darf mehreren Listings
+   zugeordnet werden, sofern das zum realen Zutrittskonzept passt.
+
+Die Integration nutzt die offiziellen Gateway-Operationen zum
+[Anlegen](https://euopen.ttlock.com/doc/api/v3/keyboardPwd/add),
+[Ändern](https://euopen.ttlock.com/doc/api/v3/keyboardPwd/change) und
+[Löschen](https://euopen.ttlock.com/doc/api/v3/keyboardPwd/delete) angepasster
+V4-Passcodes. Eine direkte Bluetooth-Verbindung von Home Assistant zum Schloss
+ist dafür nicht erforderlich.
+
+### Lebenszyklus, Fehlerfälle und Traffic
+
+- Manuelle Codeänderungen im maßgeblichen Guesty-Custom-Field werden beim
+  Webhook beziehungsweise nächsten Reservierungsabgleich erkannt. Bereits
+  bereitgestellte TTLock-Passcodes werden mit derselben ID aktualisiert.
+- Änderungen an Check-in, Check-out oder den Zugangs-Offsets aktualisieren die
+  Gültigkeitszeit auf allen zugeordneten Schlössern. Der Code bleibt dabei
+  unverändert.
+- Stornierung, Zugangsende, entfernte Zuordnung oder deaktivierte TTLock-
+  Funktion löschen ausschließlich die von dieser Integration verwalteten
+  TTLock-Passcodes. Andere TTLock-Codes bleiben unangetastet.
+- Vor jeder Neuanlage wird die Passcodeliste des betroffenen Schlosses geprüft.
+  Ist der Guesty-Code dort bereits anderweitig vergeben, erzeugt der gemeinsame
+  PIN-Manager einen neuen global eindeutigen Code, bestätigt ihn zuerst in
+  Guesty und verteilt ihn anschließend erneut an Loxone und TTLock. TTLock darf
+  höchstens drei solcher Codewechsel pro Reservierung und Stunde auslösen;
+  weitere Konflikte warten mit Backoff, statt Guesty in einer schnellen
+  Schreibschleife zu verändern.
+- Bei mehreren Schlössern werden erfolgreiche Einzeloperationen sofort
+  gespeichert. Ein ausgefallenes Gateway führt deshalb nicht zur doppelten
+  Anlage auf bereits erfolgreichen Schlössern. Der Status lautet bis zur
+  vollständigen Zustellung `Teilweise` oder `Gateway offline`.
+- Transportfehler, Rate-Limits und Offline-Gateways verwenden ein persistentes,
+  begrenztes exponentielles Backoff. Nach einer Netzwerkunterbrechung wird die
+  Arbeit automatisch fortgesetzt; es gibt keine schnelle Wiederholungsschleife.
+- TTLock wird bei Bereitstellung, Änderung, Löschung und anschließend höchstens
+  alle 30 Minuten zur Driftkontrolle abgefragt. Dabei werden Abfragen desselben
+  Schlosses innerhalb eines Abgleichs zusammengefasst. So werden manuell
+  gelöschte oder veränderte Codes erkannt, ohne bei jedem fünfminütigen Guesty-
+  Poll zusätzlichen TTLock-Traffic zu erzeugen. Bei veralteten Guesty-Daten
+  werden keine neuen Zugänge angelegt oder erweitert; ein bereits gespeichertes
+  Zugangsende wird weiterhin aufgeräumt.
+- Vor Änderung oder Löschung muss die TTLock-ID weiterhin den privaten
+  Reservierungsmarker tragen. Fremde oder manuell umbenannte Passcodes werden
+  niemals anhand einer veralteten lokalen ID verändert. TTLock-Zustände wie
+  `adding`, `add failed`, `modify failed` oder `deleting` gelten nicht als
+  erfolgreich bereitgestellt und werden gezielt erneut geprüft beziehungsweise
+  sicher ersetzt.
+- Das nicht idempotente Anlegen eines Passcodes wird bei einem Transportabbruch
+  nicht blind wiederholt. Stattdessen sucht die Integration den Vorgang über
+  den Reservierungsmarker und verhindert dadurch verwaiste Doppelanlagen.
+- Ein datenschutzfreundlicher Marker aus einem Hash der Reservierungs-ID
+  ermöglicht nach einer unklaren Netzwerkantwort die Wiedererkennung. Gastname,
+  Reservierungs-ID im Klartext, PINs und TTLock-Zugangsdaten erscheinen weder
+  im Marker noch in Home-Assistant-Diagnosedaten.
+
+Der Diagnose-Sensor **TTLock-PIN-Status** zeigt je Listing unter anderem
+`Geplant`, `Ausstehend`, `Teilweise`, `Bereitgestellt`, `Gateway offline`,
+`Konflikt`, `Löschung ausstehend` oder `Fehler`. Er enthält nur Anzahlen und
+Zeitpunkte, niemals den sechsstelligen Code.
+
+Für eine Backup-Home-Assistant-Instanz sollte immer nur eine Instanz gleichzeitig
+als aktiver Schreiber laufen. Der gemeinsame Guesty-Code bleibt bei einem
+bewussten Wechsel erhalten; die neue Instanz kann ihre eigenen TTLock-Einträge
+anlegen. Zwei parallel aktive Instanzen könnten dagegen gegenseitige
+Kollisionswechsel und unnötigen API-Traffic auslösen.
+
 ## Entitäten
 
 **Alle Listings** aus deinem Guesty-Konto werden automatisch importiert. Pro Listing:
@@ -408,6 +522,7 @@ abgelehnt.
 | Diagnose-Sensor (standardmäßig deaktiviert) | `sensor.ferienwohnung_gast_zugangslink` | Status des aktuellen beziehungsweise nächsten Links; die erzeugte URL steht im Attribut `access_url` |
 | Diagnose-Sensor | `sensor.ferienwohnung_guesty_keycode_status` | Guesty-Code-Custom-Field: `Nicht konfiguriert`, `Keine Reservierung`, `Ausstehend`, `Synchronisiert`, `Konflikt` oder `Fehler` |
 | Diagnose-Sensor | `sensor.ferienwohnung_loxone_pin_status` | Zeigt zusätzlich `Geplant`, `Bereitgestellt` oder `Löschung ausstehend` für den Loxone-Benutzer |
+| Diagnose-Sensor | `sensor.ferienwohnung_ttlock_pin_status` | Zustellung desselben Codes an TTLock, einschließlich Anzahl zugeordneter und bereitgestellter Schlösser |
 | Kalender | `calendar.ferienwohnung_reservierungen` | Alle Reservierungen |
 
 Kalendereinträge zeigen standardmäßig nur „Reserviert“ und den Reservierungsstatus. Gastnamen und Bestätigungscodes können in den Integrationsoptionen aktiviert werden.
@@ -496,6 +611,8 @@ flowchart TD
     B --> H[Loxone PIN Manager]
     H -->|begrenzte PUT/GET-bestätigte Feldwerte| A
     H -->|Anlegen/Ändern/Löschen nur bei Übergängen| I[Loxone Miniserver]
+    H --> J[TTLock PIN Manager]
+    J -->|Gateway-Passcodes nur bei Übergängen| K[TTLock Cloud und Gateways]
     G[Transition Scheduler] -->|Check-in/out Zeit| B
 ```
 
