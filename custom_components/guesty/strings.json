@@ -120,9 +120,13 @@
       },
       "loxone_listing": {
         "title": "Loxone access for {listing}",
-        "description": "Select one or more user groups from exactly one Miniserver. Their permissions determine which doors the reservation PIN can open.",
+        "description": "Select one or more user groups from exactly one Miniserver. Their permissions determine which doors the reservation PIN can open. The optional Guesty suffix is display-only and is never sent to the lock.",
         "data": {
-          "group_uuids": "Miniserver and user groups"
+          "group_uuids": "Miniserver and user groups",
+          "guesty_code_suffix": "Key shown after the Guesty code (optional)"
+        },
+        "data_description": {
+          "guesty_code_suffix": "For example #, * or ☑️. Up to 8 visible non-numeric characters; leave empty if the PIN alone is sufficient. This setting is shared with TTLock for the same listing; for different keypads you can enter a combined hint such as ☑️ / #."
         }
       },
       "ttlock": {
@@ -157,12 +161,14 @@
       },
       "ttlock_listing": {
         "title": "TTLock access for {listing}",
-        "description": "Choose the doors that guests of this listing may open.",
+        "description": "Choose the doors that guests of this listing may open. The optional Guesty suffix is display-only and is never sent to TTLock.",
         "data": {
-          "lock_ids": "TTLock locks"
+          "lock_ids": "TTLock locks",
+          "guesty_code_suffix": "Key shown after the Guesty code (optional)"
         },
         "data_description": {
-          "lock_ids": "Select one to six locks. Every selected lock receives the same reservation PIN and validity period."
+          "lock_ids": "Select one to six locks. Every selected lock receives the same reservation PIN and validity period.",
+          "guesty_code_suffix": "For example #, * or ☑️. Up to 8 visible non-numeric characters; leave empty if the PIN alone is sufficient. This setting is shared with Loxone for the same listing; for different keypads you can enter a combined hint such as ☑️ / #."
         }
       }
     },

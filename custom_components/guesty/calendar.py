@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import logging
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -32,15 +34,46 @@ def _add_listing_entities(
         return
 
     known_ids = entry.runtime_data.calendar_listing_ids
-    new_ids = set(coordinator.data.listings) - known_ids
+    new_ids = sorted(set(coordinator.data.listings) - known_ids)
     if not new_ids:
         return
 
     entities = [
         GuestyReservationCalendar(coordinator, listing_id) for listing_id in new_ids
     ]
+    entity_groups = getattr(entry.runtime_data, "calendar_listing_entities", None)
+    if not isinstance(entity_groups, dict):
+        entity_groups = {}
+        entry.runtime_data.calendar_listing_entities = entity_groups
+    for listing_id, entity in zip(new_ids, entities, strict=True):
+        entity_groups[listing_id] = [entity]
     async_add_entities(entities)
     known_ids.update(new_ids)
+
+
+async def _async_sync_listing_entities(
+    hass: HomeAssistant,
+    coordinator: GuestyDataUpdateCoordinator,
+    entry: GuestyConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Remove deleted calendars and add newly discovered listings."""
+    current_ids = set(coordinator.data.listings) if coordinator.data else set()
+    known_ids = entry.runtime_data.calendar_listing_ids
+    entity_groups = entry.runtime_data.calendar_listing_entities
+    registry = er.async_get(hass)
+    for listing_id in known_ids - current_ids:
+        for entity in entity_groups.pop(listing_id, []):
+            entity_id = entity.entity_id
+            if getattr(entity, "hass", None) is not None:
+                try:
+                    await entity.async_remove(force_remove=True)
+                except Exception:  # Defensive Home Assistant lifecycle boundary.
+                    _LOGGER.exception("Could not remove Guesty calendar %s", entity_id)
+            if entity_id and registry.async_get(entity_id):
+                registry.async_remove(entity_id)
+        known_ids.discard(listing_id)
+    _add_listing_entities(coordinator, entry, async_add_entities)
 
 
 async def async_setup_entry(
@@ -52,11 +85,25 @@ async def async_setup_entry(
     coordinator = entry.runtime_data.coordinator
 
     _add_listing_entities(coordinator, entry, async_add_entities)
+    sync_lock = asyncio.Lock()
+
+    async def _async_handle_coordinator_update() -> None:
+        async with sync_lock:
+            await _async_sync_listing_entities(
+                hass,
+                coordinator,
+                entry,
+                async_add_entities,
+            )
 
     @callback
     def _handle_coordinator_update() -> None:
-        """Add calendars when Guesty returns new listings."""
-        _add_listing_entities(coordinator, entry, async_add_entities)
+        """Synchronize calendars when Guesty adds or removes listings."""
+        entry.async_create_background_task(
+            hass,
+            _async_handle_coordinator_update(),
+            "guesty_sync_listing_calendars",
+        )
 
     entry.async_on_unload(coordinator.async_add_listener(_handle_coordinator_update))
 

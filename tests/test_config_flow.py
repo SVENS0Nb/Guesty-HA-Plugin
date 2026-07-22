@@ -38,6 +38,8 @@ from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
+    CONF_GUESTY_CODE_SUFFIX,
+    CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
     CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
@@ -80,6 +82,22 @@ VALIDATED = {
     CONF_ACCESS_TOKEN: "validated-token",
     CONF_TOKEN_EXPIRES_AT: 123456.0,
 }
+
+
+@pytest.mark.parametrize("suffix", ["#", "*", "☑️", "☑️ / #", ""])
+def test_guesty_code_suffix_accepts_visible_non_numeric_text(suffix) -> None:
+    """Administrators may enter short visible keypad instructions."""
+    assert config_flow._guesty_code_suffix(suffix) == suffix
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["1", "#2", "123456", "\x00", "\u202e", "\u200b", "123456789"],
+)
+def test_guesty_code_suffix_rejects_digits_controls_and_long_values(suffix) -> None:
+    """Unsafe or ambiguous display suffixes never reach Guesty."""
+    with pytest.raises(config_flow.vol.Invalid):
+        config_flow._guesty_code_suffix(suffix)
 
 
 @pytest.mark.asyncio
@@ -443,7 +461,8 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
             CONF_LOXONE_GROUP_UUIDS: [
                 f"{server_id}|group-front",
                 f"{server_id}|group-flat",
-            ]
+            ],
+            CONF_GUESTY_CODE_SUFFIX: "#",
         },
     )
 
@@ -455,6 +474,7 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
         }
     }
     assert result["data"][CONF_LOXONE_CUSTOM_FIELD] == "{{door_code}}"
+    assert result["data"][CONF_GUESTY_CODE_SUFFIXES] == {"listing-1": "#"}
     assert (
         result["data"][CONF_LOXONE_MINISERVERS][0][CONF_LOXONE_SERVER_PASSWORD]
         == "secret"
@@ -567,17 +587,158 @@ async def test_options_flow_tests_ttlock_and_maps_compatible_locks(
     )
 
     result = await hass.config_entries.options.async_configure(
-        form["flow_id"], {CONF_TTLOCK_LOCK_IDS: ["101"]}
+        form["flow_id"],
+        {
+            CONF_TTLOCK_LOCK_IDS: ["101"],
+            CONF_GUESTY_CODE_SUFFIX: "☑️",
+        },
     )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_TTLOCK_LISTING_MAPPINGS] == {
         "listing-1": {CONF_TTLOCK_LOCK_IDS: [101]}
     }
+    assert result["data"][CONF_GUESTY_CODE_SUFFIXES] == {"listing-1": "☑️"}
     assert result["data"][CONF_TTLOCK_LOCKS] == [
         {CONF_TTLOCK_LOCK_ID: 101, "name": "Haustür"}
     ]
     assert result["data"][CONF_TTLOCK_ACCOUNT][CONF_TTLOCK_CLIENT_ID] == ("tt-client")
+
+
+@pytest.mark.asyncio
+async def test_shared_suffix_is_configured_once_when_both_providers_use_listing(
+    hass, monkeypatch
+) -> None:
+    """TTLock cannot overwrite the suffix already chosen for the same Loxone listing."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={CONF_SCAN_INTERVAL: 300},
+    )
+    entry.add_to_hass(hass)
+    listing = GuestyListing(
+        id="listing-1",
+        title="Apartment",
+        nickname=None,
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data=SimpleNamespace(listings={listing.id: listing})
+        ),
+        client=SimpleNamespace(
+            async_resolve_custom_field=AsyncMock(return_value="field-id")
+        ),
+    )
+    loxone_client = SimpleNamespace(
+        async_get_groups=AsyncMock(
+            return_value=[{"uuid": "group-front", "name": "Front door"}]
+        )
+    )
+    ttlock_client = SimpleNamespace(
+        async_authenticate=AsyncMock(),
+        async_refresh_access_token=AsyncMock(),
+        async_list_locks=AsyncMock(
+            return_value=[
+                {
+                    "lockId": 101,
+                    "lockAlias": "Apartment",
+                    "keyboardPwdVersion": 4,
+                    "hasGateway": 1,
+                }
+            ]
+        ),
+        token_snapshot=lambda: {
+            CONF_TTLOCK_ACCESS_TOKEN: "access",
+            CONF_TTLOCK_REFRESH_TOKEN: "refresh",
+            CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-20T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        config_flow.LoxoneApiClient,
+        "from_hass",
+        lambda *args, **kwargs: loxone_client,
+    )
+    monkeypatch.setattr(
+        config_flow.TTLockApiClient,
+        "from_hass",
+        lambda *args, **kwargs: ttlock_client,
+    )
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    loxone_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_SCAN_INTERVAL: 300,
+            "listing_sync_interval": 86400,
+            "reservation_days_past": 30,
+            "reservation_days_future": 365,
+            "stale_threshold_hours": 6,
+            CONF_EXPOSE_GUEST_DETAILS: False,
+            CONF_ACCESS_ENABLED: False,
+            CONF_LOXONE_ENABLED: True,
+            CONF_TTLOCK_ENABLED: True,
+        },
+    )
+    server_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_PROVISION_LEAD_MINUTES: 360,
+            CONF_LOXONE_CODE_PREFIX: "7",
+            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
+            CONF_ACCESS_EARLY_MINUTES: 0,
+            CONF_ACCESS_LATE_MINUTES: 0,
+            config_flow.CONF_LOXONE_SERVER_COUNT: 1,
+            CONF_LOXONE_LISTINGS: ["listing-1"],
+        },
+    )
+    assert loxone_form["step_id"] == "loxone"
+    assert server_form["step_id"] == "loxone_server"
+    listing_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_SERVER_NAME: "Haus",
+            CONF_LOXONE_SERVER_URL: "https://loxone.example.test",
+            CONF_LOXONE_SERVER_USERNAME: "service",
+            CONF_LOXONE_SERVER_PASSWORD: "secret",
+        },
+    )
+    server_id = loxone_server_id("https://loxone.example.test", "service")
+    ttlock_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_GROUP_UUIDS: [f"{server_id}|group-front"],
+            CONF_GUESTY_CODE_SUFFIX: "☑️ / #",
+        },
+    )
+    assert listing_form["step_id"] == "loxone_listing"
+    assert ttlock_form["step_id"] == "ttlock"
+    ttlock_listing_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_TTLOCK_PROVISION_LEAD_MINUTES: 360,
+            CONF_TTLOCK_REGION: "eu",
+            CONF_TTLOCK_CLIENT_ID: "tt-client",
+            CONF_TTLOCK_CLIENT_SECRET: "tt-secret",
+            CONF_TTLOCK_USERNAME: "owner@example.com",
+            config_flow.CONF_TTLOCK_PASSWORD: "password",
+            CONF_TTLOCK_LISTINGS: ["listing-1"],
+        },
+    )
+    assert ttlock_listing_form["step_id"] == "ttlock_listing"
+    assert CONF_GUESTY_CODE_SUFFIX not in {
+        key.schema for key in ttlock_listing_form["data_schema"].schema
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"], {CONF_TTLOCK_LOCK_IDS: ["101"]}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_GUESTY_CODE_SUFFIXES] == {"listing-1": "☑️ / #"}
 
 
 @pytest.mark.asyncio

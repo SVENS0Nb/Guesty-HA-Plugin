@@ -90,6 +90,106 @@ async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_partial_setup_failure_rolls_back_started_resources(
+    hass, monkeypatch
+) -> None:
+    """A failed manager setup leaves no scheduler, task, or public registration."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+    entry.add_to_hass(hass)
+    storage = SimpleNamespace(async_load=AsyncMock(return_value={}))
+    coordinator = SimpleNamespace(
+        data=None,
+        async_load_cached_data=AsyncMock(return_value=None),
+        async_config_entry_first_refresh=AsyncMock(),
+        async_shutdown=AsyncMock(),
+    )
+    scheduler = SimpleNamespace(
+        async_schedule=MagicMock(),
+        async_unschedule=MagicMock(),
+    )
+    access_manager = SimpleNamespace(
+        async_setup=AsyncMock(),
+        async_unload=AsyncMock(),
+    )
+    loxone_manager = SimpleNamespace(
+        async_setup=AsyncMock(side_effect=RuntimeError("broken setup")),
+        async_unload=AsyncMock(),
+    )
+    unregister = MagicMock()
+    unload_platforms = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(guesty_init, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(
+        guesty_init.GuestyApiClient,
+        "from_hass",
+        MagicMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyDataUpdateCoordinator", lambda *_args: coordinator
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyTransitionScheduler", lambda *_args: scheduler
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyAccessManager", lambda *_args: access_manager
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyLoxoneManager", lambda *_args: loxone_manager
+    )
+    monkeypatch.setattr(guesty_init, "async_unregister_access_manager", unregister)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_unload_platforms",
+        unload_platforms,
+    )
+
+    with pytest.raises(RuntimeError, match="broken setup"):
+        await async_setup_entry(hass, entry)
+
+    scheduler.async_unschedule.assert_called_once_with()
+    access_manager.async_unload.assert_awaited_once_with()
+    loxone_manager.async_unload.assert_awaited_once_with()
+    coordinator.async_shutdown.assert_awaited_once_with()
+    unregister.assert_not_called()
+    unload_platforms.assert_awaited_once_with(entry, guesty_init.PLATFORMS)
+
+
+@pytest.mark.asyncio
+async def test_first_refresh_failure_shuts_down_coordinator(hass, monkeypatch) -> None:
+    """A failed initial Guesty fetch cannot leave coordinator work behind."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+    entry.add_to_hass(hass)
+    storage = SimpleNamespace(async_load=AsyncMock(return_value={}))
+    coordinator = SimpleNamespace(
+        async_load_cached_data=AsyncMock(return_value=None),
+        async_config_entry_first_refresh=AsyncMock(
+            side_effect=RuntimeError("refresh failed")
+        ),
+        async_shutdown=AsyncMock(),
+    )
+    monkeypatch.setattr(guesty_init, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(
+        guesty_init.GuestyApiClient,
+        "from_hass",
+        MagicMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyDataUpdateCoordinator", lambda *_args: coordinator
+    )
+
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        await async_setup_entry(hass, entry)
+
+    coordinator.async_shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
     """Home Assistant reloads keep the remote Guesty subscription intact."""
     entry = MockConfigEntry(

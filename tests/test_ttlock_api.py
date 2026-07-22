@@ -142,6 +142,21 @@ async def test_add_change_and_delete_use_gateway_operations(monkeypatch) -> None
     assert request.await_args_list[2].args[1]["deleteType"] == 2
 
 
+@pytest.mark.asyncio
+async def test_ttlock_rejects_non_ascii_passcode_digits() -> None:
+    """TTLock receives only ASCII keypad digits."""
+    start = datetime.fromisoformat("2026-07-20T13:00:00+00:00")
+    end = datetime.fromisoformat("2026-07-22T09:00:00+00:00")
+    with pytest.raises(ValueError):
+        await _client().async_add_passcode(
+            lock_id=42,
+            code="٧١٢٣٤٥",
+            name="Guesty-ABC",
+            valid_from=start,
+            valid_until=end,
+        )
+
+
 def test_ttlock_error_classification_is_fail_closed() -> None:
     """Known gateway and collision responses are never accepted as success."""
     client = _client()

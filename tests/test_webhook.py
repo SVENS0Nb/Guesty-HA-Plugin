@@ -174,6 +174,33 @@ async def test_invalid_stale_and_replayed_signatures_are_rejected(
 
 
 @pytest.mark.asyncio
+async def test_failed_webhook_handoff_can_be_retried(hass, monkeypatch) -> None:
+    """A handler failure never permanently consumes Guesty's message id."""
+    handlers = _capture_registry(monkeypatch)
+    entry = _entry(hass)
+    coordinator = SimpleNamespace(
+        async_handle_webhook=AsyncMock(side_effect=RuntimeError("temporary failure"))
+    )
+    webhook_id = await guesty_webhook.async_setup_webhook(hass, entry, coordinator)
+    request = _signed_request(
+        {
+            "event": "reservation.updated.v2",
+            "data": {"reservationId": "reservation-1"},
+        },
+        message_id="retryable-message",
+    )
+
+    with pytest.raises(RuntimeError, match="temporary failure"):
+        await handlers[webhook_id](hass, webhook_id, request)
+
+    coordinator.async_handle_webhook.side_effect = None
+    response = await handlers[webhook_id](hass, webhook_id, request)
+
+    assert response.status == 202
+    assert coordinator.async_handle_webhook.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None:
     """An unchanged subscription reuses its stored secret without extra traffic."""
     monkeypatch.setattr(

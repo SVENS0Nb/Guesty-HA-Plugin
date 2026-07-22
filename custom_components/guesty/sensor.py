@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
+import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -29,6 +32,8 @@ from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
 from .models import ListingOccupancy
 
+_LOGGER = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from .access import GuestyAccessManager
     from .loxone import GuestyLoxoneManager
@@ -44,44 +49,77 @@ def _add_listing_entities(
         return
 
     known_ids = entry.runtime_data.sensor_listing_ids
-    new_ids = set(coordinator.data.listings) - known_ids
+    new_ids = sorted(set(coordinator.data.listings) - known_ids)
     if not new_ids:
         return
 
     entities: list[SensorEntity] = []
+    entity_groups = getattr(entry.runtime_data, "sensor_listing_entities", None)
+    if not isinstance(entity_groups, dict):
+        entity_groups = {}
+        entry.runtime_data.sensor_listing_entities = entity_groups
     ttlock_manager = getattr(entry.runtime_data, "ttlock_manager", None)
     for listing_id in new_ids:
-        entities.extend(
-            (
-                GuestyOccupancySensor(coordinator, listing_id),
-                GuestyCurrentGuestSensor(coordinator, listing_id),
-                GuestyAccessLinkSensor(
-                    coordinator,
-                    entry.runtime_data.access_manager,
-                    listing_id,
-                ),
-                GuestyKeycodeStatusSensor(
-                    coordinator,
-                    entry.runtime_data.loxone_manager,
-                    listing_id,
-                ),
-                GuestyLoxonePinStatusSensor(
-                    coordinator,
-                    entry.runtime_data.loxone_manager,
-                    listing_id,
-                ),
-            )
-        )
+        listing_entities: list[SensorEntity] = [
+            GuestyOccupancySensor(coordinator, listing_id),
+            GuestyCurrentGuestSensor(coordinator, listing_id),
+            GuestyAccessLinkSensor(
+                coordinator,
+                entry.runtime_data.access_manager,
+                listing_id,
+            ),
+            GuestyKeycodeStatusSensor(
+                coordinator,
+                entry.runtime_data.loxone_manager,
+                listing_id,
+            ),
+            GuestyLoxonePinStatusSensor(
+                coordinator,
+                entry.runtime_data.loxone_manager,
+                listing_id,
+            ),
+        ]
         if ttlock_manager is not None:
-            entities.append(
+            listing_entities.append(
                 GuestyTTLockPinStatusSensor(
                     coordinator,
                     ttlock_manager,
                     listing_id,
                 )
             )
+        entity_groups[listing_id] = listing_entities
+        entities.extend(listing_entities)
     async_add_entities(entities)
     known_ids.update(new_ids)
+
+
+async def _async_sync_listing_entities(
+    hass: HomeAssistant,
+    coordinator: GuestyDataUpdateCoordinator,
+    entry: GuestyConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Remove deleted listing sensors and add newly discovered listings."""
+    current_ids = set(coordinator.data.listings) if coordinator.data else set()
+    known_ids = entry.runtime_data.sensor_listing_ids
+    entity_groups = entry.runtime_data.sensor_listing_entities
+    registry = er.async_get(hass)
+    for listing_id in known_ids - current_ids:
+        for entity in entity_groups.pop(listing_id, []):
+            entity_id = entity.entity_id
+            # Registry-disabled entities are deliberately never attached to a
+            # platform and therefore have no ``hass`` instance to remove from.
+            # Still delete their registry entries and never let one malformed
+            # entity abort cleanup of the remaining listing entities.
+            if getattr(entity, "hass", None) is not None:
+                try:
+                    await entity.async_remove(force_remove=True)
+                except Exception:  # Defensive Home Assistant lifecycle boundary.
+                    _LOGGER.exception("Could not remove Guesty entity %s", entity_id)
+            if entity_id and registry.async_get(entity_id):
+                registry.async_remove(entity_id)
+        known_ids.discard(listing_id)
+    _add_listing_entities(coordinator, entry, async_add_entities)
 
 
 async def async_setup_entry(
@@ -96,11 +134,25 @@ async def async_setup_entry(
     async_add_entities(entities)
 
     _add_listing_entities(coordinator, entry, async_add_entities)
+    sync_lock = asyncio.Lock()
+
+    async def _async_handle_coordinator_update() -> None:
+        async with sync_lock:
+            await _async_sync_listing_entities(
+                hass,
+                coordinator,
+                entry,
+                async_add_entities,
+            )
 
     @callback
     def _handle_coordinator_update() -> None:
-        """Add sensors when Guesty returns new listings."""
-        _add_listing_entities(coordinator, entry, async_add_entities)
+        """Synchronize sensors when Guesty adds or removes listings."""
+        entry.async_create_background_task(
+            hass,
+            _async_handle_coordinator_update(),
+            "guesty_sync_listing_sensors",
+        )
 
     entry.async_on_unload(coordinator.async_add_listener(_handle_coordinator_update))
 

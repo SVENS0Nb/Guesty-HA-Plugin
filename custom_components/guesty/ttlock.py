@@ -54,7 +54,7 @@ from .ttlock_api import (
 _LOGGER = logging.getLogger(__name__)
 
 TTLOCK_STORAGE_KEY = "guesty_ttlock"
-_CODE_PATTERN = re.compile(r"^\d{6}$")
+_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _ACCOUNT_SNAPSHOT_KEY = "account_snapshot"
 _TOKEN_ACCOUNT_KEY = "account_key"
 _REMOTE_VERIFY_INTERVAL = timedelta(minutes=30)
@@ -291,8 +291,10 @@ class GuestyTTLockManager:
             if data is not None:
                 for reservation in sorted(
                     eligible.values(),
-                    key=lambda item: item.check_in_datetime(
-                        data.listings[item.listing_id]
+                    key=lambda item: self._reservation_sync_order(
+                        item,
+                        data.listings[item.listing_id],
+                        now,
                     ),
                 ):
                     listing = data.listings[reservation.listing_id]
@@ -1268,6 +1270,22 @@ class GuestyTTLockManager:
         """Return the earlier datetime."""
         return candidate if current is None or candidate < current else current
 
+    def _reservation_sync_order(
+        self,
+        reservation: GuestyReservation,
+        listing: Any,
+        now: datetime,
+    ) -> tuple[int, datetime, str]:
+        """Sort malformed reservations last without aborting the entire pass."""
+        try:
+            start, _end = self._pin_manager.reservation_access_window(
+                reservation,
+                listing,
+            )
+        except (TypeError, ValueError):
+            start = datetime.max.replace(tzinfo=dt_util.UTC)
+        return (0 if start <= now else 1, start, reservation.id)
+
     @staticmethod
     def _as_int(value: Any) -> int | None:
         """Return a positive integer or None."""
@@ -1299,7 +1317,7 @@ async def async_remove_stored_ttlock_passcodes(
     hass: HomeAssistant,
     entry: ConfigEntry,
 ) -> bool:
-    """Remove managed TTLock passcodes when the integration is deleted."""
+    """Best-effort remove passcodes, then erase local account credentials."""
     storage = GuestyTTLockStorage(hass, entry.entry_id)
     data = await storage.async_load()
     records = data.get("records", {})
@@ -1370,6 +1388,8 @@ async def async_remove_stored_ttlock_passcodes(
         else:
             records.pop(reservation_id, None)
         await storage.async_save(data)
-    if cleanup_complete and not records:
-        await storage.async_remove()
+    # TTLock passcodes retain their remote end time. With the config entry
+    # deleted no durable retry owner remains, so do not orphan OAuth secrets in
+    # a store that can never be reached again.
+    await storage.async_remove()
     return cleanup_complete and not records

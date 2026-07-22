@@ -93,6 +93,7 @@ async def async_setup_webhook(
     )
 
     seen_message_ids: dict[str, int] = {}
+    processing_message_ids: set[str] = set()
 
     async def handle_webhook(
         hass: Any, webhook_id: str, request: web.Request
@@ -123,9 +124,8 @@ async def async_setup_webhook(
         for seen_id, seen_at in tuple(seen_message_ids.items()):
             if seen_at < cutoff:
                 seen_message_ids.pop(seen_id, None)
-        if message_id in seen_message_ids:
+        if message_id in seen_message_ids or message_id in processing_message_ids:
             return web.Response(status=202)
-        seen_message_ids[message_id] = now
 
         try:
             payload = json.loads(body)
@@ -142,7 +142,17 @@ async def async_setup_webhook(
             _LOGGER.debug("Ignoring unsupported Guesty webhook event %r", event)
             return web.Response(status=202)
 
-        await coordinator.async_handle_webhook(payload)
+        # Reserve the id while it is being queued to collapse concurrent
+        # duplicates. Only mark it as successfully seen after the coordinator
+        # accepted it so a failed request can be retried by Guesty.
+        processing_message_ids.add(message_id)
+        try:
+            await coordinator.async_handle_webhook(payload)
+        except BaseException:
+            processing_message_ids.discard(message_id)
+            raise
+        processing_message_ids.discard(message_id)
+        seen_message_ids[message_id] = now
         return web.Response(status=202)
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)

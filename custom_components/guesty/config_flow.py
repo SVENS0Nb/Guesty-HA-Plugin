@@ -48,6 +48,8 @@ from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_EXPOSE_GUEST_DETAILS,
+    CONF_GUESTY_CODE_SUFFIX,
+    CONF_GUESTY_CODE_SUFFIXES,
     CONF_LISTING_SYNC_INTERVAL,
     CONF_LOXONE_CODE_PREFIX,
     CONF_LOXONE_CUSTOM_FIELD,
@@ -84,6 +86,7 @@ from .const import (
     CONF_STALE_THRESHOLD_HOURS,
     CONF_TOKEN_EXPIRES_AT,
     DEFAULT_EXPOSE_GUEST_DETAILS,
+    DEFAULT_GUESTY_CODE_SUFFIX,
     DEFAULT_ACCESS_CUSTOM_FIELD,
     DEFAULT_ACCESS_EARLY_MINUTES,
     DEFAULT_ACCESS_ENABLED,
@@ -103,6 +106,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
+    GUESTY_CODE_SUFFIX_MAX_LENGTH,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
     TTLOCK_API_BASE_URLS,
@@ -115,6 +119,18 @@ CONF_LOXONE_SERVER_COUNT = "loxone_server_count"
 CONF_TTLOCK_PASSWORD = "ttlock_password"
 TTLOCK_OPEN_PLATFORM_URL = "https://euopen.ttlock.com/"
 TTLOCK_OAUTH_DOC_URL = "https://euopen.ttlock.com/doc/oauth2"
+
+
+def _guesty_code_suffix(value: Any) -> str:
+    """Validate a short non-numeric Guesty PIN display suffix."""
+    suffix = str(value or "").strip()
+    if len(suffix) > GUESTY_CODE_SUFFIX_MAX_LENGTH:
+        raise vol.Invalid("Guesty code suffix is too long")
+    if any(character.isdigit() or not character.isprintable() for character in suffix):
+        raise vol.Invalid(
+            "Guesty code suffix cannot contain digits or invisible controls"
+        )
+    return suffix
 
 
 def _lock_entity_field(position: int) -> str:
@@ -333,6 +349,7 @@ class GuestyOptionsFlow(OptionsFlow):
     _listing_queue: list[str]
     _pending_loxone_servers: list[dict[str, Any]]
     _pending_loxone_mappings: dict[str, dict[str, Any]]
+    _pending_code_suffixes: dict[str, str]
     _loxone_server_queue: list[int]
     _loxone_listing_queue: list[str]
     _pending_ttlock_account: dict[str, Any]
@@ -346,6 +363,10 @@ class GuestyOptionsFlow(OptionsFlow):
         """Manage Guesty options."""
         if user_input is not None:
             self._pending_options = {**self.config_entry.options, **user_input}
+            self._pending_code_suffixes = {}
+            self._pending_options[CONF_GUESTY_CODE_SUFFIXES] = (
+                self._pending_code_suffixes
+            )
             if user_input.get(CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED):
                 return await self.async_step_access()
             if user_input.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED):
@@ -649,7 +670,11 @@ class GuestyOptionsFlow(OptionsFlow):
             custom_field = str(user_input.get(CONF_LOXONE_CUSTOM_FIELD, "")).strip()
             if not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
-            elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
+            elif (
+                not prefix.isascii()
+                or not prefix.isdigit()
+                or not 1 <= len(prefix) <= 2
+            ):
                 errors["base"] = "invalid_code_prefix"
             elif not custom_field:
                 errors["base"] = "custom_field_not_found"
@@ -901,6 +926,9 @@ class GuestyOptionsFlow(OptionsFlow):
                 errors["base"] = "groups_from_one_server"
             else:
                 server_id = next(iter(server_ids))
+                self._pending_code_suffixes[listing_id] = _guesty_code_suffix(
+                    user_input.get(CONF_GUESTY_CODE_SUFFIX)
+                )
                 self._pending_loxone_mappings[listing_id] = {
                     CONF_LOXONE_SERVER_ID: server_id,
                     CONF_LOXONE_GROUP_UUIDS: list(
@@ -939,13 +967,26 @@ class GuestyOptionsFlow(OptionsFlow):
                         multiple=True,
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
-                )
+                ),
+                vol.Optional(CONF_GUESTY_CODE_SUFFIX): _guesty_code_suffix,
             }
+        )
+        current_suffixes = self.config_entry.options.get(CONF_GUESTY_CODE_SUFFIXES, {})
+        existing_suffix = (
+            current_suffixes.get(listing_id, DEFAULT_GUESTY_CODE_SUFFIX)
+            if isinstance(current_suffixes, dict)
+            else DEFAULT_GUESTY_CODE_SUFFIX
         )
         return self.async_show_form(
             step_id="loxone_listing",
             data_schema=self.add_suggested_values_to_schema(
-                schema, {CONF_LOXONE_GROUP_UUIDS: selected_values}
+                schema,
+                {
+                    CONF_LOXONE_GROUP_UUIDS: selected_values,
+                    CONF_GUESTY_CODE_SUFFIX: self._pending_code_suffixes.get(
+                        listing_id, existing_suffix
+                    ),
+                },
             ),
             errors=errors,
             description_placeholders={"listing": listing.display_name},
@@ -1036,7 +1077,11 @@ class GuestyOptionsFlow(OptionsFlow):
 
             if not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
-            elif not prefix.isdigit() or not 1 <= len(prefix) <= 2:
+            elif (
+                not prefix.isascii()
+                or not prefix.isdigit()
+                or not 1 <= len(prefix) <= 2
+            ):
                 errors["base"] = "invalid_code_prefix"
             elif not custom_field:
                 errors["base"] = "custom_field_not_found"
@@ -1278,6 +1323,7 @@ class GuestyOptionsFlow(OptionsFlow):
             int(item[CONF_TTLOCK_LOCK_ID]) for item in self._pending_ttlock_locks
         }
         errors: dict[str, str] = {}
+        suffix_already_configured = listing_id in self._pending_code_suffixes
         if user_input is not None:
             selected = user_input.get(CONF_TTLOCK_LOCK_IDS)
             parsed: list[int] = []
@@ -1294,6 +1340,10 @@ class GuestyOptionsFlow(OptionsFlow):
             elif len(parsed) > TTLOCK_MAX_LOCKS_PER_LISTING:
                 errors["base"] = "too_many_ttlock_locks"
             else:
+                if not suffix_already_configured:
+                    self._pending_code_suffixes[listing_id] = _guesty_code_suffix(
+                        user_input.get(CONF_GUESTY_CODE_SUFFIX)
+                    )
                 self._pending_ttlock_mappings[listing_id] = {
                     CONF_TTLOCK_LOCK_IDS: parsed
                 }
@@ -1322,21 +1372,34 @@ class GuestyOptionsFlow(OptionsFlow):
         selected_values = [
             str(value) for value in raw_selected if str(value) in valid_choice_values
         ]
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_TTLOCK_LOCK_IDS): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=choices,
-                        multiple=True,
-                        mode=selector.SelectSelectorMode.DROPDOWN,
-                    )
+        schema_fields: dict[Any, Any] = {
+            vol.Required(CONF_TTLOCK_LOCK_IDS): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=choices,
+                    multiple=True,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
                 )
-            }
+            )
+        }
+        if not suffix_already_configured:
+            schema_fields[vol.Optional(CONF_GUESTY_CODE_SUFFIX)] = _guesty_code_suffix
+        schema = vol.Schema(schema_fields)
+        current_suffixes = self.config_entry.options.get(CONF_GUESTY_CODE_SUFFIXES, {})
+        existing_suffix = (
+            current_suffixes.get(listing_id, DEFAULT_GUESTY_CODE_SUFFIX)
+            if isinstance(current_suffixes, dict)
+            else DEFAULT_GUESTY_CODE_SUFFIX
         )
+        suggested_values: dict[str, Any] = {
+            CONF_TTLOCK_LOCK_IDS: selected_values,
+        }
+        if not suffix_already_configured:
+            suggested_values[CONF_GUESTY_CODE_SUFFIX] = existing_suffix
         return self.async_show_form(
             step_id="ttlock_listing",
             data_schema=self.add_suggested_values_to_schema(
-                schema, {CONF_TTLOCK_LOCK_IDS: selected_values}
+                schema,
+                suggested_values,
             ),
             errors=errors,
             description_placeholders={"listing": listing.display_name},

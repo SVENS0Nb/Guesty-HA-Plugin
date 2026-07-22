@@ -57,6 +57,8 @@ CONF_ACCESS_LOCK_6_NAME_ES: Final = "access_lock_6_name_es"
 CONF_ACCESS_LOCK_6_NAME_FR: Final = "access_lock_6_name_fr"
 CONF_LOXONE_ENABLED: Final = "loxone_enabled"
 CONF_LOXONE_CUSTOM_FIELD: Final = "loxone_custom_field"
+CONF_GUESTY_CODE_SUFFIX: Final = "guesty_code_suffix"
+CONF_GUESTY_CODE_SUFFIXES: Final = "guesty_code_suffixes"
 CONF_LOXONE_PROVISION_LEAD_MINUTES: Final = "loxone_provision_lead_minutes"
 CONF_LOXONE_CODE_PREFIX: Final = "loxone_code_prefix"
 CONF_LOXONE_MINISERVERS: Final = "loxone_miniservers"
@@ -104,6 +106,7 @@ DEFAULT_ACCESS_EARLY_MINUTES: Final = 0
 DEFAULT_ACCESS_LATE_MINUTES: Final = 0
 DEFAULT_LOXONE_ENABLED: Final = False
 DEFAULT_LOXONE_CUSTOM_FIELD: Final = "{{door_code}}"
+DEFAULT_GUESTY_CODE_SUFFIX: Final = ""
 DEFAULT_LOXONE_PROVISION_LEAD_MINUTES: Final = 360
 DEFAULT_LOXONE_CODE_PREFIX: Final = "7"
 DEFAULT_TTLOCK_ENABLED: Final = False
@@ -119,6 +122,7 @@ MAX_SCAN_INTERVAL: Final = 3600
 
 API_BASE_URL: Final = "https://open-api.guesty.com/v1"
 OAUTH_URL: Final = "https://open-api.guesty.com/oauth2/token"
+API_MAX_RESPONSE_BYTES: Final = 10 * 1024 * 1024
 
 DEFAULT_CHECK_IN_TIME: Final = "15:00"
 DEFAULT_CHECK_OUT_TIME: Final = "11:00"
@@ -201,6 +205,7 @@ ACCESS_REVOKED_RECORD_RETENTION_DAYS: Final = 7
 
 LOXONE_STORAGE_VERSION: Final = 1
 LOXONE_ACCESS_CODE_LENGTH: Final = 6
+GUESTY_CODE_SUFFIX_MAX_LENGTH: Final = 8
 LOXONE_RETRY_BASE_SECONDS: Final = 300
 LOXONE_RETRY_MAX_SECONDS: Final = 3600
 LOXONE_REQUEST_TIMEOUT: Final = 20.0

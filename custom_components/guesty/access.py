@@ -22,6 +22,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -33,7 +34,12 @@ from .access_names import (
     localized_door_name,
     localized_door_names,
 )
-from .api import GuestyApiClient, GuestyApiError, GuestyAuthError
+from .api import (
+    GuestyApiClient,
+    GuestyApiError,
+    GuestyAuthError,
+    is_custom_field_reference_error,
+)
 from .const import (
     ACCESS_ACTION_NONCE_SECONDS,
     ACCESS_MAX_LOCKS,
@@ -53,11 +59,13 @@ from .const import (
     CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
+    CONF_STALE_THRESHOLD_HOURS,
     DEFAULT_ACCESS_CUSTOM_FIELD,
     DEFAULT_ACCESS_EARLY_MINUTES,
     DEFAULT_ACCESS_FAVICON_URL,
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_ACCESS_LOGO_URL,
+    DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
     EVENT_DOOR_ACCESS,
 )
@@ -70,6 +78,7 @@ ACCESS_STORAGE_VERSION = 1
 ACCESS_STORAGE_KEY = "guesty_access"
 ACCESS_MANAGERS = "access_managers"
 ACCESS_VIEW_REGISTERED = "access_view_registered"
+_ACCESS_FIELD_WRITE_BATCH_SIZE = 2
 
 ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
     "de": {
@@ -230,6 +239,7 @@ class GuestyAccessManager:
         self._reconcile_task: asyncio.Task[None] | None = None
         self._reconcile_pending = False
         self._unloaded = False
+        self._cancel_timer: Callable[[], None] | None = None
         self._last_reconcile_at: str | None = None
         self._last_reconcile_result = "never"
         self._last_reconcile_error: str | None = None
@@ -263,6 +273,9 @@ class GuestyAccessManager:
     async def async_unload(self) -> None:
         """Stop scheduled work and reject future requests."""
         self._unloaded = True
+        if self._cancel_timer is not None:
+            self._cancel_timer()
+            self._cancel_timer = None
         if self._reconcile_task and not self._reconcile_task.done():
             self._reconcile_task.cancel()
             try:
@@ -314,6 +327,7 @@ class GuestyAccessManager:
     async def async_reconcile(self) -> None:
         """Synchronize active reservations and revoke obsolete access."""
         async with self._reconcile_lock:
+            self._schedule_at(None)
             self._last_reconcile_at = dt_util.utcnow().isoformat()
             self._last_reconcile_result = "running"
             self._last_reconcile_error = None
@@ -325,6 +339,7 @@ class GuestyAccessManager:
             enabled = bool(self.entry.options.get(CONF_ACCESS_ENABLED, False))
             coordinator_data = self._coordinator.data
             now = dt_util.utcnow()
+            next_run: datetime | None = None
             eligible: dict[str, tuple[GuestyReservation, str]] = {}
 
             if enabled and coordinator_data:
@@ -385,6 +400,7 @@ class GuestyAccessManager:
 
             if not enabled:
                 await self._async_cleanup_revoked_records()
+                self._schedule_at(self._next_record_retry(now))
                 self._last_reconcile_result = "disabled"
                 return
 
@@ -395,6 +411,7 @@ class GuestyAccessManager:
             ).strip()
             if not field_reference or not mappings:
                 await self._async_cleanup_revoked_records()
+                self._schedule_at(self._next_record_retry(now))
                 self._last_reconcile_result = "not_configured"
                 return
 
@@ -420,10 +437,26 @@ class GuestyAccessManager:
                 self._last_reconcile_error = "external_url_not_https"
                 return
 
+            writes_remaining = self._guesty_write_budget()
             for reservation_id in sorted(eligible):
                 record = records[reservation_id]
                 if self._retry_is_deferred(record, "publish", now):
                     self._last_deferred_count += 1
+                    retry_at = self._retry_at(record, "publish")
+                    if retry_at is not None:
+                        next_run = self._earlier(next_run, retry_at)
+                    continue
+                publish_required = self._publish_required(
+                    base_url,
+                    reservation_id,
+                    record,
+                )
+                if publish_required and writes_remaining <= 0:
+                    self._last_deferred_count += 1
+                    next_run = self._earlier(
+                        next_run,
+                        now + timedelta(seconds=30),
+                    )
                     continue
                 field_id, publish_error = await self._async_publish_access_link(
                     reservation_id,
@@ -432,6 +465,8 @@ class GuestyAccessManager:
                     field_id,
                     base_url,
                 )
+                if publish_required:
+                    writes_remaining = max(0, writes_remaining - 1)
                 if publish_error is not None:
                     self._record_retry_failure(record, "publish", now)
                     _LOGGER.warning(
@@ -441,11 +476,22 @@ class GuestyAccessManager:
                     )
                     self._last_reconcile_result = "partial"
                     self._last_reconcile_error = str(publish_error)[:500]
+                    # Most write failures are account-wide. Preserve remaining
+                    # capacity for reservation polling instead of repeating the
+                    # same failure for every future booking in this pass.
+                    writes_remaining = 0
+                    retry_at = self._retry_at(record, "publish")
+                    if retry_at is not None:
+                        next_run = self._earlier(next_run, retry_at)
                 else:
                     self._clear_retry(record, "publish")
 
             await self._async_cleanup_revoked_records()
             await self._storage.async_save(self._data)
+            record_retry = self._next_record_retry(now)
+            if record_retry is not None:
+                next_run = self._earlier(next_run, record_retry)
+            self._schedule_at(next_run)
             if self._last_reconcile_result == "running":
                 self._last_reconcile_result = "ok"
 
@@ -488,13 +534,18 @@ class GuestyAccessManager:
         except GuestyAuthError as err:
             return field_id, err
         except GuestyApiError as first_error:
-            recovery = await self._async_prepare_link_recovery(
-                reservation_id,
-                record,
-                field_reference,
-                field_id,
-                base_url,
-            )
+            if not is_custom_field_reference_error(first_error):
+                return field_id, first_error
+            try:
+                recovery = await self._async_prepare_link_recovery(
+                    reservation_id,
+                    record,
+                    field_reference,
+                    field_id,
+                    base_url,
+                )
+            except (GuestyApiError, GuestyAuthError) as recovery_error:
+                return field_id, recovery_error
             if recovery is None:
                 return field_id, first_error
             field_id, access_url, url_hash = recovery
@@ -533,6 +584,10 @@ class GuestyAccessManager:
             field_reference,
             force_refresh=True,
         )
+        # Reservation-level 404 responses share the same exception type. Only
+        # rotate a bearer URL when the configured field actually moved.
+        if fresh_field_id == current_field_id:
+            return None
         recovery_marker = f"{fresh_field_id}:{fingerprint}"
         if record.get("recovery_marker") == recovery_marker:
             return None
@@ -549,6 +604,65 @@ class GuestyAccessManager:
             base_url, reservation_id, record
         )
         return fresh_field_id, access_url, url_hash
+
+    def _publish_required(
+        self,
+        base_url: str,
+        reservation_id: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        """Return whether this record consumes Guesty write capacity."""
+        _access_url, url_hash = self._access_url_and_hash(
+            base_url,
+            reservation_id,
+            record,
+        )
+        return not (
+            record.get("url_hash") == url_hash
+            and record.get("field_synced")
+            and record.get("write_verified")
+        )
+
+    def _guesty_write_budget(self) -> int:
+        """Reserve Guesty capacity for normal reservation and webhook traffic."""
+        remaining = getattr(self._client, "last_rate_limit_remaining", None)
+        if not isinstance(remaining, int):
+            return _ACCESS_FIELD_WRITE_BATCH_SIZE
+        capacity = max(1, (remaining - 4) // 2)
+        return min(_ACCESS_FIELD_WRITE_BATCH_SIZE, capacity)
+
+    def _schedule_at(self, moment: datetime | None) -> None:
+        """Schedule the next bounded publish or retry continuation."""
+        if self._cancel_timer is not None:
+            self._cancel_timer()
+            self._cancel_timer = None
+        if moment is None or self._unloaded:
+            return
+        now = dt_util.utcnow()
+        if moment <= now:
+            moment = now + timedelta(seconds=1)
+
+        @callback
+        def _run(_now: datetime) -> None:
+            self._cancel_timer = None
+            self.async_schedule_reconcile()
+
+        self._cancel_timer = async_track_point_in_utc_time(self.hass, _run, moment)
+
+    def _next_record_retry(self, now: datetime) -> datetime | None:
+        """Return the next persistent publish or cleanup retry timestamp."""
+        next_run: datetime | None = None
+        for record in self._records.values():
+            for operation in ("publish", "cleanup"):
+                retry_at = self._retry_at(record, operation)
+                if retry_at is not None and retry_at > now:
+                    next_run = self._earlier(next_run, retry_at)
+        return next_run
+
+    @staticmethod
+    def _earlier(current: datetime | None, candidate: datetime) -> datetime:
+        """Return the earlier datetime."""
+        return candidate if current is None or candidate < current else current
 
     async def _async_clear_obsolete_field(
         self,
@@ -804,16 +918,25 @@ class GuestyAccessManager:
         now: datetime,
     ) -> bool:
         """Return whether a persistent per-record retry is still cooling down."""
+        retry_at = GuestyAccessManager._retry_at(record, operation)
+        return retry_at is not None and retry_at > now
+
+    @staticmethod
+    def _retry_at(
+        record: Mapping[str, Any],
+        operation: str,
+    ) -> datetime | None:
+        """Parse one persistent retry timestamp."""
         value = record.get(f"{operation}_retry_at")
         if not isinstance(value, str):
-            return False
-        retry_at = dt_util.parse_datetime(value)
-        if retry_at is None:
-            return False
+            return None
         try:
-            return retry_at > now
-        except TypeError:
-            return False
+            retry_at = dt_util.parse_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        return (
+            retry_at if retry_at is not None and retry_at.tzinfo is not None else None
+        )
 
     @staticmethod
     def _record_retry_failure(
@@ -1017,8 +1140,9 @@ class GuestyAccessManager:
             return None
 
         data = self._coordinator.data
-        # Physical access fails closed when Guesty data is explicitly stale.
-        if data is None or data.data_stale:
+        # A single failed poll must not revoke every issued link. Fail closed
+        # only after the last confirmed snapshot exceeds the configured age.
+        if data is None or self._access_data_too_old(data):
             return None
         reservation = next(
             (item for item in data.reservations if item.id == reservation_id), None
@@ -1039,6 +1163,21 @@ class GuestyAccessManager:
         if not start <= now < end:
             return None
         return reservation_id, reservation, doors
+
+    def _access_data_too_old(self, data: Any) -> bool:
+        """Return whether cached reservation data is too old for door access."""
+        cache_age = getattr(data, "cache_age_minutes", None)
+        if not isinstance(cache_age, (int, float)) or isinstance(cache_age, bool):
+            return True
+        threshold = self.entry.options.get(
+            CONF_STALE_THRESHOLD_HOURS,
+            DEFAULT_STALE_THRESHOLD_HOURS,
+        )
+        try:
+            threshold_minutes = max(0, float(threshold)) * 60
+        except (TypeError, ValueError):
+            threshold_minutes = DEFAULT_STALE_THRESHOLD_HOURS * 60
+        return cache_age > threshold_minutes
 
     def _access_window(
         self, reservation: GuestyReservation

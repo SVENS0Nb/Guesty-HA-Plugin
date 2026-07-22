@@ -340,13 +340,12 @@ class GuestyReservation:
             raise ValueError(f"Reservation {self.id} has an invalid date range")
         return check_in, check_out
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_guest_details: bool = True) -> dict[str, Any]:
         """Serialize reservation for storage."""
-        return {
+        data = {
             "id": self.id,
             "listing_id": self.listing_id,
             "status": self.status,
-            "confirmation_code": self.confirmation_code,
             "check_in_date": self.check_in_date,
             "check_out_date": self.check_out_date,
             "check_in_utc": self.check_in_utc,
@@ -355,9 +354,12 @@ class GuestyReservation:
             "planned_departure": self.planned_departure,
             "listing_default_check_in": self.listing_default_check_in,
             "listing_default_check_out": self.listing_default_check_out,
-            "guest_name": self.guest_name,
             "last_updated_at": self.last_updated_at,
         }
+        if include_guest_details:
+            data["confirmation_code"] = self.confirmation_code
+            data["guest_name"] = self.guest_name
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GuestyReservation:

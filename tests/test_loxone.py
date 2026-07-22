@@ -10,11 +10,16 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import loxone
-from custom_components.guesty.api import GuestyApiError, GuestyPermissionError
+from custom_components.guesty.api import (
+    GuestyApiError,
+    GuestyNotFoundError,
+    GuestyPermissionError,
+)
 from custom_components.guesty.const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
     CONF_EXPOSE_GUEST_DETAILS,
+    CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
     CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
@@ -180,6 +185,129 @@ async def test_future_booking_gets_stable_guesty_code_without_early_loxone_user(
 
 
 @pytest.mark.asyncio
+async def test_guesty_confirmation_suffix_is_never_sent_to_loxone(
+    hass, monkeypatch
+) -> None:
+    """Guesty displays the keypad key while providers retain the numeric PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=1),
+        check_out=NOW + timedelta(days=1),
+    )
+    options = _options()
+    options[CONF_GUESTY_CODE_SUFFIXES] = {"listing-1": "☑️"}
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    code = manager._records[reservation.id]["code"]
+    assert len(code) == 6 and code.isdigit()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id, FIELD_ID, f"{code}☑️"
+    )
+    remote.async_set_access_code.assert_awaited_once_with("user-uuid", code)
+
+
+@pytest.mark.asyncio
+async def test_existing_suffixed_guesty_code_is_adopted_without_rotation(
+    hass, monkeypatch
+) -> None:
+    """A valid Guesty display suffix does not become part of the provider PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=1),
+        check_out=NOW + timedelta(days=1),
+        key_code="712345#",
+    )
+    options = _options()
+    options[CONF_GUESTY_CODE_SUFFIXES] = {"listing-1": "#"}
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    assert manager._records[reservation.id]["code"] == "712345"
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_set_access_code.assert_awaited_once_with("user-uuid", "712345")
+
+
+@pytest.mark.asyncio
+async def test_changed_confirmation_suffix_rewrites_display_without_rotating_pin(
+    hass, monkeypatch
+) -> None:
+    """Changing the listing suffix preserves and only reformats the Guesty PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345#",
+    )
+    options = _options()
+    options[CONF_GUESTY_CODE_SUFFIXES] = {"listing-1": "☑️"}
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    assert manager._records[reservation.id]["code"] == "712345"
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id, FIELD_ID, "712345☑️"
+    )
+    remote.async_add_or_update_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_suffix_rewrite_failure_retries_same_pin_from_private_state(
+    hass, monkeypatch
+) -> None:
+    """A failed display-only rewrite cannot rotate or strand the provider PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345#",
+    )
+    options = _options()
+    options[CONF_GUESTY_CODE_SUFFIXES] = {"listing-1": "☑️"}
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+    guesty_client.async_update_reservation_custom_field.side_effect = [
+        GuestyApiError("offline"),
+        None,
+    ]
+    guesty_client.async_get_reservation_custom_field.return_value = "712345#"
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["field_synced"] is False
+
+    reservation.key_code = None
+    reservation.key_code_observed = False
+    reservation.custom_fields = {}
+    reservation.custom_fields_observed = False
+    monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW + timedelta(minutes=6))
+    await manager.async_reconcile()
+
+    assert record["code"] == "712345"
+    assert record["field_synced"] is True
+    assert guesty_client.async_update_reservation_custom_field.await_args.args == (
+        reservation.id,
+        FIELD_ID,
+        "712345☑️",
+    )
+    remote.async_add_or_update_user.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["٧٢٣٤٥٦#", "１２３４５６☑️"])
+def test_guesty_code_parser_rejects_non_ascii_digits(value) -> None:
+    """Localized numeral glyphs can never become a provider PIN."""
+    assert GuestyLoxoneManager._parse_guesty_code(value) is None
+
+
+@pytest.mark.asyncio
 async def test_ttlock_only_listing_reuses_guesty_pin_without_loxone_side_effects(
     hass, monkeypatch
 ) -> None:
@@ -315,6 +443,58 @@ async def test_setup_recovers_reasonless_v180_guesty_backoff(hass, monkeypatch) 
     assert record["last_error"] == "guesty_sync_queued"
     manager._storage.async_save.assert_awaited_once()
     manager.async_schedule_reconcile.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_persisted_custom_field_id_is_revalidated_after_reload(
+    hass, monkeypatch
+) -> None:
+    """Deleting and recreating the field cannot strand the shared PIN sync."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    new_field_id = "75fab102a5284d73c6206db1"
+    manager._data["resolved_field"] = {
+        "reference": "{{door_code}}",
+        "id": FIELD_ID,
+    }
+    guesty_client.async_resolve_custom_field.return_value = new_field_id
+
+    assert await manager._async_custom_field_id() == new_field_id
+    assert await manager._async_custom_field_id() == new_field_id
+    guesty_client.async_resolve_custom_field.assert_awaited_once_with("{{door_code}}")
+    assert manager._data["resolved_field"]["id"] == new_field_id
+
+
+@pytest.mark.asyncio
+async def test_runtime_stale_custom_field_id_is_repaired_once(
+    hass, monkeypatch
+) -> None:
+    """A field replacement during runtime is resolved and retried immediately."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=1),
+        check_out=NOW + timedelta(days=1),
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    new_field_id = "75fab102a5284d73c6206db1"
+    guesty_client.async_resolve_custom_field.side_effect = [FIELD_ID, new_field_id]
+    guesty_client.async_update_reservation_custom_field.side_effect = [
+        GuestyNotFoundError("custom field missing"),
+        None,
+    ]
+
+    await manager.async_reconcile()
+
+    writes = guesty_client.async_update_reservation_custom_field.await_args_list
+    assert [item.args[1] for item in writes] == [FIELD_ID, new_field_id]
+    assert manager._records[reservation.id]["field_id"] == new_field_id
+    assert manager._records[reservation.id]["field_synced"] is True
 
 
 @pytest.mark.asyncio
@@ -1038,14 +1218,15 @@ async def test_private_storage_drops_invalid_record_values(hass) -> None:
     }
 
 
-def test_prefix_reserves_at_least_ten_thousand_codes(hass, monkeypatch) -> None:
-    """Prefixes that reduce the namespace below 10,000 codes are rejected."""
+@pytest.mark.parametrize("invalid_prefix", ["123", "٧"])
+def test_invalid_prefixes_are_rejected(hass, monkeypatch, invalid_prefix) -> None:
+    """Prefixes must reserve enough codes and contain only ASCII digits."""
     reservation = _reservation(
         check_in=NOW + timedelta(days=1),
         check_out=NOW + timedelta(days=2),
     )
     options = _options()
-    options[CONF_LOXONE_CODE_PREFIX] = "123"
+    options[CONF_LOXONE_CODE_PREFIX] = invalid_prefix
     manager, _coordinator, _guesty_client, _remote = _manager(
         hass, monkeypatch, reservation, options=options
     )
@@ -1073,10 +1254,10 @@ def test_external_conflict_codes_are_not_generated_again(hass, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_integration_removal_retains_code_free_tombstone_on_delete_failure(
+async def test_integration_removal_erases_credentials_after_delete_failure(
     hass, monkeypatch
 ) -> None:
-    """Failed final cleanup preserves retry data but never preserves the PIN."""
+    """Failed final cleanup never orphans credentials after entry deletion."""
     entry = MockConfigEntry(domain=DOMAIN, options=_options())
     entry.add_to_hass(hass)
     data = {
@@ -1108,5 +1289,5 @@ async def test_integration_removal_retains_code_free_tombstone_on_delete_failure
     assert result is False
     assert data["records"]["reservation-1"]["retired"] is True
     assert "code" not in data["records"]["reservation-1"]
-    storage.async_remove.assert_not_awaited()
-    assert storage.async_save.await_count >= 2
+    storage.async_remove.assert_awaited_once_with()
+    storage.async_save.assert_awaited_once_with(data)

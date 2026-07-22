@@ -12,7 +12,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import access
 from custom_components.guesty.access import GuestyAccessManager, _preferred_language
-from custom_components.guesty.api import GuestyApiError
+from custom_components.guesty.api import (
+    GuestyApiError,
+    GuestyNotFoundError,
+    GuestyRetryableError,
+)
 from custom_components.guesty.const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_ENABLED,
@@ -59,6 +63,7 @@ async def _manager(hass, monkeypatch) -> tuple[GuestyAccessManager, object]:
             listings={"listing-1": _listing()},
             reservations=[reservation],
             data_stale=False,
+            cache_age_minutes=0,
         )
     )
     client = SimpleNamespace(
@@ -168,7 +173,7 @@ async def test_failed_write_rotates_link_and_retries_once(hass, monkeypatch) -> 
     record["url_hash"] = None
     client.async_update_reservation_custom_field.reset_mock()
     client.async_update_reservation_custom_field.side_effect = [
-        GuestyApiError("stale field"),
+        GuestyNotFoundError("stale field"),
         None,
     ]
     client.async_resolve_custom_field.return_value = new_field_id
@@ -188,6 +193,69 @@ async def test_failed_write_rotates_link_and_retries_once(hass, monkeypatch) -> 
     assert record["write_verified"] is True
     assert "recovery_marker" not in record
     assert manager.diagnostics()["recovered_during_last_reconcile"] == 1
+
+
+@pytest.mark.asyncio
+async def test_temporary_write_failure_keeps_existing_bearer_link(
+    hass, monkeypatch
+) -> None:
+    """Rate limits and outages never masquerade as a stale field definition."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    resolve_count = client.async_resolve_custom_field.await_count
+    record.update({"field_synced": False, "write_verified": False, "url_hash": None})
+    client.async_update_reservation_custom_field.reset_mock()
+    client.async_update_reservation_custom_field.side_effect = GuestyRetryableError(
+        "rate limited"
+    )
+
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version
+    assert client.async_resolve_custom_field.await_count == resolve_count
+    client.async_update_reservation_custom_field.assert_awaited_once()
+    assert record["publish_retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_field_refresh_is_contained_and_backed_off(
+    hass, monkeypatch
+) -> None:
+    """A failed recovery lookup cannot abort cleanup and record persistence."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    record.update({"field_synced": False, "write_verified": False, "url_hash": None})
+    client.async_update_reservation_custom_field.side_effect = GuestyNotFoundError(
+        "field missing"
+    )
+    client.async_resolve_custom_field.side_effect = GuestyRetryableError("offline")
+
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version
+    assert record["publish_retry_count"] == 1
+    assert manager.diagnostics()["last_reconcile_result"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_bulk_link_publication_has_a_bounded_write_budget(
+    hass, monkeypatch
+) -> None:
+    """A large future booking set cannot consume the whole Guesty allowance."""
+    manager, client = await _manager(hass, monkeypatch)
+    for number in range(2, 5):
+        reservation = _reservation()
+        reservation.id = f"reservation-{number}"
+        manager._coordinator.data.reservations.append(reservation)
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    assert client.async_update_reservation_custom_field.await_count == 2
+    assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
+    assert manager._cancel_timer is not None
 
 
 @pytest.mark.asyncio
@@ -625,16 +693,23 @@ async def test_ajax_expired_nonce_is_refreshed_without_unlocking(
 
 
 @pytest.mark.asyncio
-async def test_stale_or_changed_reservation_fails_closed(hass, monkeypatch) -> None:
-    """Stale data and changed dates invalidate an old link before reconciliation."""
+async def test_expired_cache_or_changed_reservation_fails_closed(
+    hass, monkeypatch
+) -> None:
+    """Aged data and changed dates invalidate an old link before reconciliation."""
     manager, _client = await _manager(hass, monkeypatch)
     record = manager._records["reservation-1"]
     token = manager._token_for("reservation-1", record["version"])
 
     manager._coordinator.data.data_stale = True
+    manager._coordinator.data.cache_age_minutes = 1
+    assert (await manager.async_get_portal(token)).status == 200
+
+    manager._coordinator.data.cache_age_minutes = 361
     assert (await manager.async_get_portal(token)).status == 404
 
     manager._coordinator.data.data_stale = False
+    manager._coordinator.data.cache_age_minutes = 0
     reservation = manager._coordinator.data.reservations[0]
     reservation.status = "checked_in"
     assert (await manager.async_get_portal(token)).status == 200

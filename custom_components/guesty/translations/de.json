@@ -120,9 +120,13 @@
       },
       "loxone_listing": {
         "title": "Loxone-Zugang für {listing}",
-        "description": "Wähle eine oder mehrere Benutzergruppen von genau einem Miniserver. Deren Berechtigungen bestimmen, welche Türen der Reservierungs-PIN öffnen darf.",
+        "description": "Wähle eine oder mehrere Benutzergruppen von genau einem Miniserver. Deren Berechtigungen bestimmen, welche Türen der Reservierungs-PIN öffnen darf. Der optionale Guesty-Zusatz dient nur der Anzeige und wird nie an das Schloss gesendet.",
         "data": {
-          "group_uuids": "Miniserver und Benutzergruppen"
+          "group_uuids": "Miniserver und Benutzergruppen",
+          "guesty_code_suffix": "Taste hinter dem Guesty-Code (optional)"
+        },
+        "data_description": {
+          "guesty_code_suffix": "Zum Beispiel #, * oder ☑️. Maximal 8 sichtbare Zeichen ohne Ziffern; leer lassen, wenn der PIN allein genügt. Die Einstellung gilt für dasselbe Listing gemeinsam mit TTLock. Bei unterschiedlichen Tasten kann ein kombinierter Hinweis wie ☑️ / # eingetragen werden."
         }
       },
       "ttlock": {
@@ -157,12 +161,14 @@
       },
       "ttlock_listing": {
         "title": "TTLock-Zugang für {listing}",
-        "description": "Wähle die Türen aus, die Gäste dieses Listings öffnen dürfen.",
+        "description": "Wähle die Türen aus, die Gäste dieses Listings öffnen dürfen. Der optionale Guesty-Zusatz dient nur der Anzeige und wird nie an TTLock gesendet.",
         "data": {
-          "lock_ids": "TTLock-Schlösser"
+          "lock_ids": "TTLock-Schlösser",
+          "guesty_code_suffix": "Taste hinter dem Guesty-Code (optional)"
         },
         "data_description": {
-          "lock_ids": "Wähle ein bis sechs Schlösser. Alle erhalten denselben Reservierungs-PIN und Gültigkeitszeitraum."
+          "lock_ids": "Wähle ein bis sechs Schlösser. Alle erhalten denselben Reservierungs-PIN und Gültigkeitszeitraum.",
+          "guesty_code_suffix": "Zum Beispiel #, * oder ☑️. Maximal 8 sichtbare Zeichen ohne Ziffern; leer lassen, wenn der PIN allein genügt. Die Einstellung gilt für dasselbe Listing gemeinsam mit Loxone. Bei unterschiedlichen Tasten kann ein kombinierter Hinweis wie ☑️ / # eingetragen werden."
         }
       }
     },

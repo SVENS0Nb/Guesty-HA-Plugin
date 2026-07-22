@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import logging
 
 from homeassistant.components import webhook as ha_webhook
@@ -55,35 +56,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
     )
 
     coordinator = GuestyDataUpdateCoordinator(hass, entry, client, storage)
-    cached_data = await coordinator.async_load_cached_data()
-    if cached_data:
-        coordinator.async_set_updated_data(cached_data)
+    try:
+        cached_data = await coordinator.async_load_cached_data()
+        if cached_data:
+            coordinator.async_set_updated_data(cached_data)
 
-    await coordinator.async_config_entry_first_refresh()
+        await coordinator.async_config_entry_first_refresh()
 
-    # The general cache intentionally strips reservation custom-field values.
-    # When Loxone is enabled after a restart, perform one shared full read so
-    # every code is available from the normal reservation response instead of
-    # issuing one custom-field request per cached booking.
-    mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
-    ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
-    mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
-    if isinstance(ttlock_mappings, dict):
-        mapped_listing_ids.update(ttlock_mappings)
-    if (
-        (
-            entry.options.get(CONF_LOXONE_ENABLED, False)
-            or entry.options.get(CONF_TTLOCK_ENABLED, False)
-        )
-        and coordinator.data is not None
-        and any(
-            reservation.is_active_status()
-            and reservation.listing_id in mapped_listing_ids
-            and not reservation.custom_fields_observed
-            for reservation in coordinator.data.reservations
-        )
-    ):
-        await coordinator.async_force_full_sync()
+        # The general cache intentionally strips reservation custom-field values.
+        # When a PIN provider is enabled after a restart, perform one shared full
+        # read instead of issuing one custom-field request per cached booking.
+        mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
+        ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
+        mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
+        if isinstance(ttlock_mappings, dict):
+            mapped_listing_ids.update(ttlock_mappings)
+        if (
+            (
+                entry.options.get(CONF_LOXONE_ENABLED, False)
+                or entry.options.get(CONF_TTLOCK_ENABLED, False)
+            )
+            and coordinator.data is not None
+            and any(
+                reservation.is_active_status()
+                and reservation.listing_id in mapped_listing_ids
+                and not reservation.custom_fields_observed
+                for reservation in coordinator.data.reservations
+            )
+        ):
+            await coordinator.async_force_full_sync()
+    except BaseException:
+        with suppress(Exception):
+            await coordinator.async_shutdown()
+        raise
 
     if CONF_ACCESS_TOKEN in entry.data or CONF_TOKEN_EXPIRES_AT in entry.data:
         hass.config_entries.async_update_entry(
@@ -100,51 +105,78 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
         scheduler.async_schedule()
 
     scheduler = GuestyTransitionScheduler(hass, coordinator, _on_transition)
-    scheduler.async_schedule()
-
     access_manager = GuestyAccessManager(hass, entry, client, coordinator)
-    async_register_access_manager(hass, access_manager)
-    await access_manager.async_setup()
-
     loxone_manager = GuestyLoxoneManager(hass, entry, client, coordinator)
-    await loxone_manager.async_setup()
-
     ttlock_manager = None
-    if (
-        entry.options.get(CONF_TTLOCK_ENABLED, False)
-        or entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS)
-        or entry.options.get(CONF_TTLOCK_ACCOUNT)
-    ):
-        ttlock_manager = GuestyTTLockManager(hass, entry, coordinator, loxone_manager)
-        await ttlock_manager.async_setup()
-
-    entry.runtime_data = GuestyRuntimeData(
-        coordinator,
-        client,
-        scheduler,
-        access_manager,
-        loxone_manager,
-        ttlock_manager,
-    )
-
-    webhook_id = await async_setup_webhook(hass, entry, coordinator)
-    if webhook_id:
-        guesty_webhook_id = await async_register_guesty_webhook(
-            hass, entry, client, webhook_id
-        )
-        coordinator.set_webhook_active(guesty_webhook_id is not None)
-
-    def _on_coordinator_update() -> None:
+    webhook_id: str | None = None
+    access_registered = False
+    try:
         scheduler.async_schedule()
-        access_manager.async_schedule_reconcile()
-        loxone_manager.async_schedule_reconcile()
-        if ttlock_manager is not None:
-            ttlock_manager.async_schedule_reconcile()
+        await access_manager.async_setup()
+        await loxone_manager.async_setup()
 
-    entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-    return True
+        if (
+            entry.options.get(CONF_TTLOCK_ENABLED, False)
+            or entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS)
+            or entry.options.get(CONF_TTLOCK_ACCOUNT)
+        ):
+            ttlock_manager = GuestyTTLockManager(
+                hass, entry, coordinator, loxone_manager
+            )
+            await ttlock_manager.async_setup()
+
+        entry.runtime_data = GuestyRuntimeData(
+            coordinator,
+            client,
+            scheduler,
+            access_manager,
+            loxone_manager,
+            ttlock_manager,
+        )
+
+        async_register_access_manager(hass, access_manager)
+        access_registered = True
+        webhook_id = await async_setup_webhook(hass, entry, coordinator)
+        if webhook_id:
+            guesty_webhook_id = await async_register_guesty_webhook(
+                hass, entry, client, webhook_id
+            )
+            coordinator.set_webhook_active(guesty_webhook_id is not None)
+
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+        def _on_coordinator_update() -> None:
+            scheduler.async_schedule()
+            access_manager.async_schedule_reconcile()
+            loxone_manager.async_schedule_reconcile()
+            if ttlock_manager is not None:
+                ttlock_manager.async_schedule_reconcile()
+
+        entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+        return True
+    except BaseException:
+        # Setup may fail after timers, webhooks, or manager tasks have started.
+        # Roll every local resource back so the next retry starts cleanly.
+        if webhook_id:
+            with suppress(Exception):
+                ha_webhook.async_unregister(hass, webhook_id)
+        with suppress(Exception):
+            await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+        if ttlock_manager is not None:
+            with suppress(Exception):
+                await ttlock_manager.async_unload()
+        with suppress(Exception):
+            await loxone_manager.async_unload()
+        with suppress(Exception):
+            await access_manager.async_unload()
+        if access_registered:
+            async_unregister_access_manager(hass, entry.entry_id)
+        with suppress(Exception):
+            scheduler.async_unschedule()
+        with suppress(Exception):
+            await coordinator.async_shutdown()
+        raise
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bool:
@@ -210,13 +242,13 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> N
     await access_storage.async_remove()
     if not await async_remove_stored_loxone_users(hass, entry):
         _LOGGER.error(
-            "One or more managed Loxone users could not be removed; "
-            "code-free cleanup records were retained"
+            "One or more managed Loxone users could not be removed immediately; "
+            "their configured remote validity still limits access"
         )
     if not await async_remove_stored_ttlock_passcodes(hass, entry):
         _LOGGER.error(
-            "One or more managed TTLock passcodes could not be removed; "
-            "cleanup records were retained"
+            "One or more managed TTLock passcodes could not be removed immediately; "
+            "their configured remote validity still limits access"
         )
 
 

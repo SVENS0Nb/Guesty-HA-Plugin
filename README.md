@@ -155,14 +155,20 @@ Endpunkt für Reservierungs-Custom-Fields.
 - Datum, Listing oder Schlosszuordnung geändert: Der alte Token wird sofort
   ungültig und ein neuer Link wird veröffentlicht.
 - Gelöschtes oder neu angelegtes Custom Field: Die gespeicherte Feld-ID wird
-  nach einem Neustart neu geprüft. Bei einem Schreibfehler aktualisiert die
-  Integration die ID, macht den alten Link ungültig und versucht genau einmal,
-  einen neuen Link zu veröffentlichen.
+  nach einem Neustart neu geprüft. Nur wenn Guesty eindeutig eine ungültige
+  Feldreferenz meldet und die neu aufgelöste ID wirklich abweicht, macht die
+  Integration den alten Link ungültig und veröffentlicht genau einmal einen
+  neuen. Timeouts, Rate-Limits und Serverfehler verändern den Link nicht.
 - Stornierung, Löschung, Check-out oder deaktivierte Funktion: Der Zugriff wird
   zuerst lokal gesperrt; anschließend wird das Guesty-Feld gelöscht.
-- Veraltete Guesty-Daten: Der Türzugang arbeitet „fail closed“ und verweigert
-  die Öffnung, bis wieder aktuelle Reservierungsdaten vorliegen.
+- Ein einzelner fehlgeschlagener Guesty-Poll sperrt einen bereits bestätigten
+  Gastlink nicht sofort. Erst wenn der letzte bestätigte Reservierungsstand den
+  konfigurierten Stale-Schwellenwert überschreitet, arbeitet der Türzugang
+  „fail closed“ und verweigert die Öffnung.
 - Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
+- Neue Links werden pro Abgleich in kleinen Batches veröffentlicht. Dadurch
+  bleibt auch bei vielen zukünftigen Reservierungen API-Kapazität für den
+  normalen Buchungs- und Webhook-Abgleich frei.
 - Fehlgeschlagene Veröffentlichungs- und Löschvorgänge verwenden ein
   persistentes exponentielles Backoff. Dadurch erzeugen Guesty-Ausfälle keine
   Schreibschleife; lokal widerrufene Links bleiben dabei sofort gesperrt.
@@ -319,6 +325,15 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
    Türen der Buchungscode öffnen darf. Die Integration blendet eingebaute,
    administrative sowie Gruppen mit Loxone-Config- oder
    Benutzerverwaltungsrechten grundsätzlich aus.
+8. Optional pro Listing unter **Taste hinter dem Guesty-Code** die am Tastenfeld
+   erforderliche Bestätigung eintragen, zum Beispiel `#`, `*` oder `☑️`.
+   Guesty zeigt dann beispielsweise `723456#`. Loxone und TTLock erhalten
+   weiterhin ausschließlich den numerischen PIN `723456`. Das Feld akzeptiert
+   bis zu acht Zeichen ohne Ziffern; bleibt es leer, zeigt Guesty nur den PIN.
+   Nutzt dasselbe Listing Loxone und TTLock mit unterschiedlichen
+   Bestätigungstasten, kann ein gemeinsamer Hinweis wie `☑️ / #` verwendet
+   werden. Die Einstellung erscheint dann nur einmal und kann vom zweiten
+   Anbieter nicht überschrieben werden.
 
 #### 5. Funktion prüfen
 
@@ -357,6 +372,11 @@ abgelehnt.
   geleert oder enthält es einen ungültigen Wert, wird ein eventuell vorhandener
   Loxone-Benutzer zuerst entfernt und anschließend ein neuer gültiger Code in
   Guesty erzeugt.
+- Ein konfigurierter Bestätigungszusatz gehört nur zur Guesty-Anzeige und nie
+  zum eigentlichen Zugangscode. Beim Lesen trennt die Integration einen kurzen
+  nichtnumerischen Zusatz sicher vom sechsstelligen PIN. Wird der Zusatz in den
+  Optionen geändert, schreibt sie bestehende aktive Reservierungen mit dem
+  neuen Anzeigeformat neu, ohne den PIN in Loxone oder TTLock zu ändern.
 - Wird ein manuell eingetragener Code bereits von einer anderen bekannten
   aktiven Guesty-Buchung verwendet, behält die bisherige Buchung ihren Code. Die
   Buchung mit dem duplizierten Eintrag erhält einen neuen Zufallscode, der

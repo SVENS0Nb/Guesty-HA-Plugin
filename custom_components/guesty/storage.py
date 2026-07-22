@@ -23,6 +23,8 @@ class GuestyStorage:
             hass,
             STORAGE_VERSION,
             f"{STORAGE_KEY}_{entry_id}",
+            private=True,
+            atomic_writes=True,
         )
 
     async def async_load(self) -> dict[str, Any]:
@@ -61,6 +63,22 @@ class GuestyStorage:
     async def async_remove(self) -> None:
         """Delete cached Guesty data from disk."""
         await self._store.async_remove()
+
+    @staticmethod
+    def strip_guest_details(cache: dict[str, Any]) -> bool:
+        """Remove persisted guest PII when its display option is disabled."""
+        changed = False
+        reservations = cache.get("reservations")
+        if not isinstance(reservations, list):
+            return False
+        for reservation in reservations:
+            if not isinstance(reservation, dict):
+                continue
+            for key in ("guest_name", "confirmation_code"):
+                if key in reservation:
+                    reservation.pop(key, None)
+                    changed = True
+        return changed
 
     @staticmethod
     def listings_from_cache(data: dict[str, Any]) -> dict[str, GuestyListing]:

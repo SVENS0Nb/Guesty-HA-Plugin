@@ -436,5 +436,5 @@ class TTLockApiClient:
     @staticmethod
     def _validate_code(code: str) -> None:
         """Accept only the integration's six-digit reservation codes."""
-        if not code.isdigit() or len(code) != 6:
+        if not code.isascii() or not code.isdigit() or len(code) != 6:
             raise ValueError("TTLock reservation passcodes must contain six digits")

@@ -108,6 +108,26 @@ async def test_user_payload_contains_timespan_groups_and_auto_delete(
     assert payload["expirationAction"] == 1
     assert payload["usergroups"] == ["group-1", "group-2"]
     assert payload["validUntil"] > payload["validFrom"]
+    assert request.await_args.kwargs["retry_transport"] is False
+
+
+@pytest.mark.asyncio
+async def test_existing_user_update_can_retry_transport(monkeypatch) -> None:
+    """Only UUID-addressed Loxone updates are safe for transport retries."""
+    client = _client()
+    request = AsyncMock(return_value=({"uuid": "user-uuid"}, 200))
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_add_or_update_user(
+        user_uuid="user-uuid",
+        name="Guesty Test",
+        user_id="guesty-123",
+        group_uuids=["group-1"],
+        valid_from=datetime.fromisoformat("2026-07-20T13:00:00+00:00"),
+        valid_until=datetime.fromisoformat("2026-07-22T09:00:00+00:00"),
+    )
+
+    assert request.await_args.kwargs["retry_transport"] is True
 
 
 @pytest.mark.asyncio
@@ -125,6 +145,13 @@ async def test_non_unique_access_codes_are_never_accepted(
 
     with pytest.raises(LoxoneCodeConflictError):
         await client.async_set_access_code("user-uuid", "712345")
+
+
+@pytest.mark.asyncio
+async def test_access_code_rejects_non_ascii_digits() -> None:
+    """Loxone receives only the ASCII keypad digits used by the integration."""
+    with pytest.raises(ValueError):
+        await _client().async_set_access_code("user-uuid", "٧١٢٣٤٥")
 
 
 @pytest.mark.asyncio

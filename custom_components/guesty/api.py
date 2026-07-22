@@ -17,6 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import (
     API_BASE_URL,
     API_MAX_PAGES,
+    API_MAX_RESPONSE_BYTES,
     API_MAX_RETRIES,
     API_REQUEST_TIMEOUT,
     API_RETRY_BASE_DELAY,
@@ -49,6 +50,11 @@ class GuestyAuthError(Exception):
 class GuestyApiError(Exception):
     """Raised when a Guesty API request fails."""
 
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        """Initialize an API error with optional structured HTTP context."""
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class GuestyRetryableError(GuestyApiError):
     """Raised when a Guesty API request can be retried."""
@@ -65,6 +71,19 @@ class GuestyPermissionError(GuestyApiError):
 
 class GuestyNotFoundError(GuestyApiError):
     """Raised when a Guesty resource no longer exists."""
+
+
+def is_custom_field_reference_error(error: Exception) -> bool:
+    """Return whether an error specifically points to an invalid field reference."""
+    if isinstance(error, GuestyNotFoundError):
+        return True
+    if not isinstance(error, GuestyApiError) or error.status_code not in {400, 422}:
+        return False
+    normalized = " ".join(str(error).lower().replace("_", " ").split())
+    return any(
+        marker in normalized
+        for marker in ("custom field", "field id", "fieldid", "field definition")
+    )
 
 
 class GuestyApiClient:
@@ -365,14 +384,34 @@ class GuestyApiClient:
         """Register Guesty webhooks and return the webhook id."""
         await self._async_ensure_token()
         payload = {"url": url, "events": list(WEBHOOK_SUBSCRIPTION_EVENTS)}
-        data = await self._async_request(
-            "POST",
-            "/webhooks",
-            json_body=payload,
-        )
+        try:
+            # Creating a webhook is not idempotent. A connection loss after
+            # Guesty accepted the POST must not be followed by another POST.
+            data = await self._async_request(
+                "POST",
+                "/webhooks",
+                json_body=payload,
+                retry_transport=False,
+            )
+        except GuestyRetryableError:
+            existing = await self._async_find_webhook_by_url(url)
+            if existing is None:
+                raise
+            return existing
         if not isinstance(data, dict) or not is_safe_resource_id(data.get("_id")):
             raise GuestyApiError("Unexpected webhook registration response")
         return data["_id"]
+
+    async def _async_find_webhook_by_url(self, url: str) -> str | None:
+        """Recover a webhook after an ambiguous non-idempotent create request."""
+        data = await self._async_request("GET", "/webhooks")
+        for item in self._normalize_results(data):
+            if item.get("url") != url:
+                continue
+            webhook_id = item.get("_id") or item.get("id")
+            if is_safe_resource_id(webhook_id):
+                return webhook_id
+        return None
 
     async def async_ensure_webhook(
         self,
@@ -385,9 +424,9 @@ class GuestyApiClient:
         webhooks = self._normalize_results(data)
         desired_events = set(WEBHOOK_SUBSCRIPTION_EVENTS)
 
-        candidate: dict[str, Any] | None = None
+        stored_candidate: dict[str, Any] | None = None
         if existing_id and is_safe_resource_id(existing_id):
-            candidate = next(
+            stored_candidate = next(
                 (
                     item
                     for item in webhooks
@@ -395,17 +434,56 @@ class GuestyApiClient:
                 ),
                 None,
             )
+
+        # Prefer an already-correct URL over stale local metadata. This avoids
+        # deleting a recovered webhook and issuing another non-idempotent POST
+        # after an earlier response was lost or the external HA URL changed.
+        candidate = next(
+            (
+                item
+                for item in webhooks
+                if item.get("url") == url
+                and (item.get("_id") or item.get("id")) == existing_id
+            ),
+            None,
+        )
         if candidate is None:
             candidate = next(
                 (item for item in webhooks if item.get("url") == url),
                 None,
             )
+        if candidate is None:
+            candidate = stored_candidate
 
         if candidate is None:
             return await self.async_register_webhook(url)
 
         webhook_id = candidate.get("_id") or candidate.get("id")
         self._validate_resource_id(webhook_id, "webhook")
+        if (
+            stored_candidate is not None
+            and stored_candidate is not candidate
+            and stored_candidate.get("url") != url
+        ):
+            stale_id = stored_candidate.get("_id") or stored_candidate.get("id")
+            if is_safe_resource_id(stale_id):
+                try:
+                    await self.async_unregister_webhook(stale_id)
+                except (GuestyApiError, GuestyAuthError) as err:
+                    _LOGGER.warning("Could not remove a stale Guesty webhook: %s", err)
+        for duplicate in webhooks:
+            duplicate_id = duplicate.get("_id") or duplicate.get("id")
+            if (
+                duplicate is candidate
+                or duplicate.get("url") != url
+                or duplicate_id == webhook_id
+                or not is_safe_resource_id(duplicate_id)
+            ):
+                continue
+            try:
+                await self.async_unregister_webhook(duplicate_id)
+            except (GuestyApiError, GuestyAuthError) as err:
+                _LOGGER.warning("Could not remove a duplicate Guesty webhook: %s", err)
         remote_url = candidate.get("url")
         is_disabled = (
             candidate.get("active") is False or candidate.get("enabled") is False
@@ -560,7 +638,7 @@ class GuestyApiClient:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         ) as response:
-            body = await response.text()
+            body = await self._async_read_response_text(response)
             if response.status != 200:
                 _LOGGER.error("Guesty auth failed with HTTP %s", response.status)
                 if response.status in {400, 401, 403}:
@@ -653,6 +731,7 @@ class GuestyApiClient:
         params: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
         retry_auth: bool = True,
+        retry_transport: bool = True,
     ) -> Any:
         """Perform an authenticated API request with retries."""
         if not self._access_token:
@@ -671,13 +750,13 @@ class GuestyApiClient:
             except (GuestyAuthError, GuestyPermissionError):
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                last_error = GuestyApiError("Request connection failed")
+                last_error = GuestyRetryableError("Request connection failed")
             except GuestyRetryableError as err:
                 last_error = err
             except GuestyApiError:
                 raise
 
-            if attempt >= API_MAX_RETRIES:
+            if not retry_transport or attempt >= API_MAX_RETRIES:
                 break
             delay = self._retry_delay(last_error, attempt)
             _LOGGER.debug(
@@ -720,7 +799,7 @@ class GuestyApiClient:
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT),
         ) as response:
-            body = await response.text()
+            body = await self._async_read_response_text(response)
             self._capture_rate_limit_headers(response.headers)
 
             if response.status == 401 and retry_auth:
@@ -737,7 +816,7 @@ class GuestyApiClient:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT),
                 ) as retry_response:
-                    retry_body = await retry_response.text()
+                    retry_body = await self._async_read_response_text(retry_response)
                     self._capture_rate_limit_headers(retry_response.headers)
                     if retry_response.status == 401:
                         raise GuestyAuthError(
@@ -778,7 +857,8 @@ class GuestyApiClient:
                                 retry_response.status,
                                 retry_body,
                                 retry_response.headers,
-                            )
+                            ),
+                            retry_response.status,
                         )
                     return self._parse_response_body(retry_body)
 
@@ -824,7 +904,8 @@ class GuestyApiClient:
                         response.status,
                         body,
                         response.headers,
-                    )
+                    ),
+                    response.status,
                 )
 
             return self._parse_response_body(body)
@@ -838,6 +919,14 @@ class GuestyApiClient:
             return json.loads(body)
         except json.JSONDecodeError as err:
             raise GuestyApiError("Invalid JSON response from Guesty") from err
+
+    @staticmethod
+    async def _async_read_response_text(response: aiohttp.ClientResponse) -> str:
+        """Read one bounded API response to protect Home Assistant memory."""
+        raw = await response.content.read(API_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > API_MAX_RESPONSE_BYTES:
+            raise GuestyApiError("Guesty response exceeded the size limit")
+        return raw.decode(response.charset or "utf-8", errors="replace")
 
     @staticmethod
     def _error_message(

@@ -22,11 +22,13 @@ from .api import (
     is_safe_resource_id,
 )
 from .const import (
+    CONF_EXPOSE_GUEST_DETAILS,
     CONF_LISTING_SYNC_INTERVAL,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_SCAN_INTERVAL,
     CONF_STALE_THRESHOLD_HOURS,
+    DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
@@ -186,6 +188,14 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         )
 
         cache = await self._storage.async_load()
+        expose_guest_details = bool(
+            self.config_entry.options.get(
+                CONF_EXPOSE_GUEST_DETAILS,
+                DEFAULT_EXPOSE_GUEST_DETAILS,
+            )
+        )
+        if not expose_guest_details and GuestyStorage.strip_guest_details(cache):
+            await self._storage.async_save(cache)
         listings = GuestyStorage.listings_from_cache(cache)
         reservations = GuestyStorage.reservations_from_cache(cache)
 
@@ -264,9 +274,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         listing_id: listing.to_dict()
                         for listing_id, listing in listings.items()
                     },
-                    "reservations": [
-                        reservation.to_dict() for reservation in reservations
-                    ],
+                    "reservations": self._reservations_for_cache(reservations),
                     "access_token": self._client.access_token,
                     "token_expires_at": self._client.token_expires_at,
                     "last_sync": last_sync,
@@ -329,6 +337,11 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
     async def async_load_cached_data(self) -> GuestyCoordinatorData | None:
         """Load cached data for fast startup."""
         cache = await self._storage.async_load()
+        if not self.config_entry.options.get(
+            CONF_EXPOSE_GUEST_DETAILS,
+            DEFAULT_EXPOSE_GUEST_DETAILS,
+        ) and GuestyStorage.strip_guest_details(cache):
+            await self._storage.async_save(cache)
         listings = GuestyStorage.listings_from_cache(cache)
         if not listings:
             return None
@@ -576,9 +589,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         listing_id: listing.to_dict()
                         for listing_id, listing in listings.items()
                     },
-                    "reservations": [
-                        reservation.to_dict() for reservation in reservations
-                    ],
+                    "reservations": self._reservations_for_cache(reservations),
                     "access_token": self._client.access_token,
                     "token_expires_at": self._client.token_expires_at,
                     "last_sync": now,
@@ -624,7 +635,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 days_future=days_future,
             )
             now = dt_util.utcnow().isoformat()
-            cache["reservations"] = [item.to_dict() for item in reservations]
+            cache["reservations"] = self._reservations_for_cache(reservations)
             cache["last_sync"] = now
             cache["last_reservation_sync"] = now
             cache["last_error"] = None
@@ -649,7 +660,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             now = dt_util.utcnow().isoformat()
             cache.update(
                 {
-                    "reservations": [item.to_dict() for item in remaining],
+                    "reservations": self._reservations_for_cache(remaining),
                     "last_sync": now,
                     "last_reservation_sync": now,
                     "last_error": None,
@@ -690,6 +701,21 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 webhook_active=self._webhook_active,
             )
         )
+
+    def _reservations_for_cache(
+        self, reservations: list[GuestyReservation]
+    ) -> list[dict[str, Any]]:
+        """Serialize reservations without persisting opted-out guest details."""
+        include_guest_details = bool(
+            self.config_entry.options.get(
+                CONF_EXPOSE_GUEST_DETAILS,
+                DEFAULT_EXPOSE_GUEST_DETAILS,
+            )
+        )
+        return [
+            reservation.to_dict(include_guest_details=include_guest_details)
+            for reservation in reservations
+        ]
 
     async def async_recalculate_occupancy(self) -> None:
         """Recalculate occupancy locally without an API call."""

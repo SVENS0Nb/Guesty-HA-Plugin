@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
 import aiohttp
@@ -16,6 +17,7 @@ from custom_components.guesty.api import (
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    is_custom_field_reference_error,
     is_safe_resource_id,
 )
 from custom_components.guesty.const import WEBHOOK_SUBSCRIPTION_EVENTS
@@ -26,6 +28,18 @@ def _client(*, token: str | None = "token") -> GuestyApiClient:
     """Return a client whose network methods can be mocked."""
     expires = (dt_util.utcnow() + timedelta(hours=1)).timestamp() if token else None
     return GuestyApiClient(object(), "client", "secret", token, expires)
+
+
+def test_custom_field_error_classification_is_narrow() -> None:
+    """Only field-specific client errors trigger destructive self-healing."""
+    assert is_custom_field_reference_error(GuestyNotFoundError("missing"))
+    assert is_custom_field_reference_error(
+        GuestyApiError("Custom field definition is invalid", 400)
+    )
+    assert not is_custom_field_reference_error(
+        GuestyApiError("Reservation payload is invalid", 400)
+    )
+    assert not is_custom_field_reference_error(GuestyRetryableError("offline"))
 
 
 @pytest.mark.asyncio
@@ -44,6 +58,24 @@ async def test_network_error_is_retried(monkeypatch) -> None:
     assert result == {"ok": True}
     assert request_once.await_count == 2
     sleep.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_transport_error_is_not_retried(monkeypatch) -> None:
+    """Callers can prevent ambiguous create operations from being replayed."""
+    client = _client()
+    request_once = AsyncMock(
+        side_effect=[aiohttp.ClientConnectionError("offline"), {"ok": True}]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(client, "_async_request_once", request_once)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    with pytest.raises(GuestyRetryableError, match="connection failed"):
+        await client._async_request("POST", "/webhooks", retry_transport=False)
+
+    request_once.assert_awaited_once()
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -232,7 +264,62 @@ async def test_webhook_registration_uses_only_documented_events(monkeypatch) -> 
             "url": "https://ha.example.test/hook",
             "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
         },
+        retry_transport=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_webhook_create_recovers_without_second_post(
+    monkeypatch,
+) -> None:
+    """A lost POST response is reconciled by URL instead of creating a duplicate."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            GuestyRetryableError("connection lost"),
+            [{"_id": "webhook-1", "url": "https://ha.example.test/hook"}],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_register_webhook("https://ha.example.test/hook")
+
+    assert result == "webhook-1"
+    assert request.await_count == 2
+    assert request.await_args_list[0].args == ("POST", "/webhooks")
+    assert request.await_args_list[0].kwargs["retry_transport"] is False
+    assert request.await_args_list[1].args == ("GET", "/webhooks")
+
+
+@pytest.mark.asyncio
+async def test_existing_duplicate_webhooks_are_cleaned_up(monkeypatch) -> None:
+    """Legacy duplicate subscriptions are reduced to one active URL."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": "webhook-1",
+                    "url": "https://ha.example.test/hook",
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                    "active": True,
+                },
+                {
+                    "_id": "webhook-2",
+                    "url": "https://ha.example.test/hook",
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                    "active": True,
+                },
+            ],
+            [],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_ensure_webhook("https://ha.example.test/hook")
+
+    assert result == "webhook-1"
+    request.assert_any_await("DELETE", "/webhooks/webhook-2")
 
 
 @pytest.mark.asyncio
@@ -536,8 +623,56 @@ async def test_changed_webhook_url_is_deleted_and_recreated(monkeypatch) -> None
             "url": "https://new.example.test/hook",
             "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
         },
+        retry_transport=False,
     )
     assert not any(call.args[:1] == ("PUT",) for call in request.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_correct_webhook_url_wins_over_stale_stored_id(monkeypatch) -> None:
+    """Recovered remote state is reused without another delete/create cycle."""
+    client = _client()
+    request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": "webhook-old",
+                    "url": "https://old.example.test/hook",
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                    "active": True,
+                },
+                {
+                    "_id": "webhook-current",
+                    "url": "https://new.example.test/hook",
+                    "events": list(WEBHOOK_SUBSCRIPTION_EVENTS),
+                    "active": True,
+                },
+            ],
+            [],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_ensure_webhook(
+        "https://new.example.test/hook", "webhook-old"
+    )
+
+    assert result == "webhook-current"
+    request.assert_any_await("DELETE", "/webhooks/webhook-old")
+    assert not any(call.args[:1] == ("POST",) for call in request.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_api_response_body_has_a_hard_size_limit(monkeypatch) -> None:
+    """A malformed upstream response cannot grow Home Assistant memory unbounded."""
+    monkeypatch.setattr("custom_components.guesty.api.API_MAX_RESPONSE_BYTES", 8)
+    content = SimpleNamespace(read=AsyncMock(return_value=b"x" * 9))
+    response = SimpleNamespace(content=content, charset="utf-8")
+
+    with pytest.raises(GuestyApiError, match="exceeded the size limit"):
+        await GuestyApiClient._async_read_response_text(response)
+
+    content.read.assert_awaited_once_with(9)
 
 
 @pytest.mark.asyncio

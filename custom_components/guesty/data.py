@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
 
@@ -29,6 +29,8 @@ class GuestyRuntimeData:
     ttlock_manager: GuestyTTLockManager | None
     sensor_listing_ids: set[str] = field(default_factory=set)
     calendar_listing_ids: set[str] = field(default_factory=set)
+    sensor_listing_entities: dict[str, list[Any]] = field(default_factory=dict)
+    calendar_listing_entities: dict[str, list[Any]] = field(default_factory=dict)
 
 
 type GuestyConfigEntry = ConfigEntry[GuestyRuntimeData]

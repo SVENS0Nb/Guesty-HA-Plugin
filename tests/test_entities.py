@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 import zoneinfo
 
 import pytest
@@ -14,6 +14,7 @@ from homeassistant.helpers.entity import EntityCategory
 from custom_components.guesty.calendar import (
     GuestyReservationCalendar,
     _add_listing_entities as add_calendar_entities,
+    _async_sync_listing_entities as sync_calendar_entities,
 )
 from custom_components.guesty.const import CONF_EXPOSE_GUEST_DETAILS
 from custom_components.guesty.models import (
@@ -29,6 +30,7 @@ from custom_components.guesty.sensor import (
     GuestyTTLockPinStatusSensor,
     GuestyOccupancySensor,
     _add_listing_entities as add_sensor_entities,
+    _async_sync_listing_entities as sync_sensor_entities,
 )
 
 TZ = zoneinfo.ZoneInfo("Europe/Berlin")
@@ -373,3 +375,49 @@ def test_removed_listing_entities_become_unavailable() -> None:
     assert not guest_sensor.available
     assert not access_sensor.available
     assert not calendar.available
+
+
+@pytest.mark.asyncio
+async def test_removed_listing_entities_are_removed_from_runtime(hass) -> None:
+    """An authoritative listing deletion removes sensor and calendar objects."""
+    coordinator = _coordinator()
+    sensor_entity = SimpleNamespace(entity_id=None, hass=hass, async_remove=AsyncMock())
+    disabled_sensor = SimpleNamespace(
+        entity_id=None, hass=None, async_remove=AsyncMock()
+    )
+    calendar_entity = SimpleNamespace(
+        entity_id=None, hass=hass, async_remove=AsyncMock()
+    )
+    disabled_calendar = SimpleNamespace(
+        entity_id=None, hass=None, async_remove=AsyncMock()
+    )
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(
+            access_manager=_access_manager(),
+            loxone_manager=_loxone_manager(),
+            ttlock_manager=None,
+            sensor_listing_ids={"listing-1"},
+            calendar_listing_ids={"listing-1"},
+            sensor_listing_entities={"listing-1": [sensor_entity, disabled_sensor]},
+            calendar_listing_entities={
+                "listing-1": [calendar_entity, disabled_calendar]
+            },
+        )
+    )
+    coordinator.data.listings.clear()
+    add_sensors = MagicMock()
+    add_calendars = MagicMock()
+
+    await sync_sensor_entities(hass, coordinator, entry, add_sensors)
+    await sync_calendar_entities(hass, coordinator, entry, add_calendars)
+
+    sensor_entity.async_remove.assert_awaited_once_with(force_remove=True)
+    disabled_sensor.async_remove.assert_not_awaited()
+    calendar_entity.async_remove.assert_awaited_once_with(force_remove=True)
+    disabled_calendar.async_remove.assert_not_awaited()
+    assert entry.runtime_data.sensor_listing_ids == set()
+    assert entry.runtime_data.calendar_listing_ids == set()
+    assert entry.runtime_data.sensor_listing_entities == {}
+    assert entry.runtime_data.calendar_listing_entities == {}
+    add_sensors.assert_not_called()
+    add_calendars.assert_not_called()

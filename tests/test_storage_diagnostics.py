@@ -31,7 +31,7 @@ from custom_components.guesty.const import (
     DOMAIN,
 )
 from custom_components.guesty.diagnostics import async_get_config_entry_diagnostics
-from custom_components.guesty.models import GuestyListing
+from custom_components.guesty.models import GuestyListing, GuestyReservation
 from custom_components.guesty.storage import GuestyStorage
 
 
@@ -68,6 +68,47 @@ async def test_non_mapping_cache_is_reset(hass) -> None:
 
     assert cache["listings"] == {}
     assert cache["reservations"] == []
+
+
+def test_general_cache_is_private_atomic_and_can_strip_guest_pii(hass) -> None:
+    """Guest names, confirmation codes, and OAuth data use protected storage."""
+    storage = GuestyStorage(hass, "entry")
+    assert storage._store._private is True
+    assert storage._store._atomic_writes is True
+    cache = {
+        "reservations": [
+            {
+                "id": "reservation-1",
+                "guest_name": "Private Guest",
+                "confirmation_code": "PRIVATE-CODE",
+            }
+        ]
+    }
+
+    assert GuestyStorage.strip_guest_details(cache) is True
+    assert cache["reservations"] == [{"id": "reservation-1"}]
+    assert GuestyStorage.strip_guest_details(cache) is False
+
+
+def test_reservation_serialization_can_omit_guest_details() -> None:
+    """The disabled UI privacy option also controls persistent cache content."""
+    reservation = GuestyReservation.from_api(
+        {
+            "_id": "reservation-1",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-22T15:00:00+00:00",
+            "checkOut": "2026-07-23T11:00:00+00:00",
+            "confirmationCode": "PRIVATE-CODE",
+            "guest": {"fullName": "Private Guest"},
+        }
+    )
+    assert reservation is not None
+
+    serialized = reservation.to_dict(include_guest_details=False)
+
+    assert "guest_name" not in serialized
+    assert "confirmation_code" not in serialized
 
 
 @pytest.mark.asyncio

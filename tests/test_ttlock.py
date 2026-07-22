@@ -9,8 +9,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.guesty import ttlock
+from custom_components.guesty import loxone, ttlock
 from custom_components.guesty.const import (
+    CONF_ACCESS_EARLY_MINUTES,
+    CONF_ACCESS_LATE_MINUTES,
+    CONF_GUESTY_CODE_SUFFIXES,
+    CONF_LOXONE_CODE_PREFIX,
+    CONF_LOXONE_CUSTOM_FIELD,
+    CONF_LOXONE_ENABLED,
     CONF_TTLOCK_ACCESS_TOKEN,
     CONF_TTLOCK_ACCOUNT,
     CONF_TTLOCK_CLIENT_ID,
@@ -27,6 +33,7 @@ from custom_components.guesty.const import (
     CONF_TTLOCK_USERNAME,
     DOMAIN,
 )
+from custom_components.guesty.loxone import GuestyLoxoneManager
 from custom_components.guesty.models import GuestyListing, GuestyReservation
 from custom_components.guesty.ttlock import (
     GuestyTTLockManager,
@@ -91,27 +98,38 @@ def _options(lock_ids: list[int] | None = None) -> dict:
     }
 
 
-def _manager(hass, monkeypatch, reservation: GuestyReservation):
-    entry = MockConfigEntry(domain=DOMAIN, options=_options())
-    entry.add_to_hass(hass)
-    coordinator = SimpleNamespace(
-        data=SimpleNamespace(
-            listings={"listing-1": _listing()},
-            reservations=[reservation],
-            data_stale=False,
+def _manager(
+    hass,
+    monkeypatch,
+    reservation: GuestyReservation,
+    *,
+    entry=None,
+    coordinator=None,
+    pin_manager=None,
+):
+    if entry is None:
+        entry = MockConfigEntry(domain=DOMAIN, options=_options())
+        entry.add_to_hass(hass)
+    if coordinator is None:
+        coordinator = SimpleNamespace(
+            data=SimpleNamespace(
+                listings={"listing-1": _listing()},
+                reservations=[reservation],
+                data_stale=False,
+            )
         )
-    )
-    pin_manager = SimpleNamespace(
-        reservation_access_window=lambda item, _listing: (
-            item.check_in_datetime(_listing),
-            item.check_out_datetime(_listing),
-        ),
-        reservation_pin_snapshot=lambda _reservation_id: {
-            "code": "712345",
-            "field_synced": True,
-        },
-        async_rotate_external_conflict=AsyncMock(return_value=True),
-    )
+    if pin_manager is None:
+        pin_manager = SimpleNamespace(
+            reservation_access_window=lambda item, _listing: (
+                item.check_in_datetime(_listing),
+                item.check_out_datetime(_listing),
+            ),
+            reservation_pin_snapshot=lambda _reservation_id: {
+                "code": "712345",
+                "field_synced": True,
+            },
+            async_rotate_external_conflict=AsyncMock(return_value=True),
+        )
     manager = GuestyTTLockManager(hass, entry, coordinator, pin_manager)
     manager._data = {"records": {}, "tokens": {}}
     manager._storage.async_save = AsyncMock()
@@ -197,6 +215,36 @@ async def test_future_reservation_defers_ttlock_without_extra_guesty_poll(
 
 
 @pytest.mark.asyncio
+async def test_malformed_reservation_does_not_block_valid_ttlock_delivery(
+    hass, monkeypatch
+) -> None:
+    """One invalid Guesty interval is isolated from every valid reservation."""
+    valid = _reservation()
+    invalid = _reservation()
+    invalid.id = "reservation-invalid"
+    invalid.check_in_utc = "not-a-date"
+    coordinator = SimpleNamespace(
+        data=SimpleNamespace(
+            listings={"listing-1": _listing()},
+            reservations=[invalid, valid],
+            data_stale=False,
+        )
+    )
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        valid,
+        coordinator=coordinator,
+    )
+
+    await manager.async_reconcile()
+
+    assert remote.async_add_passcode.await_count == 2
+    assert manager.diagnostics()["last_reconcile_result"] == "partial"
+    assert "reservation-invalid" not in manager._records
+
+
+@pytest.mark.asyncio
 async def test_same_guesty_code_is_installed_on_every_mapped_lock(
     hass, monkeypatch
 ) -> None:
@@ -219,6 +267,63 @@ async def test_same_guesty_code_is_installed_on_every_mapped_lock(
     assert manager.listing_status_snapshot("listing-1")["ttlock_status"] == (
         "provisioned"
     )
+
+
+@pytest.mark.asyncio
+async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
+    hass, monkeypatch
+) -> None:
+    """The real shared PIN manager strips Guesty's display-only keypad key."""
+    reservation = _reservation()
+    options = {
+        **_options([101]),
+        CONF_LOXONE_ENABLED: False,
+        CONF_LOXONE_CODE_PREFIX: "7",
+        CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
+        CONF_ACCESS_EARLY_MINUTES: 0,
+        CONF_ACCESS_LATE_MINUTES: 0,
+        CONF_GUESTY_CODE_SUFFIXES: {"listing-1": "#"},
+    }
+    entry = MockConfigEntry(domain=DOMAIN, options=options)
+    entry.add_to_hass(hass)
+    coordinator = SimpleNamespace(
+        data=SimpleNamespace(
+            listings={"listing-1": _listing()},
+            reservations=[reservation],
+            data_stale=False,
+        )
+    )
+    guesty_client = SimpleNamespace(
+        async_resolve_custom_field=AsyncMock(return_value="field-id"),
+        async_get_reservation_custom_field=AsyncMock(return_value=None),
+        async_update_reservation_custom_field=AsyncMock(),
+    )
+    pin_manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
+    pin_manager._data = {"records": {}}
+    pin_manager._storage.async_save = AsyncMock()
+    pin_manager._schedule_at = MagicMock()
+    monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW)
+
+    await pin_manager.async_reconcile()
+
+    code = pin_manager.reservation_pin_snapshot(reservation.id)["code"]
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id, "field-id", f"{code}#"
+    )
+
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        entry=entry,
+        coordinator=coordinator,
+        pin_manager=pin_manager,
+    )
+    await manager.async_reconcile()
+
+    remote.async_add_passcode.assert_awaited_once()
+    assert remote.async_add_passcode.await_args.kwargs["code"] == code
+    assert "#" not in remote.async_add_passcode.await_args.kwargs["code"]
 
 
 @pytest.mark.asyncio
@@ -595,4 +700,44 @@ async def test_entry_removal_refuses_to_delete_foreign_passcode(
 
     assert complete is True
     remote.async_delete_passcode.assert_not_awaited()
+    remove.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_entry_removal_erases_ttlock_credentials_after_api_failure(
+    hass, monkeypatch
+) -> None:
+    """Deleted config entries never leave unreachable OAuth tombstones behind."""
+    data = {
+        "records": {
+            "reservation-1": {
+                "account_snapshot": {
+                    CONF_TTLOCK_REGION: "eu",
+                    CONF_TTLOCK_CLIENT_ID: "client",
+                    CONF_TTLOCK_CLIENT_SECRET: "secret",
+                    CONF_TTLOCK_USERNAME: "owner@example.com",
+                    CONF_TTLOCK_ACCESS_TOKEN: "access",
+                    CONF_TTLOCK_REFRESH_TOKEN: "refresh",
+                },
+                "locks": {"101": {"keyboard_pwd_id": 7001}},
+            }
+        },
+        "tokens": {},
+    }
+    remove = AsyncMock()
+    monkeypatch.setattr(GuestyTTLockStorage, "async_load", AsyncMock(return_value=data))
+    monkeypatch.setattr(GuestyTTLockStorage, "async_save", AsyncMock())
+    monkeypatch.setattr(GuestyTTLockStorage, "async_remove", remove)
+    remote = SimpleNamespace(
+        async_list_passcodes=AsyncMock(side_effect=TTLockApiError("offline"))
+    )
+    monkeypatch.setattr(
+        ttlock.TTLockApiClient, "from_hass", lambda *args, **kwargs: remote
+    )
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+
+    complete = await async_remove_stored_ttlock_passcodes(hass, entry)
+
+    assert complete is False
     remove.assert_awaited_once_with()

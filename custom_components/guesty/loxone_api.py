@@ -195,7 +195,12 @@ class LoxoneApiClient:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             safe="",
         )
-        value, _code = await self._async_request(f"addoredituser/{encoded}")
+        value, _code = await self._async_request(
+            f"addoredituser/{encoded}",
+            # Creating without a UUID is not idempotent. The manager persists a
+            # create marker and recovers by stable userid after ambiguity.
+            retry_transport=user_uuid is not None,
+        )
         returned_uuid = value.get("uuid") if isinstance(value, dict) else value
         if not isinstance(returned_uuid, str) or not returned_uuid:
             raise LoxoneApiError("Loxone did not return the user UUID")
@@ -203,7 +208,7 @@ class LoxoneApiClient:
 
     async def async_set_access_code(self, user_uuid: str, code: str) -> None:
         """Assign a numeric access code, rejecting every non-unique result."""
-        if not code.isdigit() or not 2 <= len(code) <= 8:
+        if not code.isascii() or not code.isdigit() or not 2 <= len(code) <= 8:
             raise ValueError("Loxone access codes must contain 2 to 8 digits")
         _value, result_code = await self._async_request(
             f"updateuseraccesscode/{quote(user_uuid, safe='')}/{quote(code, safe='')}",
@@ -246,6 +251,7 @@ class LoxoneApiClient:
         command: str,
         *,
         accepted_codes: set[int] | None = None,
+        retry_transport: bool = True,
     ) -> tuple[Any, int]:
         """Run one authenticated web-service command with bounded retries."""
         accepted = accepted_codes or {200}
@@ -297,7 +303,7 @@ class LoxoneApiClient:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last_error = err
-                if attempt >= LOXONE_MAX_RETRIES:
+                if not retry_transport or attempt >= LOXONE_MAX_RETRIES:
                     break
                 await asyncio.sleep(2**attempt)
         raise LoxoneApiError(

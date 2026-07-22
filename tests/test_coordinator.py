@@ -350,6 +350,69 @@ async def test_new_listing_webhook_uses_payload_and_targeted_reservations(hass) 
 
 
 @pytest.mark.asyncio
+async def test_new_listing_webhook_does_not_persist_opted_out_guest_details(
+    hass,
+) -> None:
+    """Targeted new-listing reads obey the same cache privacy option as polling."""
+    reservation = _reservation()
+    reservation.guest_name = "Private Guest"
+    reservation.confirmation_code = "PRIVATE-CODE"
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(),
+        async_get_reservations=AsyncMock(return_value=[reservation]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_listing_webhooks(
+        [
+            {
+                "event": "listing.new",
+                "listing": {
+                    "_id": "listing-1",
+                    "title": "New Apartment",
+                    "timezone": "Europe/Berlin",
+                },
+            }
+        ]
+    )
+
+    saved = storage.async_save.await_args.args[0]["reservations"][0]
+    assert "guest_name" not in saved
+    assert "confirmation_code" not in saved
+
+
+@pytest.mark.asyncio
+async def test_reservation_webhook_does_not_persist_opted_out_guest_details(
+    hass,
+) -> None:
+    """A single-reservation webhook cannot restore PII removed from the cache."""
+    reservation = _reservation()
+    reservation.guest_name = "Private Guest"
+    reservation.confirmation_code = "PRIVATE-CODE"
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    client = SimpleNamespace(async_get_reservation=AsyncMock(return_value=reservation))
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    saved = storage.async_save.await_args.args[0]["reservations"][0]
+    assert "guest_name" not in saved
+    assert "confirmation_code" not in saved
+    assert instance.data.reservations[0].guest_name == "Private Guest"
+
+
+@pytest.mark.asyncio
 async def test_removed_listing_webhook_prunes_listing_and_reservations(hass) -> None:
     """Removed listings become unavailable immediately with no API request."""
     cache = _empty_cache()
