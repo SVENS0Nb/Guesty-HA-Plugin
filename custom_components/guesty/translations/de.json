@@ -176,6 +176,7 @@
       "select_listing": "Wähle mindestens ein Listing aus",
       "invalid_branding_url": "Logo und Favicon müssen gültige direkte HTTPS-URLs verwenden",
       "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden",
+      "invalid_code_suffix": "Der Guesty-Code-Zusatz darf höchstens 8 sichtbare Zeichen und keine Ziffern enthalten",
       "invalid_code_prefix": "Der PIN-Präfix muss aus 1 oder 2 Ziffern bestehen",
       "custom_field_not_found": "Trage Name, Variable oder ID eines Guesty-Reservierungs-Custom-Fields ein",
       "loxone_invalid_auth": "Loxone lehnt das Konto ab oder das Recht Benutzerverwaltung fehlt",

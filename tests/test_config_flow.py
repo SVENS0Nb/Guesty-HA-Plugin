@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from voluptuous_serialize import convert
 
 from custom_components.guesty import config_flow
 from custom_components.guesty.const import (
@@ -454,6 +456,7 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
         loxone_server_input,
     )
     assert listing_form["step_id"] == "loxone_listing"
+    convert(listing_form["data_schema"], custom_serializer=cv.custom_serializer)
 
     repeated_form = await hass.config_entries.options.async_configure(
         form["flow_id"], loxone_server_input
@@ -462,6 +465,18 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
     assert repeated_form["errors"] == {}
 
     server_id = loxone_server_id("https://loxone.example.test/proxy", "service")
+    invalid_suffix_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_GROUP_UUIDS: [f"{server_id}|group-front"],
+            CONF_GUESTY_CODE_SUFFIX: "7#",
+        },
+    )
+    assert invalid_suffix_form["step_id"] == "loxone_listing"
+    assert invalid_suffix_form["errors"] == {
+        CONF_GUESTY_CODE_SUFFIX: "invalid_code_suffix"
+    }
+
     result = await hass.config_entries.options.async_configure(
         form["flow_id"],
         {
@@ -590,6 +605,7 @@ async def test_options_flow_tests_ttlock_and_maps_compatible_locks(
         ttlock_account_input,
     )
     assert listing_form["step_id"] == "ttlock_listing"
+    convert(listing_form["data_schema"], custom_serializer=cv.custom_serializer)
     ttlock_client.async_authenticate.assert_awaited_once_with(
         "owner@example.com", "app-password"
     )

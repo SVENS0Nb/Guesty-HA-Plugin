@@ -119,6 +119,9 @@ CONF_LOXONE_SERVER_COUNT = "loxone_server_count"
 CONF_TTLOCK_PASSWORD = "ttlock_password"
 TTLOCK_OPEN_PLATFORM_URL = "https://euopen.ttlock.com/"
 TTLOCK_OAUTH_DOC_URL = "https://euopen.ttlock.com/doc/oauth2"
+GUESTY_CODE_SUFFIX_SELECTOR = selector.TextSelector(
+    selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+)
 
 
 def _guesty_code_suffix(value: Any) -> str:
@@ -925,30 +928,35 @@ class GuestyOptionsFlow(OptionsFlow):
             elif len(server_ids) != 1:
                 errors["base"] = "groups_from_one_server"
             else:
-                server_id = next(iter(server_ids))
-                self._pending_code_suffixes[listing_id] = _guesty_code_suffix(
-                    user_input.get(CONF_GUESTY_CODE_SUFFIX)
-                )
-                self._pending_loxone_mappings[listing_id] = {
-                    CONF_LOXONE_SERVER_ID: server_id,
-                    CONF_LOXONE_GROUP_UUIDS: list(
-                        dict.fromkeys(item[1] for item in parsed)
-                    ),
-                }
-                self._loxone_listing_queue.pop(0)
-                if self._loxone_listing_queue:
-                    return await self.async_step_loxone_listing()
-                self._pending_options[CONF_LOXONE_MINISERVERS] = (
-                    self._pending_loxone_servers
-                )
-                self._pending_options[CONF_LOXONE_LISTING_MAPPINGS] = (
-                    self._pending_loxone_mappings
-                )
-                if self._pending_options.get(
-                    CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED
-                ):
-                    return await self.async_step_ttlock()
-                return self.async_create_entry(title="", data=self._pending_options)
+                try:
+                    suffix = _guesty_code_suffix(
+                        user_input.get(CONF_GUESTY_CODE_SUFFIX)
+                    )
+                except vol.Invalid:
+                    errors[CONF_GUESTY_CODE_SUFFIX] = "invalid_code_suffix"
+                else:
+                    server_id = next(iter(server_ids))
+                    self._pending_code_suffixes[listing_id] = suffix
+                    self._pending_loxone_mappings[listing_id] = {
+                        CONF_LOXONE_SERVER_ID: server_id,
+                        CONF_LOXONE_GROUP_UUIDS: list(
+                            dict.fromkeys(item[1] for item in parsed)
+                        ),
+                    }
+                    self._loxone_listing_queue.pop(0)
+                    if self._loxone_listing_queue:
+                        return await self.async_step_loxone_listing()
+                    self._pending_options[CONF_LOXONE_MINISERVERS] = (
+                        self._pending_loxone_servers
+                    )
+                    self._pending_options[CONF_LOXONE_LISTING_MAPPINGS] = (
+                        self._pending_loxone_mappings
+                    )
+                    if self._pending_options.get(
+                        CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED
+                    ):
+                        return await self.async_step_ttlock()
+                    return self.async_create_entry(title="", data=self._pending_options)
 
         current = self.config_entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
         existing = current.get(listing_id, {}) if isinstance(current, dict) else {}
@@ -968,7 +976,7 @@ class GuestyOptionsFlow(OptionsFlow):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
-                vol.Optional(CONF_GUESTY_CODE_SUFFIX): _guesty_code_suffix,
+                vol.Optional(CONF_GUESTY_CODE_SUFFIX): GUESTY_CODE_SUFFIX_SELECTOR,
             },
             # A slow Miniserver check can leave a stale credential submission in
             # flight while this next step is already active. Drop only those
@@ -1351,24 +1359,33 @@ class GuestyOptionsFlow(OptionsFlow):
             elif len(parsed) > TTLOCK_MAX_LOCKS_PER_LISTING:
                 errors["base"] = "too_many_ttlock_locks"
             else:
-                if not suffix_already_configured:
-                    self._pending_code_suffixes[listing_id] = _guesty_code_suffix(
-                        user_input.get(CONF_GUESTY_CODE_SUFFIX)
+                try:
+                    suffix = (
+                        _guesty_code_suffix(user_input.get(CONF_GUESTY_CODE_SUFFIX))
+                        if not suffix_already_configured
+                        else None
                     )
-                self._pending_ttlock_mappings[listing_id] = {
-                    CONF_TTLOCK_LOCK_IDS: parsed
-                }
-                self._ttlock_listing_queue.pop(0)
-                if self._ttlock_listing_queue:
-                    return await self.async_step_ttlock_listing()
-                self._pending_options[CONF_TTLOCK_ACCOUNT] = (
-                    self._pending_ttlock_account
-                )
-                self._pending_options[CONF_TTLOCK_LOCKS] = self._pending_ttlock_locks
-                self._pending_options[CONF_TTLOCK_LISTING_MAPPINGS] = (
-                    self._pending_ttlock_mappings
-                )
-                return self.async_create_entry(title="", data=self._pending_options)
+                except vol.Invalid:
+                    errors[CONF_GUESTY_CODE_SUFFIX] = "invalid_code_suffix"
+                else:
+                    if suffix is not None:
+                        self._pending_code_suffixes[listing_id] = suffix
+                    self._pending_ttlock_mappings[listing_id] = {
+                        CONF_TTLOCK_LOCK_IDS: parsed
+                    }
+                    self._ttlock_listing_queue.pop(0)
+                    if self._ttlock_listing_queue:
+                        return await self.async_step_ttlock_listing()
+                    self._pending_options[CONF_TTLOCK_ACCOUNT] = (
+                        self._pending_ttlock_account
+                    )
+                    self._pending_options[CONF_TTLOCK_LOCKS] = (
+                        self._pending_ttlock_locks
+                    )
+                    self._pending_options[CONF_TTLOCK_LISTING_MAPPINGS] = (
+                        self._pending_ttlock_mappings
+                    )
+                    return self.async_create_entry(title="", data=self._pending_options)
 
         current = self.config_entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
         existing = current.get(listing_id, {}) if isinstance(current, dict) else {}
@@ -1393,7 +1410,9 @@ class GuestyOptionsFlow(OptionsFlow):
             )
         }
         if not suffix_already_configured:
-            schema_fields[vol.Optional(CONF_GUESTY_CODE_SUFFIX)] = _guesty_code_suffix
+            schema_fields[vol.Optional(CONF_GUESTY_CODE_SUFFIX)] = (
+                GUESTY_CODE_SUFFIX_SELECTOR
+            )
         # Authentication and lock discovery can outlive a duplicate frontend
         # submission. Once this step is active, discard fields from that prior
         # account form and keep waiting for an explicit lock selection.
