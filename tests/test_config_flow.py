@@ -443,16 +443,23 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
     )
     assert server_form["step_id"] == "loxone_server"
 
+    loxone_server_input = {
+        CONF_LOXONE_SERVER_NAME: "Haus",
+        CONF_LOXONE_SERVER_URL: "https://loxone.example.test/proxy/",
+        CONF_LOXONE_SERVER_USERNAME: "service",
+        CONF_LOXONE_SERVER_PASSWORD: "secret",
+    }
     listing_form = await hass.config_entries.options.async_configure(
         form["flow_id"],
-        {
-            CONF_LOXONE_SERVER_NAME: "Haus",
-            CONF_LOXONE_SERVER_URL: "https://loxone.example.test/proxy/",
-            CONF_LOXONE_SERVER_USERNAME: "service",
-            CONF_LOXONE_SERVER_PASSWORD: "secret",
-        },
+        loxone_server_input,
     )
     assert listing_form["step_id"] == "loxone_listing"
+
+    repeated_form = await hass.config_entries.options.async_configure(
+        form["flow_id"], loxone_server_input
+    )
+    assert repeated_form["step_id"] == "loxone_listing"
+    assert repeated_form["errors"] == {}
 
     server_id = loxone_server_id("https://loxone.example.test/proxy", "service")
     result = await hass.config_entries.options.async_configure(
@@ -565,26 +572,34 @@ async def test_options_flow_tests_ttlock_and_maps_compatible_locks(
     )
     assert ttlock_form["step_id"] == "ttlock"
 
+    ttlock_account_input = {
+        CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
+        CONF_LOXONE_CODE_PREFIX: "7",
+        CONF_ACCESS_EARLY_MINUTES: 15,
+        CONF_ACCESS_LATE_MINUTES: 30,
+        CONF_TTLOCK_PROVISION_LEAD_MINUTES: 360,
+        CONF_TTLOCK_REGION: "eu",
+        CONF_TTLOCK_CLIENT_ID: "tt-client",
+        CONF_TTLOCK_CLIENT_SECRET: "tt-secret",
+        CONF_TTLOCK_USERNAME: "owner@example.com",
+        config_flow.CONF_TTLOCK_PASSWORD: "app-password",
+        CONF_TTLOCK_LISTINGS: ["listing-1"],
+    }
     listing_form = await hass.config_entries.options.async_configure(
         form["flow_id"],
-        {
-            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
-            CONF_LOXONE_CODE_PREFIX: "7",
-            CONF_ACCESS_EARLY_MINUTES: 15,
-            CONF_ACCESS_LATE_MINUTES: 30,
-            CONF_TTLOCK_PROVISION_LEAD_MINUTES: 360,
-            CONF_TTLOCK_REGION: "eu",
-            CONF_TTLOCK_CLIENT_ID: "tt-client",
-            CONF_TTLOCK_CLIENT_SECRET: "tt-secret",
-            CONF_TTLOCK_USERNAME: "owner@example.com",
-            config_flow.CONF_TTLOCK_PASSWORD: "app-password",
-            CONF_TTLOCK_LISTINGS: ["listing-1"],
-        },
+        ttlock_account_input,
     )
     assert listing_form["step_id"] == "ttlock_listing"
     ttlock_client.async_authenticate.assert_awaited_once_with(
         "owner@example.com", "app-password"
     )
+
+    repeated_form = await hass.config_entries.options.async_configure(
+        form["flow_id"], ttlock_account_input
+    )
+    assert repeated_form["step_id"] == "ttlock_listing"
+    assert repeated_form["errors"] == {}
+    ttlock_client.async_authenticate.assert_awaited_once()
 
     result = await hass.config_entries.options.async_configure(
         form["flow_id"],

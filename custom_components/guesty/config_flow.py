@@ -912,7 +912,7 @@ class GuestyOptionsFlow(OptionsFlow):
                 )
         errors: dict[str, str] = {}
 
-        if user_input is not None:
+        if user_input and CONF_LOXONE_GROUP_UUIDS in user_input:
             selected = user_input.get(CONF_LOXONE_GROUP_UUIDS)
             parsed = (
                 [valid_values[item] for item in selected if item in valid_values]
@@ -961,7 +961,7 @@ class GuestyOptionsFlow(OptionsFlow):
             ]
         schema = vol.Schema(
             {
-                vol.Required(CONF_LOXONE_GROUP_UUIDS): selector.SelectSelector(
+                vol.Optional(CONF_LOXONE_GROUP_UUIDS): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=choices,
                         multiple=True,
@@ -969,7 +969,13 @@ class GuestyOptionsFlow(OptionsFlow):
                     )
                 ),
                 vol.Optional(CONF_GUESTY_CODE_SUFFIX): _guesty_code_suffix,
-            }
+            },
+            # A slow Miniserver check can leave a stale credential submission in
+            # flight while this next step is already active. Drop only those
+            # now-unrelated fields instead of exposing Voluptuous internals in
+            # the UI; the credential step has already validated and stored them
+            # in the in-memory pending configuration.
+            extra=vol.REMOVE_EXTRA,
         )
         current_suffixes = self.config_entry.options.get(CONF_GUESTY_CODE_SUFFIXES, {})
         existing_suffix = (
@@ -977,17 +983,22 @@ class GuestyOptionsFlow(OptionsFlow):
             if isinstance(current_suffixes, dict)
             else DEFAULT_GUESTY_CODE_SUFFIX
         )
+        schema = self.add_suggested_values_to_schema(
+            schema,
+            {
+                CONF_LOXONE_GROUP_UUIDS: selected_values,
+                CONF_GUESTY_CODE_SUFFIX: self._pending_code_suffixes.get(
+                    listing_id, existing_suffix
+                ),
+            },
+        )
+        # Home Assistant's suggested-value helper rebuilds the schema with the
+        # default PREVENT_EXTRA policy, so restore the deliberate stale-submit
+        # handling after applying suggestions.
+        schema = vol.Schema(schema.schema, extra=vol.REMOVE_EXTRA)
         return self.async_show_form(
             step_id="loxone_listing",
-            data_schema=self.add_suggested_values_to_schema(
-                schema,
-                {
-                    CONF_LOXONE_GROUP_UUIDS: selected_values,
-                    CONF_GUESTY_CODE_SUFFIX: self._pending_code_suffixes.get(
-                        listing_id, existing_suffix
-                    ),
-                },
-            ),
+            data_schema=schema,
             errors=errors,
             description_placeholders={"listing": listing.display_name},
         )
@@ -1324,7 +1335,7 @@ class GuestyOptionsFlow(OptionsFlow):
         }
         errors: dict[str, str] = {}
         suffix_already_configured = listing_id in self._pending_code_suffixes
-        if user_input is not None:
+        if user_input and CONF_TTLOCK_LOCK_IDS in user_input:
             selected = user_input.get(CONF_TTLOCK_LOCK_IDS)
             parsed: list[int] = []
             if isinstance(selected, list):
@@ -1373,7 +1384,7 @@ class GuestyOptionsFlow(OptionsFlow):
             str(value) for value in raw_selected if str(value) in valid_choice_values
         ]
         schema_fields: dict[Any, Any] = {
-            vol.Required(CONF_TTLOCK_LOCK_IDS): selector.SelectSelector(
+            vol.Optional(CONF_TTLOCK_LOCK_IDS): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=choices,
                     multiple=True,
@@ -1383,7 +1394,10 @@ class GuestyOptionsFlow(OptionsFlow):
         }
         if not suffix_already_configured:
             schema_fields[vol.Optional(CONF_GUESTY_CODE_SUFFIX)] = _guesty_code_suffix
-        schema = vol.Schema(schema_fields)
+        # Authentication and lock discovery can outlive a duplicate frontend
+        # submission. Once this step is active, discard fields from that prior
+        # account form and keep waiting for an explicit lock selection.
+        schema = vol.Schema(schema_fields, extra=vol.REMOVE_EXTRA)
         current_suffixes = self.config_entry.options.get(CONF_GUESTY_CODE_SUFFIXES, {})
         existing_suffix = (
             current_suffixes.get(listing_id, DEFAULT_GUESTY_CODE_SUFFIX)
@@ -1395,12 +1409,11 @@ class GuestyOptionsFlow(OptionsFlow):
         }
         if not suffix_already_configured:
             suggested_values[CONF_GUESTY_CODE_SUFFIX] = existing_suffix
+        schema = self.add_suggested_values_to_schema(schema, suggested_values)
+        schema = vol.Schema(schema.schema, extra=vol.REMOVE_EXTRA)
         return self.async_show_form(
             step_id="ttlock_listing",
-            data_schema=self.add_suggested_values_to_schema(
-                schema,
-                suggested_values,
-            ),
+            data_schema=schema,
             errors=errors,
             description_placeholders={"listing": listing.display_name},
         )
