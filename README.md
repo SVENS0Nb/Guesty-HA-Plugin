@@ -359,25 +359,30 @@ abgelehnt.
   ein Code im reservierten Präfixbereich erzeugt. Beim Update wird ein bereits
   privat gespeicherter Code ohne Rotation in das leere native Feld übernommen.
 - Ein gültiger, eindeutiger sechsstelliger Code im nativen Guesty-Keycode ist die
-  maßgebliche Quelle. Manuelle Änderungen werden nach dem Reservierungs-Webhook
-  beziehungsweise dem nächsten Abgleich übernommen und auch bei einem bereits
-  existierenden Loxone-Benutzer aktualisiert. Wird das Feld ausdrücklich
-  geleert oder enthält es einen ungültigen Wert, wird ein eventuell vorhandener
-  Loxone-Benutzer zuerst entfernt und anschließend ein neuer gültiger Code in
-  Guesty erzeugt.
+  maßgebliche Quelle. Sobald Guesty ihn einmal bestätigt hat, ändert die
+  Integration seine sechs Ziffern niemals automatisch. Manuelle Änderungen
+  werden nach dem Reservierungs-Webhook beziehungsweise dem nächsten Abgleich
+  übernommen und auch bei einem bereits existierenden Loxone-Benutzer
+  aktualisiert. Wird ein zuvor bestätigtes Feld ausdrücklich geleert oder
+  enthält es einen ungültigen Wert, werden vorhandene Loxone- und
+  TTLock-Zugänge entfernt und ein Konflikt angezeigt. Ein neuer Code wird erst
+  wieder verwendet, nachdem er manuell in Guesty eingetragen wurde.
 - Ein konfigurierter Bestätigungszusatz gehört nur zur Guesty-Anzeige und nie
   zum eigentlichen Zugangscode. Beim Lesen trennt die Integration einen kurzen
   nichtnumerischen Zusatz sicher vom sechsstelligen PIN. Wird der Zusatz in den
   Optionen geändert, schreibt sie bestehende aktive Reservierungen mit dem
   neuen Anzeigeformat neu, ohne den PIN in Loxone oder TTLock zu ändern.
 - Wird ein manuell eingetragener Code bereits von einer anderen bekannten
-  aktiven Guesty-Buchung verwendet, behält die bisherige Buchung ihren Code. Die
-  Buchung mit dem duplizierten Eintrag erhält einen neuen Zufallscode, der
-  zuerst nach Guesty und anschließend nach Loxone geschrieben wird.
+  aktiven Guesty-Buchung verwendet, behält die bisherige Buchung ihren Zugang.
+  Die Buchung mit dem duplizierten Eintrag wird gesperrt; die Integration
+  verändert keinen der beiden Guesty-Codes. Nach einer manuellen Änderung auf
+  einen eindeutigen Wert wird die Bereitstellung automatisch fortgesetzt.
 - Eine Kollision mit einem ausschließlich in Loxone vorhandenen Code kann die
   Loxone-API erst beim tatsächlichen Zuweisen erkennen. Bei zukünftigen
   Buchungen erfolgt diese Prüfung daher erst innerhalb des konfigurierten
-  Loxone-Vorlaufs; ein nötiger Ersatz erscheint dann automatisch in Guesty.
+  Loxone-Vorlaufs. Der möglicherweise angelegte Loxone-Benutzer wird entfernt
+  und der bestätigte Guesty-Code bleibt unverändert, bis er dort manuell
+  geändert wird.
 - Änderungen an Gastname, Zeitraum oder Gruppen aktualisieren den bestehenden
   Loxone-Benutzer. Wird eine bereits bereitgestellte Buchung so weit in die
   Zukunft verschoben, dass sie wieder außerhalb des Vorlaufs liegt, wird der
@@ -394,12 +399,11 @@ abgelehnt.
   speichert Codes ausdrücklich nicht dauerhaft.
 - Loxones Ergebnisse `201` (nicht eindeutig) und `409` (bereits in einem
   NFC-Authentifizierungsbaustein verwendet) werden niemals als Erfolg
-  akzeptiert. Der möglicherweise angelegte Benutzer wird sofort entfernt, der
-  abgelehnte Code ausgeschlossen und ein neuer Code erzeugt. Erst nachdem
-  Guesty den Ersatz bestätigt hat, wird die Loxone-Bereitstellung erneut
-  versucht. Pro Abgleich sind höchstens drei automatische Rotationen erlaubt;
-  danach greift das normale exponentielle Backoff. So entstehen weder
-  Endlosschleifen noch unkontrollierter API-Traffic.
+  akzeptiert. Der möglicherweise angelegte Benutzer wird sofort entfernt. Der
+  bestätigte Guesty-Code wird nicht verändert; der Status bleibt mit
+  exponentiellem Backoff auf `Konflikt`, bis ein manuell geänderter Guesty-Code
+  beobachtet wird. So entstehen weder Codewechsel noch unkontrollierter
+  API-Traffic.
 - Bei veralteten Guesty-Daten werden keine neuen Loxone-Benutzer angelegt oder
   Codes erzeugt. Bereits bekannte Benutzer werden am fest gespeicherten
   Zugangsende trotzdem entfernt. API-Fehler verwenden persistentes,
@@ -476,12 +480,10 @@ ist dafür nicht erforderlich.
   Funktion löschen ausschließlich die von dieser Integration verwalteten
   TTLock-Passcodes. Andere TTLock-Codes bleiben unangetastet.
 - Vor jeder Neuanlage wird die Passcodeliste des betroffenen Schlosses geprüft.
-  Ist der Guesty-Code dort bereits anderweitig vergeben, erzeugt der gemeinsame
-  PIN-Manager einen neuen global eindeutigen Code, bestätigt ihn zuerst in
-  Guesty und verteilt ihn anschließend erneut an Loxone und TTLock. TTLock darf
-  höchstens drei solcher Codewechsel pro Reservierung und Stunde auslösen;
-  weitere Konflikte warten mit Backoff, statt Guesty in einer schnellen
-  Schreibschleife zu verändern.
+  Ist der Guesty-Code dort bereits anderweitig vergeben, wird kein fremder Code
+  verändert und kein Ersatz in Guesty erzeugt. Ein möglicherweise nur teilweise
+  angelegter verwalteter Passcode wird entfernt. Der Status bleibt mit Backoff
+  auf `Konflikt`, bis in Guesty manuell ein anderer Code eingetragen wurde.
 - Bei mehreren Schlössern werden erfolgreiche Einzeloperationen sofort
   gespeichert. Ein ausgefallenes Gateway führt deshalb nicht zur doppelten
   Anlage auf bereits erfolgreichen Schlössern. Der Status lautet bis zur

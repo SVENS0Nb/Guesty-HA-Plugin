@@ -158,7 +158,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   `{"notes":{"keyCode":"..."}}`. Do not round-trip or overwrite unrelated notes.
   Treat the write as successful only after exact confirmation.
 - Guesty's returned `notes.keyCode` is authoritative. A valid, unique manual
-  change must propagate to existing Loxone and TTLock objects.
+  change must propagate to existing Loxone and TTLock objects. Once Guesty has
+  confirmed a PIN, the integration must never change its six digits
+  automatically; only a subsequently observed Guesty edit may replace it.
 - An omitted `notes` projection means “not observed,” not “the user deleted the
   Keycode.” Never rotate or overwrite a privately cached PIN solely because a
   sparse response omitted `notes`.
@@ -166,11 +168,13 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   Keycode publication. After bounded backoff, retry the exact stable private PIN
   for a failed initial write, source migration, or configured suffix change;
   never rotate merely because the projection is absent.
-- An explicitly empty, invalid, or duplicate observed Keycode is fail-closed:
-  revoke existing remote delivery first, generate a replacement, confirm it in
-  Guesty, and only then provision it remotely.
-- Duplicate ownership is deterministic. The established/lexically first known
-  reservation keeps a code; the new duplicate rotates.
+- An explicitly empty, invalid, or duplicate observed Keycode is fail-closed.
+  Revoke existing remote delivery and expose a conflict, but never manufacture
+  a replacement after any PIN was confirmed. A new reservation whose observed
+  Keycode is initially empty may receive its first generated PIN.
+- Duplicate ownership is deterministic. The first healthy established
+  reservation keeps remote delivery; later duplicates stay blocked until a
+  user supplies a unique code in Guesty.
 - The actual PIN is exactly six ASCII digits. Generated codes use
   `secrets.randbelow`, the configured one- or two-digit ASCII prefix, reject weak
   sequences, and exclude every known active/private/rejected code.
@@ -180,6 +184,12 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   display without rotating the numeric PIN.
 - Use at most two Guesty Keycode writes per reconciliation pass and schedule the
   remaining queue after about 30 seconds. Prioritize current and nearest stays.
+- Every native-Keycode path must consume that same write budget, including
+  sparse cached snapshots and one-time migrations from private stored PINs.
+  Never bypass the queue merely because Guesty omitted the `notes` projection.
+- Loxone and TTLock collisions never rotate an already confirmed Guesty PIN.
+  Delete any tentative remote object, expose a conflict, and use persistent
+  retry backoff until a manual Guesty edit supplies a different PIN.
 - A reservation-specific Guesty 404 consumes its own bounded write attempt and
   enters retry backoff, but must never stop unrelated reservations in the same
   batch. Account-wide authentication, permission, transport, or payload errors
@@ -253,8 +263,8 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Guest name may be sent only when the global guest-details privacy option is
   enabled. Otherwise use the booking ID as the remote label.
 - Loxone collision results such as `201` and `409` are not success. Delete any
-  tentative user, reject that code, rotate via authoritative Guesty, then retry.
-  Rotation attempts are bounded and backed off.
+  tentative user, retain the confirmed Guesty PIN unchanged, and expose a
+  backed-off conflict until the user changes the Keycode in Guesty.
 - Persist a private connection snapshot only while required to clean a remote
   user after configuration changes. On cancellation, remove plaintext first
   and retain only a code-free cleanup tombstone if deletion fails.
@@ -282,9 +292,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   it later with the same Guesty PIN.
 - Track every lock independently. Persist partial successes so one offline
   gateway causes targeted retry, not duplicate creation on successful locks.
-- Before add, check for code conflicts. A remote conflict may request a rotation
-  from the shared authoritative Guesty PIN manager, but rotations are strictly
-  bounded per reservation and time window.
+- Before add, check for code conflicts. A remote conflict deletes any tentative
+  managed passcode and enters backoff; it never requests an automatic Guesty
+  PIN rotation.
 - Use a privacy-safe hashed reservation marker for ambiguous-create recovery and
   ownership checks. Before change/delete, verify that the remote passcode ID
   still has the expected marker. Never alter foreign or manually renamed codes.
@@ -353,7 +363,7 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   PIN continuity.
 - Do not promise active/active behavior or use a new shared custom field to
   coordinate writers. Parallel writers can create competing URLs, remote
-  objects, collision rotations, and unnecessary API traffic.
+  objects, PIN conflicts, and unnecessary API traffic.
 
 ## Change and regression discipline
 
@@ -377,7 +387,7 @@ High-risk regression areas include:
 - fragmented HTTP bodies and size limits;
 - OAuth refresh stampedes and late `401` responses;
 - non-idempotent create recovery;
-- duplicate PIN ownership and bounded rotation;
+- duplicate PIN ownership and immutable confirmed PIN handling;
 - booking/listing/mapping changes after provisioning;
 - partial multi-lock success and foreign-object ownership checks;
 - repeated options-form submissions and blank-secret preservation;

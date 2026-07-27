@@ -59,8 +59,6 @@ _ACCOUNT_SNAPSHOT_KEY = "account_snapshot"
 _TOKEN_ACCOUNT_KEY = "account_key"
 _REMOTE_VERIFY_INTERVAL = timedelta(minutes=30)
 _REMOTE_PENDING_RETRY = timedelta(seconds=30)
-_CONFLICT_ROTATION_WINDOW = timedelta(hours=1)
-_MAX_CONFLICT_ROTATIONS_PER_WINDOW = 3
 _REMOTE_NORMAL_STATUS = 1
 _REMOTE_INVALID_STATUSES = {2, 5, 7, 9}
 _REMOTE_PENDING_STATUSES = {3, 4, 6, 8}
@@ -387,6 +385,14 @@ class GuestyTTLockManager:
                     pin = self._pin_manager.reservation_pin_snapshot(reservation.id)
                     code = pin.get("code")
                     if not pin.get("field_synced") or not isinstance(code, str):
+                        if record.get("locks"):
+                            try:
+                                await self._async_delete_all(record, marker)
+                            except TTLockApiError as err:
+                                self._record_retry_failure(record, now)
+                                record["last_error"] = self._error_reason(err)
+                                errors.append(record["last_error"])
+                                continue
                         record["last_error"] = "guesty_pin_pending"
                         continue
                     if not _CODE_PATTERN.fullmatch(code):
@@ -410,34 +416,17 @@ class GuestyTTLockManager:
                     except TTLockCodeConflictError:
                         try:
                             await self._async_delete_all(record, marker)
-                            if not self._allow_conflict_rotation(record, now):
-                                self._record_retry_failure(record, now)
-                                record["last_error"] = "code_conflict"
-                                errors.append("code_conflict")
-                                retry_at = self._retry_at(record)
-                                if retry_at is not None:
-                                    next_run = self._earlier(next_run, retry_at)
-                                continue
-                            await self._storage.async_save(self._data)
-                            rotated = (
-                                await self._pin_manager.async_rotate_external_conflict(
-                                    reservation.id, code
-                                )
-                            )
-                        except (TTLockApiError, GuestyApiError, GuestyAuthError) as err:
+                        except TTLockApiError as err:
                             self._record_retry_failure(record, now)
                             record["last_error"] = self._error_reason(err)
                             errors.append(record["last_error"])
                         else:
-                            record["last_error"] = (
-                                "code_conflict_rotated" if rotated else "code_conflict"
-                            )
-                            if not rotated:
-                                self._record_retry_failure(record, now)
-                                errors.append("code_conflict")
-                            else:
-                                self._clear_retry(record)
-                                self._pending = True
+                            # Once Guesty confirms a PIN, a provider collision
+                            # must never rewrite it. Fail closed and wait for a
+                            # manual Guesty edit to supply the next code.
+                            self._record_retry_failure(record, now)
+                            record["last_error"] = "code_conflict"
+                            errors.append("code_conflict")
                     except TTLockOperationPendingError as err:
                         record["retry_at"] = (now + _REMOTE_PENDING_RETRY).isoformat()
                         record["last_error"] = self._error_reason(err)
@@ -1208,24 +1197,6 @@ class GuestyTTLockManager:
             verified_at is not None
             and verified_at <= now < verified_at + _REMOTE_VERIFY_INTERVAL
         )
-
-    @classmethod
-    def _allow_conflict_rotation(cls, record: dict[str, Any], now: datetime) -> bool:
-        """Limit authoritative Guesty code changes caused by one provider."""
-        cutoff = now - _CONFLICT_ROTATION_WINDOW
-        values = record.get("conflict_rotation_times", [])
-        recent: list[datetime] = []
-        if isinstance(values, list):
-            for value in values:
-                parsed = cls._parse_time(value)
-                if parsed is not None and cutoff <= parsed <= now:
-                    recent.append(parsed)
-        if len(recent) >= _MAX_CONFLICT_ROTATIONS_PER_WINDOW:
-            record["conflict_rotation_times"] = [value.isoformat() for value in recent]
-            return False
-        recent.append(now)
-        record["conflict_rotation_times"] = [value.isoformat() for value in recent]
-        return True
 
     @staticmethod
     def _record_retry_failure(record: dict[str, Any], now: datetime) -> None:

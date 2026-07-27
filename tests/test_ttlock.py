@@ -323,6 +323,59 @@ async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
 
 
 @pytest.mark.asyncio
+async def test_existing_guesty_keycode_without_private_record_reaches_ttlock(
+    hass, monkeypatch
+) -> None:
+    """TTLock receives Guesty's existing PIN without a local record or rewrite."""
+    reservation = _reservation()
+    reservation.key_code = "734567"
+    reservation.key_code_observed = True
+    options = {
+        **_options([101]),
+        CONF_LOXONE_ENABLED: False,
+        CONF_LOXONE_CODE_PREFIX: "7",
+        CONF_ACCESS_EARLY_MINUTES: 0,
+        CONF_ACCESS_LATE_MINUTES: 0,
+    }
+    entry = MockConfigEntry(domain=DOMAIN, options=options)
+    entry.add_to_hass(hass)
+    coordinator = SimpleNamespace(
+        data=SimpleNamespace(
+            listings={"listing-1": _listing()},
+            reservations=[reservation],
+            data_stale=False,
+        )
+    )
+    guesty_client = SimpleNamespace(
+        async_update_reservation_key_code=AsyncMock(),
+    )
+    pin_manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
+    pin_manager._data = {"records": {}}
+    pin_manager._storage.async_save = AsyncMock()
+    pin_manager._schedule_at = MagicMock()
+    monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW)
+
+    await pin_manager.async_reconcile()
+
+    assert pin_manager.reservation_pin_snapshot(reservation.id)["code"] == "734567"
+    assert pin_manager.reservation_pin_snapshot(reservation.id)["field_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        entry=entry,
+        coordinator=coordinator,
+        pin_manager=pin_manager,
+    )
+    await manager.async_reconcile()
+
+    remote.async_add_passcode.assert_awaited_once()
+    assert remote.async_add_passcode.await_args.kwargs["code"] == "734567"
+
+
+@pytest.mark.asyncio
 async def test_booking_time_change_updates_existing_passcodes(
     hass, monkeypatch
 ) -> None:
@@ -368,10 +421,10 @@ async def test_booking_moved_beyond_lead_removes_early_remote_passcodes(
 
 
 @pytest.mark.asyncio
-async def test_remote_duplicate_rotates_authoritative_guesty_code(
+async def test_remote_duplicate_never_rotates_authoritative_guesty_code(
     hass, monkeypatch
 ) -> None:
-    """A proven TTLock collision is delegated to the shared Guesty PIN owner."""
+    """A TTLock collision is fail-closed without changing Guesty's PIN."""
     reservation = _reservation()
     manager, _coordinator, pin_manager, remote = _manager(
         hass, monkeypatch, reservation
@@ -383,16 +436,17 @@ async def test_remote_duplicate_rotates_authoritative_guesty_code(
 
     await manager.async_reconcile()
 
-    pin_manager.async_rotate_external_conflict.assert_awaited_once_with(
-        reservation.id, "712345"
-    )
+    pin_manager.async_rotate_external_conflict.assert_not_awaited()
     remote.async_add_passcode.assert_not_awaited()
-    assert manager._records[reservation.id]["last_error"] == "code_conflict_rotated"
+    assert manager._records[reservation.id]["last_error"] == "code_conflict"
+    assert manager._records[reservation.id]["retry_at"]
 
 
 @pytest.mark.asyncio
-async def test_repeated_remote_conflicts_are_rate_limited(hass, monkeypatch) -> None:
-    """TTLock cannot cause an unbounded loop of authoritative Guesty writes."""
+async def test_repeated_remote_conflicts_keep_guesty_code_immutable(
+    hass, monkeypatch
+) -> None:
+    """Repeated TTLock conflicts never request a Guesty code rotation."""
     reservation = _reservation()
     manager, _coordinator, pin_manager, remote = _manager(
         hass, monkeypatch, reservation
@@ -405,11 +459,34 @@ async def test_repeated_remote_conflicts_are_rate_limited(hass, monkeypatch) -> 
     for _attempt in range(4):
         await manager.async_reconcile()
 
-    assert pin_manager.async_rotate_external_conflict.await_count == 3
+    pin_manager.async_rotate_external_conflict.assert_not_awaited()
     record = manager._records[reservation.id]
-    assert len(record["conflict_rotation_times"]) == 3
+    assert "conflict_rotation_times" not in record
     assert record["last_error"] == "code_conflict"
     assert record["retry_at"]
+
+
+@pytest.mark.asyncio
+async def test_guesty_pin_conflict_revokes_existing_ttlock_passcodes(
+    hass, monkeypatch
+) -> None:
+    """A blocked Guesty PIN cannot leave previously delivered TTLock access."""
+    reservation = _reservation()
+    manager, _coordinator, pin_manager, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    assert len(manager._records[reservation.id]["locks"]) == 2
+
+    pin_manager.reservation_pin_snapshot = MagicMock(
+        return_value={"code": "712345", "field_synced": False}
+    )
+    await manager.async_reconcile()
+
+    assert remote.async_delete_passcode.await_count == 2
+    assert manager._records[reservation.id]["locks"] == {}
+    assert manager._records[reservation.id]["last_error"] == "guesty_pin_pending"
+    pin_manager.async_rotate_external_conflict.assert_not_awaited()
 
 
 @pytest.mark.asyncio
