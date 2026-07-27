@@ -182,11 +182,16 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   as `#`, `*`, or `☑️`. Guesty receives, for example, `723456#`; Loxone and
   TTLock always receive only `723456`. Changing the suffix rewrites the Guesty
   display without rotating the numeric PIN.
-- Use at most two Guesty Keycode writes per reconciliation pass and schedule the
-  remaining queue after about 30 seconds. Prioritize current and nearest stays.
+- Use one persistent global limit of at most two Guesty Keycode write attempts
+  in any 30-second window. Normal queue passes, reservation-specific retries,
+  webhook-triggered passes, and restarts share this limit. Failed and ambiguous
+  PUTs consume a slot. Prioritize current and nearest stays.
 - Every native-Keycode path must consume that same write budget, including
   sparse cached snapshots and one-time migrations from private stored PINs.
   Never bypass the queue merely because Guesty omitted the `notes` projection.
+- Deferring a due reservation-specific failure because the global limit is full
+  must preserve its retry count and failure reason; global queueing may move the
+  next retry later but must not turn a real failure into a generic queued state.
 - Loxone and TTLock collisions never rotate an already confirmed Guesty PIN.
   Delete any tentative remote object, expose a conflict, and use persistent
   retry backoff until a manual Guesty edit supplies a different PIN.

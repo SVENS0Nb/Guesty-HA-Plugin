@@ -69,6 +69,7 @@ _LOGGER = logging.getLogger(__name__)
 LOXONE_STORAGE_KEY = "guesty_loxone"
 _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
+_GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
@@ -105,6 +106,15 @@ _WEAK_CODES = {
     "654321",
     "543210",
 }
+
+
+class _GuestyWriteDeferred(Exception):
+    """Signal that the persistent global Guesty write limit is full."""
+
+    def __init__(self, retry_at: datetime) -> None:
+        """Initialize the internal control-flow signal."""
+        super().__init__("Guesty Keycode write deferred")
+        self.retry_at = retry_at
 
 
 class GuestyLoxoneStorage:
@@ -309,7 +319,7 @@ class GuestyLoxoneManager:
             self._last_deleted = 0
             self._last_guesty_writes = 0
             self._last_queued = 0
-            self._guesty_writes_remaining = self._guesty_write_budget()
+            self._guesty_writes_remaining = self._guesty_write_budget(now)
             next_run: datetime | None = None
             errors: list[str] = []
             data = self._coordinator.data
@@ -414,14 +424,20 @@ class GuestyLoxoneManager:
                         reservation,
                         record,
                     )
-                    if (
-                        self._guesty_writes_remaining <= 0
-                        and not self._retry_is_deferred(record, "guesty", now)
-                        and self._keycode_write_required(
-                            reservation,
-                            record,
-                        )
+                    write_required = self._keycode_write_required(
+                        reservation,
+                        record,
+                    )
+                    if write_required and self._retry_is_deferred(
+                        record,
+                        "guesty",
+                        now,
                     ):
+                        retry_at = self._retry_at(record, "guesty")
+                        if retry_at is not None:
+                            next_run = self._earlier(next_run, retry_at)
+                        guesty_queued = True
+                    elif write_required and self._guesty_writes_remaining <= 0:
                         retry_at = self._queue_keycode_write(record, now)
                         next_run = self._earlier(next_run, retry_at)
                         guesty_queued = True
@@ -435,6 +451,9 @@ class GuestyLoxoneManager:
                         )
                     if guesty_queued:
                         continue
+                except _GuestyWriteDeferred as err:
+                    next_run = self._earlier(next_run, err.retry_at)
+                    continue
                 except (GuestyApiError, GuestyAuthError) as err:
                     reason = self._guesty_error_reason(err)
                     record["last_error"] = reason
@@ -618,15 +637,75 @@ class GuestyLoxoneManager:
             self._last_error = errors[0] if errors else None
             self._notify_listeners()
 
-    def _guesty_write_budget(self) -> int:
-        """Return a small write budget while reserving normal API capacity."""
+    def _recent_guesty_write_attempts(self, now: datetime) -> list[datetime]:
+        """Return and normalize recent globally rate-limited write attempts."""
+        raw_attempts = self._data.get(_GUESTY_WRITE_ATTEMPTS_KEY, [])
+        if not isinstance(raw_attempts, list):
+            raw_attempts = []
+
+        cutoff = now - timedelta(seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS)
+        future_limit = now + timedelta(seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS)
+        attempts: list[datetime] = []
+        for value in raw_attempts[-32:]:
+            if not isinstance(value, str):
+                continue
+            try:
+                parsed = dt_util.parse_datetime(value)
+            except (TypeError, ValueError):
+                continue
+            if (
+                parsed is None
+                or parsed.utcoffset() is None
+                or parsed <= cutoff
+                or parsed > future_limit
+            ):
+                continue
+            attempts.append(parsed)
+        attempts.sort()
+        normalized = [attempt.isoformat() for attempt in attempts]
+        if normalized:
+            self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = normalized
+        else:
+            self._data.pop(_GUESTY_WRITE_ATTEMPTS_KEY, None)
+        return attempts
+
+    def _guesty_write_budget(self, now: datetime) -> int:
+        """Return the global write allowance while reserving API capacity."""
+        recent_attempts = self._recent_guesty_write_attempts(now)
+        global_capacity = max(
+            0,
+            _GUESTY_KEYCODE_WRITE_BATCH_SIZE - len(recent_attempts),
+        )
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
         if not isinstance(remaining, int):
-            return _GUESTY_KEYCODE_WRITE_BATCH_SIZE
+            return global_capacity
         # Native Keycode synchronization normally needs only one minimal PUT.
         # Keep several requests available for reservation and webhook traffic.
         capacity = max(1, remaining - 4)
-        return min(_GUESTY_KEYCODE_WRITE_BATCH_SIZE, capacity)
+        return min(global_capacity, capacity)
+
+    def _next_guesty_write_at(self, now: datetime) -> datetime:
+        """Return the earliest time another global write slot is available."""
+        attempts = self._recent_guesty_write_attempts(now)
+        if len(attempts) < _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
+            return now
+        return attempts[-_GUESTY_KEYCODE_WRITE_BATCH_SIZE] + timedelta(
+            seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS
+        )
+
+    async def _async_consume_guesty_write_slot(self, now: datetime) -> bool:
+        """Persist one Guesty write attempt before making the network request."""
+        attempts = self._recent_guesty_write_attempts(now)
+        if len(attempts) >= _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
+            return False
+        attempts.append(now)
+        self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
+            attempt.isoformat() for attempt in attempts
+        ]
+        # Persist before the PUT. A timeout or restart after Guesty accepted the
+        # request must still consume the shared traffic allowance.
+        await self._storage.async_save(self._data)
+        return True
 
     def _reservation_sync_order(
         self,
@@ -680,11 +759,21 @@ class GuestyLoxoneManager:
         record: dict[str, Any],
         now: datetime,
     ) -> datetime:
-        """Queue one unsynchronized Keycode without exponential error backoff."""
-        self._clear_retry(record, "guesty")
-        retry_at = now + timedelta(seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS)
+        """Queue a write globally without erasing reservation failure state."""
+        retry_at = self._next_guesty_write_at(now)
+        if retry_at <= now:
+            retry_at = now + timedelta(seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS)
+        failure_count = record.get("guesty_retry_count")
+        has_failure_backoff = (
+            isinstance(failure_count, int)
+            and not isinstance(failure_count, bool)
+            and failure_count > 0
+            and record.get("last_error") != _GUESTY_SYNC_QUEUED
+        )
+        if not has_failure_backoff:
+            self._clear_retry(record, "guesty")
+            record["last_error"] = _GUESTY_SYNC_QUEUED
         record["guesty_retry_at"] = retry_at.isoformat()
-        record["last_error"] = _GUESTY_SYNC_QUEUED
         self._last_queued += 1
         return retry_at
 
@@ -1026,6 +1115,10 @@ class GuestyLoxoneManager:
             and raw_retry_count >= 0
             else 0
         )
+        attempted_at = dt_util.utcnow()
+        if not await self._async_consume_guesty_write_slot(attempted_at):
+            self._guesty_writes_remaining = 0
+            raise _GuestyWriteDeferred(self._queue_keycode_write(record, attempted_at))
         self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
         self._last_guesty_writes += 1
         guesty_value = self._guesty_code_value(code, reservation.listing_id)

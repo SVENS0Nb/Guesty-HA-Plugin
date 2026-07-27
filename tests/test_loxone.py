@@ -627,6 +627,162 @@ async def test_native_keycode_not_found_does_not_starve_other_reservations(
 
 
 @pytest.mark.asyncio
+async def test_guesty_write_limit_is_global_across_overlapping_reconciles(
+    hass, monkeypatch
+) -> None:
+    """A retry pass and a new-reservation pass share one persistent write limit."""
+    missing = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-missing-{days}",
+        )
+        for days in (1, 2)
+    ]
+    queued = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-queued-{days}",
+        )
+        for days in (3, 4)
+    ]
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, missing[0]
+    )
+    coordinator.data.reservations = missing
+    guesty_client.async_update_reservation_key_code.side_effect = [
+        GuestyNotFoundError("reservation missing"),
+        GuestyNotFoundError("reservation missing"),
+        None,
+        None,
+    ]
+
+    await manager.async_reconcile()
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=4),
+    )
+    coordinator.data.reservations.extend(queued)
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert all(
+        manager._records[reservation.id]["last_error"] == "guesty_sync_queued"
+        for reservation in queued
+    )
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=31),
+    )
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 4
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_key_code.await_args_list
+    ] == [
+        missing[0].id,
+        missing[1].id,
+        queued[0].id,
+        queued[1].id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_global_write_deferral_preserves_reservation_failure_backoff(
+    hass, monkeypatch
+) -> None:
+    """Global throttling cannot erase a reservation's failure reason or count."""
+    reservations = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-{days}",
+        )
+        for days in (1, 2, 3)
+    ]
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservations[0]
+    )
+    coordinator.data.reservations = reservations[:2]
+
+    await manager.async_reconcile()
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+
+    failed_record = {
+        "listing_id": "listing-1",
+        "code": "712345",
+        "field_synced": False,
+        "field_id": "notes.keyCode",
+        "last_error": "guesty_reservation_not_found",
+        "guesty_retry_count": 3,
+        "guesty_retry_at": (NOW + timedelta(seconds=4)).isoformat(),
+    }
+    manager._records[reservations[2].id] = failed_record
+    coordinator.data.reservations.append(reservations[2])
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=4),
+    )
+
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert failed_record["last_error"] == "guesty_reservation_not_found"
+    assert failed_record["guesty_retry_count"] == 3
+    assert datetime.fromisoformat(failed_record["guesty_retry_at"]) >= (
+        NOW + timedelta(seconds=30)
+    )
+
+
+@pytest.mark.asyncio
+async def test_persisted_guesty_write_limit_survives_manager_restart(
+    hass, monkeypatch
+) -> None:
+    """Restarting the manager cannot create a fresh Guesty write allowance."""
+    reservations = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-{days}",
+        )
+        for days in (1, 2, 3)
+    ]
+    first_manager, first_coordinator, first_client, _remote = _manager(
+        hass, monkeypatch, reservations[0]
+    )
+    first_coordinator.data.reservations = reservations[:2]
+    await first_manager.async_reconcile()
+    assert first_client.async_update_reservation_key_code.await_count == 2
+
+    second_manager, second_coordinator, second_client, _remote = _manager(
+        hass, monkeypatch, reservations[2]
+    )
+    second_manager._data = first_manager._data
+    second_coordinator.data.reservations = reservations
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=4),
+    )
+
+    await second_manager.async_reconcile()
+
+    second_client.async_update_reservation_key_code.assert_not_awaited()
+    assert (
+        second_manager._records[reservations[2].id]["last_error"]
+        == "guesty_sync_queued"
+    )
+
+
+@pytest.mark.asyncio
 async def test_existing_guesty_keycode_is_adopted_without_rewrite(
     hass, monkeypatch
 ) -> None:

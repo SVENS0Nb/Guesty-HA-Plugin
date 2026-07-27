@@ -335,10 +335,12 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
    spätestens nach dem normalen Abgleich muss Guesty im nativen Feld
    **Keycode** einen sechsstelligen Wert anzeigen. Bei der erstmaligen
    Aktivierung mit vielen vorhandenen Reservierungen werden aktuelle und nahe
-   Buchungen zuerst und danach jeweils höchstens zwei weitere Feldwerte pro
-   Durchlauf geschrieben. Der nächste Teil der Warteschlange folgt automatisch
-   nach etwa 30 Sekunden; dadurch bleibt Guestys API auch während der Migration
-   für normale Reservierungsabgleiche verfügbar.
+   Buchungen zuerst und danach global höchstens zwei Feldwerte innerhalb von
+   30 Sekunden geschrieben. Normale Warteschlange, einzelne Fehlerrückläufe und
+   ein Neustart teilen sich dasselbe persistent gespeicherte Limit. Der nächste
+   Teil folgt automatisch, sobald wieder ein Schreibplatz frei ist; dadurch
+   bleibt Guestys API auch während der Migration für normale
+   Reservierungsabgleiche verfügbar.
 2. Der Sensor **Guesty-Code-Status** muss `Synchronisiert` anzeigen. Vor dem
    eingestellten Loxone-Vorlauf zeigt **Loxone-PIN-Status** zunächst `Geplant`.
 3. Innerhalb des Vorlaufs muss in Loxone ein zeitlich begrenzter Benutzer mit
