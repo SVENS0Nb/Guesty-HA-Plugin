@@ -481,6 +481,39 @@ async def test_native_keycode_not_found_is_reported_without_fallback(
 
 
 @pytest.mark.asyncio
+async def test_native_keycode_not_found_does_not_starve_other_reservations(
+    hass, monkeypatch
+) -> None:
+    """One reservation-specific 404 cannot stop unrelated Keycode writes."""
+    missing = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+        reservation_id="reservation-missing",
+    )
+    writable = _reservation(
+        check_in=NOW + timedelta(days=3),
+        check_out=NOW + timedelta(days=4),
+        reservation_id="reservation-writable",
+    )
+    manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, missing)
+    coordinator.data.reservations.append(writable)
+    guesty_client.async_update_reservation_key_code.side_effect = [
+        GuestyNotFoundError("reservation missing"),
+        None,
+    ]
+
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert manager._records[missing.id]["field_synced"] is False
+    assert manager._records[missing.id]["last_error"] == (
+        "guesty_reservation_not_found"
+    )
+    assert manager._records[writable.id]["field_synced"] is True
+    assert manager.diagnostics()["native_keycode_failures"] == 1
+
+
+@pytest.mark.asyncio
 async def test_existing_guesty_keycode_is_adopted_without_rewrite(
     hass, monkeypatch
 ) -> None:

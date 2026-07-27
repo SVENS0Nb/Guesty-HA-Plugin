@@ -907,7 +907,12 @@ class GuestyApiClient:
                             ),
                             retry_response.status,
                         )
-                    return self._parse_response_body(retry_body)
+                    return self._parse_response_body(
+                        retry_body,
+                        path=path,
+                        status=retry_response.status,
+                        headers=retry_response.headers,
+                    )
 
             if response.status == 401:
                 raise GuestyAuthError(
@@ -955,17 +960,81 @@ class GuestyApiClient:
                     response.status,
                 )
 
-            return self._parse_response_body(body)
+            return self._parse_response_body(
+                body,
+                path=path,
+                status=response.status,
+                headers=response.headers,
+            )
 
     @staticmethod
-    def _parse_response_body(body: str) -> Any:
-        """Parse an API response body."""
-        if not body:
+    def _parse_response_body(
+        body: str,
+        *,
+        path: str | None = None,
+        status: int | None = None,
+        headers: Any = None,
+    ) -> Any:
+        """Parse an API response body with privacy-safe failure context."""
+        normalized = body.removeprefix("\ufeff")
+        if not normalized.strip():
             return []
         try:
-            return json.loads(body)
+            # Guesty data is user-entered and has occasionally contained raw
+            # control characters inside JSON strings. Accept those characters
+            # without weakening structural JSON validation.
+            return json.loads(normalized, strict=False)
         except json.JSONDecodeError as err:
-            raise GuestyApiError("Invalid JSON response from Guesty") from err
+            encoded_body = body.encode("utf-8", errors="replace")
+            context = [
+                f"endpoint={GuestyApiClient._endpoint_label(path)}",
+                f"length={len(encoded_body)}",
+                f"sha256={hashlib.sha256(encoded_body).hexdigest()[:12]}",
+                f"position={err.pos}",
+            ]
+            if status is not None:
+                context.append(f"status={status}")
+            content_type = GuestyApiClient._response_content_type(headers)
+            if content_type:
+                context.append(f"content_type={content_type}")
+            request_id = GuestyApiClient._request_id(headers)
+            if request_id:
+                context.append(f"request_id={request_id}")
+            raise GuestyApiError(
+                f"Invalid JSON response from Guesty ({', '.join(context)})"
+            ) from err
+
+    @staticmethod
+    def _endpoint_label(path: str | None) -> str:
+        """Return a privacy-safe endpoint label without resource identifiers."""
+        if not isinstance(path, str):
+            return "unknown"
+        first_segment = path.strip("/").split("/", 1)[0]
+        if not first_segment:
+            return "root"
+        return re.sub(r"[^A-Za-z0-9_-]", "_", first_segment)[:40] or "unknown"
+
+    @staticmethod
+    def _response_content_type(headers: Any) -> str | None:
+        """Return a bounded, printable response content type."""
+        value = headers.get("Content-Type") if headers is not None else None
+        if not isinstance(value, str):
+            return None
+        media_type = value.split(";", 1)[0].strip().lower()
+        if not media_type:
+            return None
+        safe_value = re.sub(r"[^a-z0-9.+/-]", "_", media_type)
+        return safe_value[:80] or None
+
+    @staticmethod
+    def _request_id(headers: Any) -> str | None:
+        """Return a bounded printable Guesty request identifier."""
+        for name in ("x-request-id", "X-Request-Id", "x-guesty-request-id"):
+            value = headers.get(name) if headers is not None else None
+            if isinstance(value, str) and value:
+                safe_value = re.sub(r"[^A-Za-z0-9._:-]", "_", value)
+                return safe_value[:100] or None
+        return None
 
     @staticmethod
     async def _async_read_response_text(response: aiohttp.ClientResponse) -> str:
@@ -1006,12 +1075,7 @@ class GuestyApiClient:
                     if safe_items:
                         details.append(", ".join(safe_items))
 
-        request_id = None
-        for name in ("x-request-id", "X-Request-Id", "x-guesty-request-id"):
-            value = headers.get(name) if headers is not None else None
-            if isinstance(value, str) and value:
-                request_id = value[:100]
-                break
+        request_id = GuestyApiClient._request_id(headers)
 
         message = f"{prefix} ({status})"
         if details:

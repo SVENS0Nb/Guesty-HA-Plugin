@@ -233,6 +233,38 @@ def test_permission_and_invalid_json_errors_are_safe() -> None:
         GuestyApiClient._parse_response_body("not json")
 
 
+def test_json_parser_accepts_bom_and_raw_control_characters() -> None:
+    """Benign Guesty encoding defects do not invalidate a complete response."""
+    assert GuestyApiClient._parse_response_body('\ufeff{"guest":"Line 1\nLine 2"}') == {
+        "guest": "Line 1\nLine 2"
+    }
+    assert GuestyApiClient._parse_response_body(" \n\t") == []
+
+
+def test_invalid_json_error_has_safe_actionable_response_context() -> None:
+    """Malformed responses identify the endpoint without logging their body."""
+    secret_body = '{"guest":"Private Name"'
+
+    with pytest.raises(GuestyApiError) as raised:
+        GuestyApiClient._parse_response_body(
+            secret_body,
+            path="/reservations/507f1f77bcf86cd799439011",
+            status=200,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "x-request-id": "request-123",
+            },
+        )
+
+    message = str(raised.value)
+    assert "endpoint=reservations" in message
+    assert "status=200" in message
+    assert "content_type=text/html" in message
+    assert "request_id=request-123" in message
+    assert "507f1f77bcf86cd799439011" not in message
+    assert "Private Name" not in message
+
+
 def test_targeted_reservation_filters_limit_new_listing_traffic() -> None:
     """New listings can retrieve reservations without scanning the whole account."""
     filters = build_reservation_filters(

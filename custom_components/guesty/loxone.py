@@ -439,7 +439,8 @@ class GuestyLoxoneManager:
                 except (GuestyApiError, GuestyAuthError) as err:
                     reason = self._guesty_error_reason(err)
                     record["last_error"] = reason
-                    self._guesty_writes_remaining = 0
+                    if self._guesty_error_stops_write_batch(err):
+                        self._guesty_writes_remaining = 0
                     self._record_retry_failure(record, "guesty", now)
                     retry_at = self._retry_at(record, "guesty")
                     if retry_at:
@@ -583,7 +584,8 @@ class GuestyLoxoneManager:
                                 reason = self._guesty_error_reason(err)
                                 self._record_retry_failure(record, "guesty", now)
                                 record["last_error"] = reason
-                                self._guesty_writes_remaining = 0
+                                if self._guesty_error_stops_write_batch(err):
+                                    self._guesty_writes_remaining = 0
                                 errors.append(reason)
                             except (LoxoneApiError, LoxoneAuthError) as err:
                                 self._record_retry_failure(record, "loxone", now)
@@ -692,6 +694,15 @@ class GuestyLoxoneManager:
         if isinstance(error, GuestyRetryableError):
             return "guesty_temporarily_unavailable"
         return "guesty_keycode_rejected"
+
+    @staticmethod
+    def _guesty_error_stops_write_batch(error: Exception) -> bool:
+        """Return whether one failure predicts failure for all later writes."""
+        # A reservation-specific 404 may affect a stale, imported, grouped, or
+        # otherwise non-writable record while unrelated reservations remain
+        # writable. Its failed request already consumed one write-budget slot;
+        # do not let it starve the rest of the bounded batch.
+        return not isinstance(error, GuestyNotFoundError)
 
     @staticmethod
     def _reservation_marker(reservation_id: str) -> str:
