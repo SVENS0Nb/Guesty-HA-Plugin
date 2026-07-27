@@ -13,6 +13,7 @@ import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 
+from ._http import ResponseTooLargeError, async_read_limited
 from .const import (
     TTLOCK_API_BASE_URLS,
     TTLOCK_MAX_RESPONSE_BYTES,
@@ -324,9 +325,14 @@ class TTLockApiClient:
                     headers={"Accept": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=TTLOCK_REQUEST_TIMEOUT),
                 ) as response:
-                    raw = await response.content.read(TTLOCK_MAX_RESPONSE_BYTES + 1)
-                    if len(raw) > TTLOCK_MAX_RESPONSE_BYTES:
-                        raise TTLockApiError("TTLock response exceeded the size limit")
+                    try:
+                        raw = await async_read_limited(
+                            response.content, TTLOCK_MAX_RESPONSE_BYTES
+                        )
+                    except ResponseTooLargeError as err:
+                        raise TTLockApiError(
+                            "TTLock response exceeded the size limit"
+                        ) from err
                     if response.status in {401, 403}:
                         raise TTLockAuthError("TTLock rejected the account")
                     if response.status == 429:

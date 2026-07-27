@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import unquote
 
 import pytest
@@ -36,6 +37,36 @@ def test_loxone_url_requires_https_and_preserves_proxy_path() -> None:
 def test_loxone_epoch_conversion() -> None:
     """Loxone validity timestamps use seconds since 2009 UTC."""
     assert loxone_timestamp(datetime.fromisoformat("2009-01-01T00:01:00+00:00")) == 60
+
+
+@pytest.mark.asyncio
+async def test_loxone_response_reader_joins_fragmented_json() -> None:
+    """A Loxone response may arrive in several network reads."""
+    content = SimpleNamespace(
+        read=AsyncMock(
+            side_effect=[
+                b'{"LL":{"Code":"200",',
+                b'"value":"{\\"ok\\":true}"}}',
+                b"",
+            ]
+        )
+    )
+    response = SimpleNamespace(
+        content=content,
+        charset="utf-8",
+        status=200,
+        request_info=None,
+        history=(),
+    )
+    request_context = MagicMock()
+    request_context.__aenter__ = AsyncMock(return_value=response)
+    request_context.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.get.return_value = request_context
+    client = LoxoneApiClient(session, "https://loxone.example.test", "svc", "pw")
+
+    assert await client._async_request("test") == ({"ok": True}, 200)
+    assert content.read.await_count == 3
 
 
 @pytest.mark.asyncio

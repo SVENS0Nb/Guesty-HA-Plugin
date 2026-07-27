@@ -739,13 +739,26 @@ async def test_correct_webhook_url_wins_over_stale_stored_id(monkeypatch) -> Non
 async def test_api_response_body_has_a_hard_size_limit(monkeypatch) -> None:
     """A malformed upstream response cannot grow Home Assistant memory unbounded."""
     monkeypatch.setattr("custom_components.guesty.api.API_MAX_RESPONSE_BYTES", 8)
-    content = SimpleNamespace(read=AsyncMock(return_value=b"x" * 9))
+    content = SimpleNamespace(read=AsyncMock(side_effect=[b"x" * 4, b"x" * 5]))
     response = SimpleNamespace(content=content, charset="utf-8")
 
     with pytest.raises(GuestyApiError, match="exceeded the size limit"):
         await GuestyApiClient._async_read_response_text(response)
 
-    content.read.assert_awaited_once_with(9)
+    assert content.read.await_args_list == [call(9), call(5)]
+
+
+@pytest.mark.asyncio
+async def test_api_response_reader_joins_fragmented_json(monkeypatch) -> None:
+    """A response split across network reads is not parsed prematurely."""
+    monkeypatch.setattr("custom_components.guesty.api.API_MAX_RESPONSE_BYTES", 64)
+    content = SimpleNamespace(read=AsyncMock(side_effect=[b'{"results":', b"[]}", b""]))
+    response = SimpleNamespace(content=content, charset="utf-8")
+
+    body = await GuestyApiClient._async_read_response_text(response)
+
+    assert body == '{"results":[]}'
+    assert content.read.await_count == 3
 
 
 @pytest.mark.asyncio

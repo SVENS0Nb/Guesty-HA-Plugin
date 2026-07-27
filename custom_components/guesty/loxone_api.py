@@ -13,6 +13,7 @@ import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 
+from ._http import ResponseTooLargeError, async_read_limited
 from .const import (
     LOXONE_EPOCH,
     LOXONE_EXPIRATION_ACTION_DELETE,
@@ -265,11 +266,14 @@ class LoxoneApiClient:
                     headers={"Accept": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=LOXONE_REQUEST_TIMEOUT),
                 ) as response:
-                    raw_body = await response.content.read(
-                        LOXONE_MAX_RESPONSE_BYTES + 1
-                    )
-                    if len(raw_body) > LOXONE_MAX_RESPONSE_BYTES:
-                        raise LoxoneApiError("Loxone response exceeded the size limit")
+                    try:
+                        raw_body = await async_read_limited(
+                            response.content, LOXONE_MAX_RESPONSE_BYTES
+                        )
+                    except ResponseTooLargeError as err:
+                        raise LoxoneApiError(
+                            "Loxone response exceeded the size limit"
+                        ) from err
                     body = raw_body.decode(
                         response.charset or "utf-8", errors="replace"
                     )

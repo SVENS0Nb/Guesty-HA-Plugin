@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from ._http import ResponseTooLargeError, async_read_limited
 from .const import (
     API_BASE_URL,
     API_MAX_PAGES,
@@ -969,9 +970,10 @@ class GuestyApiClient:
     @staticmethod
     async def _async_read_response_text(response: aiohttp.ClientResponse) -> str:
         """Read one bounded API response to protect Home Assistant memory."""
-        raw = await response.content.read(API_MAX_RESPONSE_BYTES + 1)
-        if len(raw) > API_MAX_RESPONSE_BYTES:
-            raise GuestyApiError("Guesty response exceeded the size limit")
+        try:
+            raw = await async_read_limited(response.content, API_MAX_RESPONSE_BYTES)
+        except ResponseTooLargeError as err:
+            raise GuestyApiError("Guesty response exceeded the size limit") from err
         return raw.decode(response.charset or "utf-8", errors="replace")
 
     @staticmethod

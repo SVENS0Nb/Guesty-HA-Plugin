@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -50,6 +51,39 @@ def test_invalid_token_expiration_fails_safe_to_refresh() -> None:
     client.token_expires_at = "not-a-timestamp"
 
     assert client._token_needs_refresh() is True
+
+
+@pytest.mark.asyncio
+async def test_ttlock_response_reader_joins_fragmented_json() -> None:
+    """A TTLock response may arrive in several network reads."""
+    content = SimpleNamespace(
+        read=AsyncMock(side_effect=[b'{"errcode":', b'0,"success":true}', b""])
+    )
+    response = SimpleNamespace(
+        content=content,
+        charset="utf-8",
+        status=200,
+        request_info=None,
+        history=(),
+    )
+    request_context = MagicMock()
+    request_context.__aenter__ = AsyncMock(return_value=response)
+    request_context.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.post.return_value = request_context
+    client = TTLockApiClient(
+        session,
+        region="eu",
+        client_id="client",
+        client_secret="secret",
+        access_token="access",
+    )
+
+    assert await client._async_http_post("/test", {}) == {
+        "errcode": 0,
+        "success": True,
+    }
+    assert content.read.await_count == 3
 
 
 @pytest.mark.asyncio
