@@ -17,6 +17,14 @@
           "client_id": "Client ID",
           "client_secret": "Client Secret"
         }
+      },
+      "reconfigure": {
+        "title": "Guesty-Zugangsdaten ändern",
+        "description": "Gib die neuen Guesty-Open-API-Zugangsdaten ein. Sie müssen zum selben Guesty-Konto gehören. Bestehende Einstellungen, Türlinks und Schlosszuordnungen bleiben erhalten.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Neues Client Secret"
+        }
       }
     },
     "error": {
@@ -27,7 +35,9 @@
     },
     "abort": {
       "already_configured": "Guesty ist bereits eingerichtet",
-      "reauth_successful": "Guesty wurde erfolgreich erneut verbunden"
+      "reauth_successful": "Guesty wurde erfolgreich erneut verbunden",
+      "reconfigure_successful": "Die Guesty-Zugangsdaten wurden erfolgreich geändert",
+      "account_mismatch": "Die Zugangsdaten gehören zu einem anderen Guesty-Konto"
     }
   },
   "options": {
@@ -97,11 +107,10 @@
       },
       "loxone": {
         "title": "Loxone Reservierungs-PINs",
-        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und in einem konfigurierbaren Guesty-Reservierungs-Custom-Field gespeichert. Das Custom Field ist die maßgebliche Quelle, daher werden gültige manuelle Änderungen mit Loxone synchronisiert; doppelte Codes werden automatisch ersetzt. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und ausschließlich in Guestys nativem Keycode-Feld gespeichert. Der native Keycode ist die maßgebliche Quelle: Gültige manuelle Änderungen werden mit Loxone und TTLock synchronisiert, doppelte Codes automatisch ersetzt. Ein Türcode-Custom-Field ist nicht erforderlich. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
-          "loxone_custom_field": "Guesty-Reservierungsfeld für den Türcode (Name, Variable oder ID)",
           "access_early_minutes": "Zugang vor Check-in freigeben (Minuten)",
           "access_late_minutes": "Zugang nach Check-out erhalten (Minuten)",
           "loxone_server_count": "Anzahl der Loxone-Miniserver",
@@ -131,9 +140,8 @@
       },
       "ttlock": {
         "title": "TTLock Reservierungs-PINs",
-        "description": "Lege zuerst eine Anwendung in der [TTLock Open Platform]({open_platform_url}) an. Bei Bedarf hilft die [TTLock-OAuth-Anleitung]({oauth_doc_url}). Verwende anschließend das TTLock-App-Konto, das die Schlösser verwaltet – nicht den Login des Entwicklerportals. Angezeigt werden nur V4-Schlösser mit Online-Gateway.",
+        "description": "Codes werden ausschließlich in Guestys nativem Keycode-Feld gespeichert; ein Türcode-Custom-Field ist nicht erforderlich. Lege zuerst eine Anwendung in der [TTLock Open Platform]({open_platform_url}) an. Bei Bedarf hilft die [TTLock-OAuth-Anleitung]({oauth_doc_url}). Verwende anschließend das TTLock-App-Konto, das die Schlösser verwaltet – nicht den Login des Entwicklerportals. Angezeigt werden nur V4-Schlösser mit Online-Gateway.",
         "data": {
-          "loxone_custom_field": "Guesty-Codefeld",
           "loxone_code_prefix": "PIN-Präfix",
           "access_early_minutes": "Zugang vor Check-in (Minuten)",
           "access_late_minutes": "Zugang nach Check-out (Minuten)",
@@ -146,7 +154,6 @@
           "ttlock_listings": "Guesty-Listings"
         },
         "data_description": {
-          "loxone_custom_field": "Name, Variable oder ID des Guesty-Reservierungs-Custom-Fields, zum Beispiel door_code.",
           "loxone_code_prefix": "Eine oder zwei führende Ziffern für automatisch erzeugte sechsstellige Codes, zum Beispiel 7.",
           "access_early_minutes": "So viele Minuten vor dem Guesty-Check-in wird der Code gültig.",
           "access_late_minutes": "So viele Minuten nach dem Guesty-Check-out bleibt der Code gültig.",

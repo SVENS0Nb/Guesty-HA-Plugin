@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, call
 
 import aiohttp
 from homeassistant.util import dt as dt_util
@@ -114,10 +114,15 @@ async def test_retry_after_header_controls_delay(monkeypatch) -> None:
 async def test_credential_validation_reuses_token_and_fetches_one_listing(
     monkeypatch,
 ) -> None:
-    """Validation does not paginate and exposes its token for first setup."""
+    """Validation identifies the account, checks listings, and exposes its token."""
     client = _client(token=None)
     ensure_token = AsyncMock()
-    request = AsyncMock(return_value={"results": []})
+    request = AsyncMock(
+        side_effect=[
+            {"_id": "account-1"},
+            {"results": []},
+        ]
+    )
 
     async def set_token() -> None:
         client._access_token = "validated-token"
@@ -131,11 +136,14 @@ async def test_credential_validation_reuses_token_and_fetches_one_listing(
 
     assert len(account_id) == 64
     assert client.access_token == "validated-token"
-    request.assert_awaited_once_with(
-        "GET",
-        "/listings",
-        params={"fields": ANY, "limit": "1"},
-    )
+    assert request.await_args_list == [
+        call("GET", "/accounts/me"),
+        call(
+            "GET",
+            "/listings",
+            params={"fields": ANY, "limit": "1"},
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -348,6 +356,71 @@ async def test_deleted_reservation_returns_none(monkeypatch) -> None:
     )
 
     assert await client.async_get_reservation("reservation-1") is None
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_uses_minimal_v3_notes_payload(monkeypatch) -> None:
+    """Keycodes use the internal ID and never round-trip unrelated notes."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        return_value={
+            "reservationId": reservation_id,
+            "notes": {"keyCode": "712345#"},
+        }
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    await client.async_update_reservation_key_code(reservation_id, "712345#")
+
+    request.assert_awaited_once_with(
+        "PUT",
+        f"/reservations-v3/{reservation_id}/notes",
+        json_body={"notes": {"keyCode": "712345#"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_rejects_confirmation_code(monkeypatch) -> None:
+    """A public GY confirmation code can never enter the v3 notes URL."""
+    client = _client()
+    request = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyApiError, match="Invalid reservation id"):
+        await client.async_update_reservation_key_code("GY-vUX2hCRe", "712345")
+
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_rejects_oversized_value(monkeypatch) -> None:
+    """An unexpectedly large value can never be sent to Guesty."""
+    client = _client()
+    request = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(ValueError, match="too long"):
+        await client.async_update_reservation_key_code(
+            "6a64b5dcec567638fee95de9", "7" * 65
+        )
+
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_requires_exact_success_confirmation(monkeypatch) -> None:
+    """A misleading 2xx response remains retryable by the manager."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    monkeypatch.setattr(
+        client,
+        "_async_request",
+        AsyncMock(return_value={"reservationId": reservation_id, "notes": {}}),
+    )
+
+    with pytest.raises(GuestyApiError, match="did not persist"):
+        await client.async_update_reservation_key_code(reservation_id, "712345")
 
 
 @pytest.mark.asyncio

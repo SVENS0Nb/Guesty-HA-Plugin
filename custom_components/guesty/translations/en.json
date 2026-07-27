@@ -17,6 +17,14 @@
           "client_id": "Client ID",
           "client_secret": "Client Secret"
         }
+      },
+      "reconfigure": {
+        "title": "Change Guesty credentials",
+        "description": "Enter the replacement Guesty Open API credentials. The new credentials must belong to the same Guesty account. Existing settings, door links and lock assignments are retained.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "New Client Secret"
+        }
       }
     },
     "error": {
@@ -27,7 +35,9 @@
     },
     "abort": {
       "already_configured": "Guesty is already configured",
-      "reauth_successful": "Guesty was reconnected successfully"
+      "reauth_successful": "Guesty was reconnected successfully",
+      "reconfigure_successful": "The Guesty credentials were changed successfully",
+      "account_mismatch": "The credentials belong to a different Guesty account"
     }
   },
   "options": {
@@ -97,11 +107,10 @@
       },
       "loxone": {
         "title": "Loxone reservation PINs",
-        "description": "Generate one six-digit code per reservation and store it in a configurable Guesty reservation custom field. The custom field is the source of truth, so valid manual changes are synchronized to Loxone; duplicate codes are replaced automatically. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
+        "description": "Generate one six-digit code per reservation and store it only in Guesty's native Keycode field. The native Keycode is the source of truth, so valid manual changes are synchronized to Loxone and TTLock; duplicate codes are replaced automatically. No door-code custom field is required. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
         "data": {
           "loxone_provision_lead_minutes": "Create Loxone user before access starts (minutes)",
           "loxone_code_prefix": "Reserved PIN prefix (1–2 digits)",
-          "loxone_custom_field": "Guesty reservation field for the door code (name, variable, or ID)",
           "access_early_minutes": "Enable access before check-in (minutes)",
           "access_late_minutes": "Keep access after check-out (minutes)",
           "loxone_server_count": "Number of Loxone Miniservers",
@@ -131,9 +140,8 @@
       },
       "ttlock": {
         "title": "TTLock reservation PINs",
-        "description": "First create an application in [TTLock Open Platform]({open_platform_url}). See [TTLock OAuth help]({oauth_doc_url}) if needed. Use the TTLock App account that manages the locks—not the developer-portal login. Only V4 locks with an online gateway are shown.",
+        "description": "Codes are stored only in Guesty's native Keycode field; no door-code custom field is required. First create an application in [TTLock Open Platform]({open_platform_url}). See [TTLock OAuth help]({oauth_doc_url}) if needed. Use the TTLock App account that manages the locks—not the developer-portal login. Only V4 locks with an online gateway are shown.",
         "data": {
-          "loxone_custom_field": "Guesty door-code field",
           "loxone_code_prefix": "PIN prefix",
           "access_early_minutes": "Access before check-in (minutes)",
           "access_late_minutes": "Access after check-out (minutes)",
@@ -146,7 +154,6 @@
           "ttlock_listings": "Guesty listings"
         },
         "data_description": {
-          "loxone_custom_field": "Name, variable, or ID of the Guesty reservation custom field, for example door_code.",
           "loxone_code_prefix": "One or two leading digits for automatically generated six-digit codes, for example 7.",
           "access_early_minutes": "How many minutes before Guesty check-in the code becomes valid.",
           "access_late_minutes": "How many minutes after Guesty check-out the code remains valid.",

@@ -63,9 +63,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
         await coordinator.async_config_entry_first_refresh()
 
-        # The general cache intentionally strips reservation custom-field values.
-        # When a PIN provider is enabled after a restart, perform one shared full
-        # read instead of issuing one custom-field request per cached booking.
+        # The general cache intentionally strips reservation Keycodes. When a
+        # PIN provider is enabled after a restart, perform one shared full read
+        # instead of treating the missing cached value as an authoritative edit.
         mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
         ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
         mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
@@ -80,7 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
             and any(
                 reservation.is_active_status()
                 and reservation.listing_id in mapped_listing_ids
-                and not reservation.custom_fields_observed
+                and not reservation.key_code_observed
                 for reservation in coordinator.data.reservations
             )
         ):

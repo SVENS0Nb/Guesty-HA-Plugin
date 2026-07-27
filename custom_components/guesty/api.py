@@ -36,6 +36,12 @@ PAGE_LIMIT = 100
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 OBJECT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
+MAX_NATIVE_KEYCODE_LENGTH = 64
+
+
+def legacy_client_unique_id(client_id: str) -> str:
+    """Return the config-entry identity used before account IDs were available."""
+    return hashlib.sha256(client_id.strip().encode()).hexdigest()
 
 
 def is_safe_resource_id(value: Any) -> bool:
@@ -140,8 +146,13 @@ class GuestyApiClient:
         return self._token_expires_at
 
     async def async_validate_credentials(self) -> str:
-        """Validate credentials and return the account id."""
+        """Validate credentials and return a privacy-safe account identity."""
         await self._async_ensure_token()
+        account = await self._async_request("GET", "/accounts/me")
+        if not isinstance(account, dict):
+            raise GuestyApiError("Unexpected Guesty account response")
+        account_id = account.get("_id") or account.get("id")
+        self._validate_resource_id(account_id, "account")
         await self._async_request(
             "GET",
             "/listings",
@@ -150,7 +161,7 @@ class GuestyApiClient:
                 "limit": "1",
             },
         )
-        return hashlib.sha256(self._client_id.strip().encode()).hexdigest()
+        return hashlib.sha256(str(account_id).encode()).hexdigest()
 
     async def async_get_listings(self) -> list[GuestyListing]:
         """Fetch all listings from the Guesty account."""
@@ -216,6 +227,41 @@ class GuestyApiClient:
         if isinstance(data, dict):
             return GuestyReservation.from_api(data)
         return None
+
+    async def async_update_reservation_key_code(
+        self,
+        reservation_id: str,
+        key_code: str,
+    ) -> None:
+        """Set Guesty's native reservation Keycode with the minimal v3 payload."""
+        if not isinstance(reservation_id, str) or not OBJECT_ID_PATTERN.fullmatch(
+            reservation_id
+        ):
+            raise GuestyApiError("Invalid reservation id")
+        if not isinstance(key_code, str) or not key_code.strip():
+            raise ValueError("Guesty reservation Keycode must not be empty")
+
+        value = key_code.strip()
+        if len(value) > MAX_NATIVE_KEYCODE_LENGTH:
+            raise ValueError("Guesty reservation Keycode is too long")
+        data = await self._async_request(
+            "PUT",
+            f"/reservations-v3/{reservation_id}/notes",
+            # Do not merge or resend unrelated reservation notes. Guesty's
+            # documented notes endpoint accepts partial updates and the minimal
+            # payload avoids the legacy failure caused by round-tripping fields
+            # such as doneBy.
+            json_body={"notes": {"keyCode": value}},
+        )
+
+        if not isinstance(data, dict) or data.get("reservationId") != reservation_id:
+            raise GuestyApiError("Guesty did not confirm the Keycode update")
+        notes = data.get("notes")
+        if (
+            not isinstance(notes, dict)
+            or str(notes.get("keyCode", "")).strip() != value
+        ):
+            raise GuestyApiError("Guesty did not persist the reservation Keycode")
 
     async def async_resolve_custom_field(self, reference: str) -> str:
         """Resolve a Guesty custom field name, variable, or id."""

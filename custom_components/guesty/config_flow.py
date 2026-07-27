@@ -25,6 +25,7 @@ from .api import (
     GuestyApiError,
     GuestyAuthError,
     GuestyPermissionError,
+    legacy_client_unique_id,
 )
 from .loxone_api import (
     LoxoneApiClient,
@@ -52,7 +53,6 @@ from .const import (
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LISTING_SYNC_INTERVAL,
     CONF_LOXONE_CODE_PREFIX,
-    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
     CONF_LOXONE_LISTING_MAPPINGS,
@@ -95,7 +95,6 @@ from .const import (
     DEFAULT_ACCESS_LOGO_URL,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_LOXONE_CODE_PREFIX,
-    DEFAULT_LOXONE_CUSTOM_FIELD,
     DEFAULT_LOXONE_ENABLED,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
     DEFAULT_TTLOCK_ENABLED,
@@ -213,12 +212,20 @@ OPTIONS_SCHEMA = vol.Schema(
     }
 )
 
-REAUTH_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_CLIENT_ID): str,
-        vol.Required(CONF_CLIENT_SECRET): str,
-    }
-)
+
+def _replacement_credentials_schema(client_id: str | None = None) -> vol.Schema:
+    """Return a credential form without ever exposing the stored secret."""
+    client_id_marker = (
+        vol.Required(CONF_CLIENT_ID, default=client_id)
+        if client_id
+        else vol.Required(CONF_CLIENT_ID)
+    )
+    return vol.Schema(
+        {
+            client_id_marker: str,
+            vol.Required(CONF_CLIENT_SECRET): str,
+        }
+    )
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
@@ -242,6 +249,22 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Guesty."""
 
     VERSION = 1
+
+    async def _async_accept_replacement_identity(
+        self,
+        entry: ConfigEntry,
+        new_unique_id: str,
+    ) -> None:
+        """Verify the account, allowing one migration from the legacy client ID."""
+        await self.async_set_unique_id(new_unique_id)
+        old_client_id = entry.data.get(CONF_CLIENT_ID)
+        legacy_unique_id = (
+            legacy_client_unique_id(old_client_id)
+            if isinstance(old_client_id, str) and old_client_id.strip()
+            else None
+        )
+        if entry.unique_id not in {None, legacy_unique_id}:
+            self._abort_if_unique_id_mismatch(reason="account_mismatch")
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -307,6 +330,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Validate and store replacement Guesty credentials."""
+        entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
@@ -321,8 +345,13 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception during Guesty reauthentication")
                 errors["base"] = "unknown"
             else:
+                await self._async_accept_replacement_identity(
+                    entry,
+                    info["unique_id"],
+                )
                 return self.async_update_reload_and_abort(
-                    self._get_reauth_entry(),
+                    entry,
+                    unique_id=info["unique_id"],
                     data_updates={
                         CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
                         CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
@@ -333,7 +362,47 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=REAUTH_SCHEMA,
+            data_schema=_replacement_credentials_schema(entry.data.get(CONF_CLIENT_ID)),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Allow an administrator to replace still-valid Guesty credentials."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                info = await validate_input(self.hass, user_input)
+            except GuestyAuthError:
+                errors["base"] = "invalid_auth"
+            except GuestyPermissionError:
+                errors["base"] = "no_permissions"
+            except GuestyApiError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception during Guesty reconfiguration")
+                errors["base"] = "unknown"
+            else:
+                await self._async_accept_replacement_identity(
+                    entry,
+                    info["unique_id"],
+                )
+                return self.async_update_reload_and_abort(
+                    entry,
+                    unique_id=info["unique_id"],
+                    data_updates={
+                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
+                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
+                        CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
+                        CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_replacement_credentials_schema(entry.data.get(CONF_CLIENT_ID)),
             errors=errors,
         )
 
@@ -366,6 +435,9 @@ class GuestyOptionsFlow(OptionsFlow):
         """Manage Guesty options."""
         if user_input is not None:
             self._pending_options = {**self.config_entry.options, **user_input}
+            # v2.1 and older stored the door-code custom-field reference here.
+            # Native notes.keyCode is now the only PIN source and destination.
+            self._pending_options.pop("loxone_custom_field", None)
             self._pending_code_suffixes = {}
             self._pending_options[CONF_GUESTY_CODE_SUFFIXES] = (
                 self._pending_code_suffixes
@@ -670,7 +742,6 @@ class GuestyOptionsFlow(OptionsFlow):
         if user_input is not None:
             selected = user_input.get(CONF_LOXONE_LISTINGS)
             prefix = str(user_input.get(CONF_LOXONE_CODE_PREFIX, "")).strip()
-            custom_field = str(user_input.get(CONF_LOXONE_CUSTOM_FIELD, "")).strip()
             if not isinstance(selected, list) or not selected:
                 errors["base"] = "select_listing"
             elif (
@@ -679,31 +750,19 @@ class GuestyOptionsFlow(OptionsFlow):
                 or not 1 <= len(prefix) <= 2
             ):
                 errors["base"] = "invalid_code_prefix"
-            elif not custom_field:
-                errors["base"] = "custom_field_not_found"
             else:
-                try:
-                    await self.config_entry.runtime_data.client.async_resolve_custom_field(
-                        custom_field
-                    )
-                except (GuestyApiError, GuestyAuthError):
-                    errors["base"] = "custom_field_not_found"
-
-                selected_ids = (
-                    list(dict.fromkeys(item for item in selected if item in listings))
-                    if not errors
-                    else []
+                selected_ids = list(
+                    dict.fromkeys(item for item in selected if item in listings)
                 )
-                if not errors and not selected_ids:
+                if not selected_ids:
                     errors["base"] = "select_listing"
-                elif not errors:
+                else:
                     self._pending_options.update(
                         {
                             CONF_LOXONE_PROVISION_LEAD_MINUTES: int(
                                 user_input[CONF_LOXONE_PROVISION_LEAD_MINUTES]
                             ),
                             CONF_LOXONE_CODE_PREFIX: prefix,
-                            CONF_LOXONE_CUSTOM_FIELD: custom_field,
                             CONF_ACCESS_EARLY_MINUTES: int(
                                 user_input[CONF_ACCESS_EARLY_MINUTES]
                             ),
@@ -729,9 +788,6 @@ class GuestyOptionsFlow(OptionsFlow):
                 ),
                 vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
                     str, vol.Length(min=1, max=2)
-                ),
-                vol.Required(CONF_LOXONE_CUSTOM_FIELD): vol.All(
-                    str, vol.Length(min=1, max=128)
                 ),
                 vol.Required(CONF_ACCESS_EARLY_MINUTES): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=180)
@@ -762,10 +818,6 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                     CONF_LOXONE_CODE_PREFIX: self.config_entry.options.get(
                         CONF_LOXONE_CODE_PREFIX, DEFAULT_LOXONE_CODE_PREFIX
-                    ),
-                    CONF_LOXONE_CUSTOM_FIELD: (
-                        self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
-                        or DEFAULT_LOXONE_CUSTOM_FIELD
                     ),
                     CONF_ACCESS_EARLY_MINUTES: self._pending_options.get(
                         CONF_ACCESS_EARLY_MINUTES,
@@ -1047,12 +1099,6 @@ class GuestyOptionsFlow(OptionsFlow):
                 or self.config_entry.options.get(CONF_LOXONE_CODE_PREFIX)
                 or DEFAULT_LOXONE_CODE_PREFIX
             ).strip()
-            custom_field = str(
-                user_input.get(CONF_LOXONE_CUSTOM_FIELD)
-                or self._pending_options.get(CONF_LOXONE_CUSTOM_FIELD)
-                or self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
-                or DEFAULT_LOXONE_CUSTOM_FIELD
-            ).strip()
             early_minutes = int(
                 user_input.get(
                     CONF_ACCESS_EARLY_MINUTES,
@@ -1102,17 +1148,12 @@ class GuestyOptionsFlow(OptionsFlow):
                 or not 1 <= len(prefix) <= 2
             ):
                 errors["base"] = "invalid_code_prefix"
-            elif not custom_field:
-                errors["base"] = "custom_field_not_found"
             elif region not in TTLOCK_API_BASE_URLS:
                 errors["base"] = "ttlock_invalid_region"
             elif not client_id or not client_secret or not username:
                 errors["base"] = "ttlock_invalid_auth"
             else:
                 try:
-                    await self.config_entry.runtime_data.client.async_resolve_custom_field(
-                        custom_field
-                    )
                     client = TTLockApiClient.from_hass(
                         self.hass,
                         region=region,
@@ -1145,8 +1186,6 @@ class GuestyOptionsFlow(OptionsFlow):
                         # secret before it is saved.
                         await client.async_refresh_access_token()
                     locks = await client.async_list_locks()
-                except (GuestyApiError, GuestyAuthError):
-                    errors["base"] = "custom_field_not_found"
                 except TTLockAuthError:
                     errors["base"] = "ttlock_invalid_auth"
                 except (TTLockApiError, ValueError, KeyError):
@@ -1182,7 +1221,6 @@ class GuestyOptionsFlow(OptionsFlow):
                         else:
                             self._pending_options.update(
                                 {
-                                    CONF_LOXONE_CUSTOM_FIELD: custom_field,
                                     CONF_LOXONE_CODE_PREFIX: prefix,
                                     CONF_ACCESS_EARLY_MINUTES: early_minutes,
                                     CONF_ACCESS_LATE_MINUTES: late_minutes,
@@ -1252,9 +1290,6 @@ class GuestyOptionsFlow(OptionsFlow):
         if not loxone_configured:
             schema_fields.update(
                 {
-                    vol.Required(CONF_LOXONE_CUSTOM_FIELD): vol.All(
-                        str, vol.Length(min=1, max=128)
-                    ),
                     vol.Required(CONF_LOXONE_CODE_PREFIX): vol.All(
                         str, vol.Length(min=1, max=2)
                     ),
@@ -1277,11 +1312,6 @@ class GuestyOptionsFlow(OptionsFlow):
             data_schema=self.add_suggested_values_to_schema(
                 schema,
                 {
-                    CONF_LOXONE_CUSTOM_FIELD: (
-                        self._pending_options.get(CONF_LOXONE_CUSTOM_FIELD)
-                        or self.config_entry.options.get(CONF_LOXONE_CUSTOM_FIELD)
-                        or DEFAULT_LOXONE_CUSTOM_FIELD
-                    ),
                     CONF_LOXONE_CODE_PREFIX: self._pending_options.get(
                         CONF_LOXONE_CODE_PREFIX,
                         self.config_entry.options.get(

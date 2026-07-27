@@ -15,7 +15,6 @@ from custom_components.guesty.const import (
     CONF_ACCESS_LATE_MINUTES,
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
-    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_TTLOCK_ACCESS_TOKEN,
     CONF_TTLOCK_ACCOUNT,
@@ -279,7 +278,6 @@ async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
         **_options([101]),
         CONF_LOXONE_ENABLED: False,
         CONF_LOXONE_CODE_PREFIX: "7",
-        CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
         CONF_ACCESS_EARLY_MINUTES: 0,
         CONF_ACCESS_LATE_MINUTES: 0,
         CONF_GUESTY_CODE_SUFFIXES: {"listing-1": "#"},
@@ -294,9 +292,7 @@ async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
         )
     )
     guesty_client = SimpleNamespace(
-        async_resolve_custom_field=AsyncMock(return_value="field-id"),
-        async_get_reservation_custom_field=AsyncMock(return_value=None),
-        async_update_reservation_custom_field=AsyncMock(),
+        async_update_reservation_key_code=AsyncMock(),
     )
     pin_manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
     pin_manager._data = {"records": {}}
@@ -307,8 +303,8 @@ async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
     await pin_manager.async_reconcile()
 
     code = pin_manager.reservation_pin_snapshot(reservation.id)["code"]
-    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
-        reservation.id, "field-id", f"{code}#"
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id, f"{code}#"
     )
 
     manager, _coordinator, _pin_manager, remote = _manager(

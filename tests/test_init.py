@@ -14,10 +14,96 @@ from custom_components.guesty.const import (
     CONF_ACCESS_TOKEN,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_LISTING_MAPPINGS,
     CONF_TOKEN_EXPIRES_AT,
     CONF_WEBHOOK_ID,
     DOMAIN,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("keycode_observed", "expected_calls"), [(False, 1), (True, 0)]
+)
+async def test_setup_refreshes_privacy_stripped_native_keycodes(
+    hass, monkeypatch, keycode_observed, expected_calls
+) -> None:
+    """PIN providers require one shared full read when cache omitted Keycodes."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={
+            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+        },
+    )
+    entry.add_to_hass(hass)
+    reservation = SimpleNamespace(
+        listing_id="listing-1",
+        key_code_observed=keycode_observed,
+        is_active_status=lambda: True,
+    )
+    coordinator = SimpleNamespace(
+        data=SimpleNamespace(
+            listings={"listing-1": SimpleNamespace()},
+            reservations=[reservation],
+        ),
+        async_load_cached_data=AsyncMock(return_value=None),
+        async_config_entry_first_refresh=AsyncMock(),
+        async_force_full_sync=AsyncMock(),
+        async_add_listener=MagicMock(return_value=lambda: None),
+        set_webhook_active=MagicMock(),
+    )
+    storage = SimpleNamespace(async_load=AsyncMock(return_value={}))
+    scheduler = SimpleNamespace(
+        async_schedule=MagicMock(),
+        async_unschedule=MagicMock(),
+    )
+    access_manager = SimpleNamespace(
+        async_setup=AsyncMock(),
+        async_unload=AsyncMock(),
+        async_schedule_reconcile=MagicMock(),
+    )
+    loxone_manager = SimpleNamespace(
+        async_setup=AsyncMock(),
+        async_unload=AsyncMock(),
+        async_schedule_reconcile=MagicMock(),
+    )
+
+    monkeypatch.setattr(guesty_init, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(
+        guesty_init.GuestyApiClient,
+        "from_hass",
+        MagicMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyDataUpdateCoordinator", lambda *_args: coordinator
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyTransitionScheduler", lambda *_args: scheduler
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyAccessManager", lambda *_args: access_manager
+    )
+    monkeypatch.setattr(
+        guesty_init, "GuestyLoxoneManager", lambda *_args: loxone_manager
+    )
+    monkeypatch.setattr(guesty_init, "async_register_access_manager", MagicMock())
+    monkeypatch.setattr(
+        guesty_init,
+        "async_setup_webhook",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        AsyncMock(),
+    )
+
+    assert await async_setup_entry(hass, entry)
+
+    assert coordinator.async_force_full_sync.await_count == expected_calls
 
 
 @pytest.mark.asyncio

@@ -187,7 +187,6 @@ class GuestyReservation:
     key_code_observed: bool = False
     custom_fields: dict[str, Any] = field(default_factory=dict)
     custom_fields_observed: bool = False
-    legacy_key_code: str | None = None
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
@@ -207,9 +206,8 @@ class GuestyReservation:
 
         listing = data.get("listing") or {}
         guest = data.get("guest") or {}
-        notes = data.get("notes") or {}
-        if not isinstance(notes, dict):
-            notes = {}
+        raw_notes = data.get("notes")
+        notes = raw_notes if isinstance(raw_notes, dict) else {}
         raw_custom_fields = data.get("customFields")
         custom_fields: dict[str, Any] = {}
         if isinstance(raw_custom_fields, list):
@@ -234,19 +232,18 @@ class GuestyReservation:
             listing_default_check_out=listing.get("defaultCheckOutTime"),
             guest_name=guest.get("fullName"),
             last_updated_at=data.get("lastUpdatedAt"),
-            # The configured reservation custom field is selected only after its
-            # reference has been resolved to an account-specific field ID.
-            key_code=None,
-            key_code_observed=False,
-            custom_fields=custom_fields,
-            custom_fields_observed=isinstance(raw_custom_fields, list),
-            # Keep the former built-in Keycode only in memory for a one-time,
-            # non-rotating migration into the configured custom field.
-            legacy_key_code=(
+            # Guesty's native reservation Keycode is the authoritative source
+            # for both Loxone and TTLock. Only a returned notes object proves
+            # that this optional projection was observed; an omitted object
+            # must not look like a manual deletion on a later poll.
+            key_code=(
                 str(notes["keyCode"]).strip()
                 if notes.get("keyCode") is not None
                 else None
             ),
+            key_code_observed=isinstance(raw_notes, dict),
+            custom_fields=custom_fields,
+            custom_fields_observed=isinstance(raw_custom_fields, list),
         )
 
     def is_active_status(self) -> bool:
@@ -385,7 +382,6 @@ class GuestyReservation:
             key_code_observed=False,
             custom_fields={},
             custom_fields_observed=False,
-            legacy_key_code=None,
         )
 
 

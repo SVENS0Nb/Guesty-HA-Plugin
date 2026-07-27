@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
-from homeassistant.config_entries import SOURCE_REAUTH
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
 import pytest
@@ -43,7 +44,6 @@ from custom_components.guesty.const import (
     CONF_GUESTY_CODE_SUFFIX,
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
-    CONF_LOXONE_CUSTOM_FIELD,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
     CONF_LOXONE_LISTING_MAPPINGS,
@@ -133,8 +133,9 @@ async def test_reauth_updates_credentials_and_token(hass, monkeypatch) -> None:
     """Expired credentials can be replaced without deleting the integration."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        unique_id="existing-account",
+        unique_id=VALIDATED["unique_id"],
         data={CONF_CLIENT_ID: "old", CONF_CLIENT_SECRET: "old-secret"},
+        options={"preserved": True},
     )
     entry.add_to_hass(hass)
     monkeypatch.setattr(
@@ -160,6 +161,180 @@ async def test_reauth_updates_credentials_and_token(hass, monkeypatch) -> None:
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_CLIENT_ID] == "new-client"
     assert entry.data[CONF_ACCESS_TOKEN] == "validated-token"
+    assert entry.options == {"preserved": True}
+
+
+@pytest.mark.asyncio
+async def test_reauth_rejects_credentials_for_another_account(
+    hass, monkeypatch
+) -> None:
+    """Replacement credentials cannot silently switch the configured account."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="existing-account",
+        data={CONF_CLIENT_ID: "old", CONF_CLIENT_SECRET: "old-secret"},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        config_flow,
+        "validate_input",
+        AsyncMock(return_value=VALIDATED),
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {
+            CONF_CLIENT_ID: "other-client",
+            CONF_CLIENT_SECRET: "other-secret",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "account_mismatch"
+    assert entry.data[CONF_CLIENT_ID] == "old"
+    assert entry.data[CONF_CLIENT_SECRET] == "old-secret"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_updates_credentials_without_losing_options(
+    hass, monkeypatch
+) -> None:
+    """Valid credentials can be replaced proactively from the integration menu."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={
+            CONF_CLIENT_ID: "old-client",
+            CONF_CLIENT_SECRET: "old-secret",
+            "unrelated_data": "preserved",
+        },
+        options={
+            CONF_ACCESS_ENABLED: True,
+            CONF_LOXONE_ENABLED: True,
+            CONF_TTLOCK_ENABLED: True,
+        },
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        config_flow,
+        "validate_input",
+        AsyncMock(return_value=VALIDATED),
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    assert form["type"] is FlowResultType.FORM
+    assert form["step_id"] == "reconfigure"
+    client_id_field = next(
+        marker
+        for marker in form["data_schema"].schema
+        if marker.schema == CONF_CLIENT_ID
+    )
+    assert client_id_field.default() == "old-client"
+
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {
+            CONF_CLIENT_ID: " new-client ",
+            CONF_CLIENT_SECRET: " new-secret ",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_CLIENT_ID] == "new-client"
+    assert entry.data[CONF_CLIENT_SECRET] == "new-secret"
+    assert entry.data[CONF_ACCESS_TOKEN] == "validated-token"
+    assert entry.data[CONF_TOKEN_EXPIRES_AT] == 123456.0
+    assert entry.data["unrelated_data"] == "preserved"
+    assert entry.options == {
+        CONF_ACCESS_ENABLED: True,
+        CONF_LOXONE_ENABLED: True,
+        CONF_TTLOCK_ENABLED: True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_rejects_credentials_for_another_account(
+    hass, monkeypatch
+) -> None:
+    """Manual credential replacement cannot move an entry to another account."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="existing-account",
+        data={CONF_CLIENT_ID: "old", CONF_CLIENT_SECRET: "old-secret"},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        config_flow,
+        "validate_input",
+        AsyncMock(return_value=VALIDATED),
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {
+            CONF_CLIENT_ID: "other-client",
+            CONF_CLIENT_SECRET: "other-secret",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "account_mismatch"
+    assert entry.data[CONF_CLIENT_ID] == "old"
+    assert entry.data[CONF_CLIENT_SECRET] == "old-secret"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_migrates_legacy_client_based_unique_id(
+    hass, monkeypatch
+) -> None:
+    """An existing installation can replace its Client ID exactly once."""
+    old_client_id = "old-client"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=hashlib.sha256(old_client_id.encode()).hexdigest(),
+        data={
+            CONF_CLIENT_ID: old_client_id,
+            CONF_CLIENT_SECRET: "old-secret",
+        },
+        options={"preserved": True},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        config_flow,
+        "validate_input",
+        AsyncMock(return_value=VALIDATED),
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {
+            CONF_CLIENT_ID: "new-client",
+            CONF_CLIENT_SECRET: "new-secret",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == VALIDATED["unique_id"]
+    assert entry.data[CONF_CLIENT_ID] == "new-client"
+    assert entry.options == {"preserved": True}
 
 
 @pytest.mark.asyncio
@@ -168,7 +343,10 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
-        options={CONF_SCAN_INTERVAL: 300},
+        options={
+            CONF_SCAN_INTERVAL: 300,
+            "loxone_custom_field": "{{door_code}}",
+        },
     )
     entry.add_to_hass(hass)
 
@@ -188,6 +366,7 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_SCAN_INTERVAL] == 600
     assert result["data"][CONF_EXPOSE_GUEST_DETAILS] is True
+    assert "loxone_custom_field" not in result["data"]
 
 
 @pytest.mark.asyncio
@@ -436,7 +615,6 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
         {
             CONF_LOXONE_PROVISION_LEAD_MINUTES: 360,
             CONF_LOXONE_CODE_PREFIX: "7",
-            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
             CONF_ACCESS_EARLY_MINUTES: 15,
             CONF_ACCESS_LATE_MINUTES: 30,
             config_flow.CONF_LOXONE_SERVER_COUNT: 1,
@@ -495,7 +673,7 @@ async def test_options_flow_tests_loxone_and_maps_groups(hass, monkeypatch) -> N
             CONF_LOXONE_GROUP_UUIDS: ["group-front", "group-flat"],
         }
     }
-    assert result["data"][CONF_LOXONE_CUSTOM_FIELD] == "{{door_code}}"
+    assert "loxone_custom_field" not in result["data"]
     assert result["data"][CONF_GUESTY_CODE_SUFFIXES] == {"listing-1": "#"}
     assert (
         result["data"][CONF_LOXONE_MINISERVERS][0][CONF_LOXONE_SERVER_PASSWORD]
@@ -588,7 +766,6 @@ async def test_options_flow_tests_ttlock_and_maps_compatible_locks(
     assert ttlock_form["step_id"] == "ttlock"
 
     ttlock_account_input = {
-        CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
         CONF_LOXONE_CODE_PREFIX: "7",
         CONF_ACCESS_EARLY_MINUTES: 15,
         CONF_ACCESS_LATE_MINUTES: 30,
@@ -719,7 +896,6 @@ async def test_shared_suffix_is_configured_once_when_both_providers_use_listing(
         {
             CONF_LOXONE_PROVISION_LEAD_MINUTES: 360,
             CONF_LOXONE_CODE_PREFIX: "7",
-            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
             CONF_ACCESS_EARLY_MINUTES: 0,
             CONF_ACCESS_LATE_MINUTES: 0,
             config_flow.CONF_LOXONE_SERVER_COUNT: 1,
@@ -868,7 +1044,6 @@ async def test_ttlock_reconfigure_reuses_latest_private_refresh_token(
     result = await hass.config_entries.options.async_configure(
         form["flow_id"],
         {
-            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
             CONF_LOXONE_CODE_PREFIX: "7",
             CONF_ACCESS_EARLY_MINUTES: 0,
             CONF_ACCESS_LATE_MINUTES: 0,
@@ -914,7 +1089,6 @@ async def test_ttlock_reconfigure_reuses_latest_private_refresh_token(
     rejected = await hass.config_entries.options.async_configure(
         rejected_flow["flow_id"],
         {
-            CONF_LOXONE_CUSTOM_FIELD: "{{door_code}}",
             CONF_LOXONE_CODE_PREFIX: "7",
             CONF_ACCESS_EARLY_MINUTES: 0,
             CONF_ACCESS_LATE_MINUTES: 0,
