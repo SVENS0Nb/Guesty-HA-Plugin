@@ -162,6 +162,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - An omitted `notes` projection means “not observed,” not “the user deleted the
   Keycode.” Never rotate or overwrite a privately cached PIN solely because a
   sparse response omitted `notes`.
+- A sparse `notes` projection must not strand an explicitly pending native
+  Keycode publication. After bounded backoff, retry the exact stable private PIN
+  for a failed initial write, source migration, or configured suffix change;
+  never rotate merely because the projection is absent.
 - An explicitly empty, invalid, or duplicate observed Keycode is fail-closed:
   revoke existing remote delivery first, generate a replacement, confirm it in
   Guesty, and only then provision it remotely.
@@ -180,6 +184,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   enters retry backoff, but must never stop unrelated reservations in the same
   batch. Account-wide authentication, permission, transport, or payload errors
   may stop the batch to avoid unnecessary traffic.
+- Native Keycode failures log only the hashed reservation marker, stable
+  operation/reason, safe endpoint label, HTTP status, bounded `x-request-id`,
+  retry count/delay, and available rate-limit headroom. A successful write may
+  log the marker and retry count, but never the PIN or full reservation ID.
 - The privacy-filtered general cache never persists Keycodes. The private PIN
   store owns plaintext only while needed. Remove plaintext locally at
   cancellation/access end before attempting remote cleanup. Guesty's native

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, call
+from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import aiohttp
 from homeassistant.util import dt as dt_util
@@ -263,6 +263,57 @@ def test_invalid_json_error_has_safe_actionable_response_context() -> None:
     assert "request_id=request-123" in message
     assert "507f1f77bcf86cd799439011" not in message
     assert "Private Name" not in message
+
+
+def test_structured_error_context_excludes_resource_ids_and_unsafe_headers() -> None:
+    """Managers receive useful HTTP context without a reservation identifier."""
+    context = GuestyApiClient._structured_error_context(
+        "/reservations-v3/507f1f77bcf86cd799439011/notes",
+        404,
+        {"x-request-id": "request/404 unsafe"},
+    )
+    error = GuestyNotFoundError("private upstream detail", **context)
+
+    assert error.status_code == 404
+    assert error.endpoint == "reservations-v3"
+    assert error.request_id == "request_404_unsafe"
+    assert "507f1f77bcf86cd799439011" not in error.endpoint
+
+
+@pytest.mark.asyncio
+async def test_http_404_propagates_safe_structured_context() -> None:
+    """A real request failure retains status and request ID for manager logs."""
+
+    class ResponseContext:
+        async def __aenter__(self):
+            return response
+
+        async def __aexit__(self, *_args):
+            return False
+
+    content = SimpleNamespace(
+        read=AsyncMock(side_effect=[b'{"message":"private detail"}', b""])
+    )
+    response = SimpleNamespace(
+        status=404,
+        headers={"x-request-id": "request-404"},
+        content=content,
+        charset="utf-8",
+    )
+    session = SimpleNamespace(request=MagicMock(return_value=ResponseContext()))
+    client = GuestyApiClient(session, "client", "secret", "token", float("inf"))
+
+    with pytest.raises(GuestyNotFoundError) as raised:
+        await client._async_request_once(
+            "PUT",
+            "/reservations-v3/507f1f77bcf86cd799439011/notes",
+            json_body={"notes": {}},
+        )
+
+    assert raised.value.status_code == 404
+    assert raised.value.endpoint == "reservations-v3"
+    assert raised.value.request_id == "request-404"
+    assert "507f1f77bcf86cd799439011" not in str(raised.value)
 
 
 def test_targeted_reservation_filters_limit_new_listing_traffic() -> None:

@@ -446,10 +446,11 @@ class GuestyLoxoneManager:
                     if retry_at:
                         next_run = self._earlier(next_run, retry_at)
                     errors.append(reason)
-                    _LOGGER.warning(
-                        "Guesty reservation code synchronization failed for %s: %s",
-                        self._reservation_marker(reservation.id),
-                        reason,
+                    self._log_guesty_keycode_failure(
+                        reservation,
+                        record,
+                        err,
+                        now,
                     )
                 except (RuntimeError, ValueError) as err:
                     record["last_error"] = "code_generation_failed"
@@ -587,6 +588,12 @@ class GuestyLoxoneManager:
                                 if self._guesty_error_stops_write_batch(err):
                                     self._guesty_writes_remaining = 0
                                 errors.append(reason)
+                                self._log_guesty_keycode_failure(
+                                    reservation,
+                                    record,
+                                    err,
+                                    now,
+                                )
                             except (LoxoneApiError, LoxoneAuthError) as err:
                                 self._record_retry_failure(record, "loxone", now)
                                 record["last_error"] = type(err).__name__
@@ -696,6 +703,72 @@ class GuestyLoxoneManager:
         return "guesty_keycode_rejected"
 
     @staticmethod
+    def _guesty_error_log_context(error: Exception) -> tuple[int | str, str, str]:
+        """Return bounded, privacy-safe Guesty HTTP fields for logs."""
+        raw_status = getattr(error, "status_code", None)
+        status: int | str = (
+            raw_status
+            if isinstance(raw_status, int)
+            and not isinstance(raw_status, bool)
+            and 100 <= raw_status <= 599
+            else "unknown"
+        )
+        raw_endpoint = getattr(error, "endpoint", None)
+        endpoint = (
+            raw_endpoint
+            if isinstance(raw_endpoint, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", raw_endpoint)
+            else "unknown"
+        )
+        raw_request_id = getattr(error, "request_id", None)
+        request_id = (
+            raw_request_id
+            if isinstance(raw_request_id, str)
+            and re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", raw_request_id)
+            else "unavailable"
+        )
+        return status, endpoint, request_id
+
+    def _log_guesty_keycode_failure(
+        self,
+        reservation: GuestyReservation,
+        record: Mapping[str, Any],
+        error: Exception,
+        now: datetime,
+    ) -> None:
+        """Log actionable Guesty context without PINs or reservation IDs."""
+        status, endpoint, request_id = self._guesty_error_log_context(error)
+        retry_at = self._retry_at(record, "guesty")
+        retry_count = record.get("guesty_retry_count", 0)
+        retry_in_seconds = (
+            max(0, int((retry_at - now).total_seconds())) if retry_at is not None else 0
+        )
+        rate_limit_remaining = getattr(
+            self._client,
+            "last_rate_limit_remaining",
+            None,
+        )
+        _LOGGER.warning(
+            "Guesty reservation Keycode synchronization failed "
+            "marker=%s operation=native_keycode_write reason=%s "
+            "endpoint=%s http_status=%s request_id=%s "
+            "retry_count=%s retry_in_seconds=%s "
+            "rate_limit_remaining=%s",
+            self._reservation_marker(reservation.id),
+            self._guesty_error_reason(error),
+            endpoint,
+            status,
+            request_id,
+            retry_count,
+            retry_in_seconds,
+            (
+                rate_limit_remaining
+                if isinstance(rate_limit_remaining, int)
+                else "unknown"
+            ),
+        )
+
+    @staticmethod
     def _guesty_error_stops_write_batch(error: Exception) -> bool:
         """Return whether one failure predicts failure for all later writes."""
         # A reservation-specific 404 may affect a stale, imported, grouped, or
@@ -733,7 +806,10 @@ class GuestyLoxoneManager:
                 # The disk cache intentionally strips codes. Preserve the
                 # private record until the next successful shared Guesty poll.
                 return False
-            return False
+            # A sparse response still cannot prove a manual deletion. It must,
+            # however, not suppress an explicit migration or display-suffix
+            # change that already requires publishing the stable private PIN.
+            return source_changed or suffix_changed
 
         record["source_last_updated_at"] = reservation.last_updated_at
         return source_changed
@@ -765,6 +841,27 @@ class GuestyLoxoneManager:
             and local_code is not None
             and not record.get("replacement_pending")
         ):
+            publication_pending = field_changed or record.get("field_synced") is False
+            if not publication_pending:
+                return
+            # Resume only the exact PIN publication already recorded in private
+            # state. This never treats an omitted notes projection as a manual
+            # deletion and therefore cannot rotate a stable cached PIN.
+            if self._retry_is_deferred(record, "guesty", now):
+                return
+            if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(
+                local_code
+            ):
+                local_code = self._generate_code()
+                record["code"] = local_code
+                self._last_rotated += 1
+            record["field_synced"] = False
+            await self._async_write_keycode(
+                reservation,
+                record,
+                field_id,
+                local_code,
+            )
             return
 
         if record.get("replacement_pending"):
@@ -917,6 +1014,14 @@ class GuestyLoxoneManager:
         """Write and locally confirm Guesty's native reservation Keycode."""
         if not _CODE_PATTERN.fullmatch(code):
             raise ValueError("Guesty reservation access code must contain six digits")
+        raw_retry_count = record.get("guesty_retry_count", 0)
+        retry_count = (
+            raw_retry_count
+            if isinstance(raw_retry_count, int)
+            and not isinstance(raw_retry_count, bool)
+            and raw_retry_count >= 0
+            else 0
+        )
         self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
         self._last_guesty_writes += 1
         guesty_value = self._guesty_code_value(code, reservation.listing_id)
@@ -935,6 +1040,12 @@ class GuestyLoxoneManager:
         if isinstance(last_error, str) and last_error.startswith("guesty_"):
             record.pop("last_error", None)
         await self._storage.async_save(self._data)
+        _LOGGER.info(
+            "Guesty reservation Keycode synchronized "
+            "marker=%s operation=native_keycode_write retry_count=%s",
+            self._reservation_marker(reservation.id),
+            retry_count,
+        )
 
     async def _async_replace_invalid_or_missing_guesty_code(
         self,

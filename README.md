@@ -662,7 +662,20 @@ python -m pytest
   lokale Erzeugung und den von Guesty bestätigten Schreibvorgang; `Ausstehend`
   oder `Fehler` zeigt, dass die Veröffentlichung noch nicht bestätigt ist
 - **Diagnostics** – Integration → ⋮ → Diagnose-Daten herunterladen
-- **Logs** – `logger: custom_components.guesty: debug` in `configuration.yaml`
+- **Ausführliche Logs** – folgende Konfiguration in `configuration.yaml`
+  eintragen und Home Assistant neu starten:
+
+  ```yaml
+  logger:
+    default: warning
+    logs:
+      custom_components.guesty: debug
+  ```
+
+  Keycode-Fehler enthalten dann eine anonymisierte Reservierungskennung,
+  Operation, HTTP-Status, Guesty-`x-request-id`, Retry-Zähler und verfügbares
+  API-Limit. PINs, Gastnamen und vollständige Reservierungs-IDs werden nicht
+  protokolliert.
 
 ## Lizenz
 

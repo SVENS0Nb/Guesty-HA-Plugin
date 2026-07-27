@@ -434,11 +434,12 @@ async def test_setup_recovers_reasonless_v180_guesty_backoff(hass, monkeypatch) 
 async def test_existing_private_code_migrates_to_native_keycode_without_rotation(
     hass, monkeypatch
 ) -> None:
-    """An existing private PIN is published natively without being rotated."""
+    """A sparse response cannot block migration of an existing private PIN."""
     reservation = _reservation(
         check_in=NOW + timedelta(days=10),
         check_out=NOW + timedelta(days=12),
     )
+    reservation.key_code_observed = False
     manager, _coordinator, guesty_client, _remote = _manager(
         hass, monkeypatch, reservation
     )
@@ -458,9 +459,9 @@ async def test_existing_private_code_migrates_to_native_keycode_without_rotation
 
 @pytest.mark.asyncio
 async def test_native_keycode_not_found_is_reported_without_fallback(
-    hass, monkeypatch
+    hass, monkeypatch, caplog
 ) -> None:
-    """A missing reservation is surfaced and never falls back to a custom field."""
+    """A missing reservation logs safe context without a custom-field fallback."""
     reservation = _reservation(
         check_in=NOW + timedelta(days=10),
         check_out=NOW + timedelta(days=12),
@@ -469,8 +470,12 @@ async def test_native_keycode_not_found_is_reported_without_fallback(
         hass, monkeypatch, reservation
     )
     guesty_client.async_update_reservation_key_code.side_effect = GuestyNotFoundError(
-        "reservation missing"
+        "private upstream detail",
+        404,
+        request_id="request-404",
+        endpoint="reservations-v3",
     )
+    caplog.set_level("INFO", logger="custom_components.guesty.loxone")
 
     await manager.async_reconcile()
 
@@ -478,6 +483,65 @@ async def test_native_keycode_not_found_is_reported_without_fallback(
     assert record["field_synced"] is False
     assert record["last_error"] == "guesty_reservation_not_found"
     guesty_client.async_update_reservation_key_code.assert_awaited_once()
+    assert "operation=native_keycode_write" in caplog.text
+    assert "reason=guesty_reservation_not_found" in caplog.text
+    assert "endpoint=reservations-v3" in caplog.text
+    assert "http_status=404" in caplog.text
+    assert "request_id=request-404" in caplog.text
+    assert "retry_count=1" in caplog.text
+    assert "retry_in_seconds=300" in caplog.text
+    assert "private upstream detail" not in caplog.text
+    assert reservation.id not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_not_found_retries_same_pin_after_sparse_response(
+    hass, monkeypatch, caplog
+) -> None:
+    """A failed initial native write remains retryable when notes are omitted."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+    )
+    reservation.key_code_observed = False
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    guesty_client.async_update_reservation_key_code.side_effect = [
+        GuestyNotFoundError("reservation missing"),
+        None,
+    ]
+    caplog.set_level("INFO", logger="custom_components.guesty.loxone")
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    generated = record["code"]
+    assert record["field_synced"] is False
+    assert record["last_error"] == "guesty_reservation_not_found"
+
+    # A coordinator update before the bounded retry time must not create a
+    # rapid write loop.
+    await manager.async_reconcile()
+    assert guesty_client.async_update_reservation_key_code.await_count == 1
+
+    monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW + timedelta(minutes=6))
+    await manager.async_reconcile()
+
+    assert record["code"] == generated
+    assert record["field_synced"] is True
+    assert "last_error" not in record
+    assert "guesty_retry_at" not in record
+    assert "guesty_retry_count" not in record
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    guesty_client.async_update_reservation_key_code.assert_awaited_with(
+        reservation.id,
+        generated,
+    )
+    assert "Guesty reservation Keycode synchronized" in caplog.text
+    assert "retry_count=1" in caplog.text
+    assert generated not in caplog.text
+    assert reservation.id not in caplog.text
 
 
 @pytest.mark.asyncio

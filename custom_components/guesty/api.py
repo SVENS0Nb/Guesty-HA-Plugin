@@ -53,22 +53,58 @@ def is_safe_resource_id(value: Any) -> bool:
 class GuestyAuthError(Exception):
     """Raised when Guesty authentication fails."""
 
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        request_id: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        """Initialize an authentication error with safe HTTP context."""
+        super().__init__(message)
+        self.status_code = status_code
+        self.request_id = request_id
+        self.endpoint = endpoint
+
 
 class GuestyApiError(Exception):
     """Raised when a Guesty API request fails."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
-        """Initialize an API error with optional structured HTTP context."""
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        request_id: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        """Initialize an API error with safe structured HTTP context."""
         super().__init__(message)
         self.status_code = status_code
+        self.request_id = request_id
+        self.endpoint = endpoint
 
 
 class GuestyRetryableError(GuestyApiError):
     """Raised when a Guesty API request can be retried."""
 
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        status_code: int | None = None,
+        request_id: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
         """Initialize a retryable API error."""
-        super().__init__(message)
+        super().__init__(
+            message,
+            status_code,
+            request_id=request_id,
+            endpoint=endpoint,
+        )
         self.retry_after = retry_after
 
 
@@ -652,7 +688,10 @@ class GuestyApiClient:
             except GuestyAuthError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                last_error = GuestyApiError("Token request connection failed")
+                last_error = GuestyApiError(
+                    "Token request connection failed",
+                    endpoint="oauth2",
+                )
             except GuestyRetryableError as err:
                 last_error = err
             except GuestyApiError:
@@ -688,14 +727,26 @@ class GuestyApiClient:
             body = await self._async_read_response_text(response)
             if response.status != 200:
                 _LOGGER.error("Guesty auth failed with HTTP %s", response.status)
+                context = self._structured_error_context(
+                    "/oauth2/token",
+                    response.status,
+                    response.headers,
+                )
                 if response.status in {400, 401, 403}:
-                    raise GuestyAuthError(f"Authentication failed ({response.status})")
+                    raise GuestyAuthError(
+                        f"Authentication failed ({response.status})",
+                        **context,
+                    )
                 if response.status in RETRYABLE_STATUS_CODES:
                     raise GuestyRetryableError(
                         f"Token request failed ({response.status})",
                         self._retry_delay_from_response(response),
+                        **context,
                     )
-                raise GuestyApiError(f"Token request failed ({response.status})")
+                raise GuestyApiError(
+                    f"Token request failed ({response.status})",
+                    **context,
+                )
 
             try:
                 data = json.loads(body)
@@ -797,7 +848,10 @@ class GuestyApiClient:
             except (GuestyAuthError, GuestyPermissionError):
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                last_error = GuestyRetryableError("Request connection failed")
+                last_error = GuestyRetryableError(
+                    "Request connection failed",
+                    endpoint=self._endpoint_label(path),
+                )
             except GuestyRetryableError as err:
                 last_error = err
             except GuestyApiError:
@@ -848,6 +902,11 @@ class GuestyApiClient:
         ) as response:
             body = await self._async_read_response_text(response)
             self._capture_rate_limit_headers(response.headers)
+            context = self._structured_error_context(
+                path,
+                response.status,
+                response.headers,
+            )
 
             if response.status == 401 and retry_auth:
                 await self._async_ensure_token(
@@ -865,6 +924,11 @@ class GuestyApiClient:
                 ) as retry_response:
                     retry_body = await self._async_read_response_text(retry_response)
                     self._capture_rate_limit_headers(retry_response.headers)
+                    retry_context = self._structured_error_context(
+                        path,
+                        retry_response.status,
+                        retry_response.headers,
+                    )
                     if retry_response.status == 401:
                         raise GuestyAuthError(
                             self._error_message(
@@ -872,7 +936,8 @@ class GuestyApiClient:
                                 retry_response.status,
                                 retry_body,
                                 retry_response.headers,
-                            )
+                            ),
+                            **retry_context,
                         )
                     if retry_response.status == 403:
                         raise GuestyPermissionError(
@@ -881,7 +946,8 @@ class GuestyApiClient:
                                 retry_response.status,
                                 retry_body,
                                 retry_response.headers,
-                            )
+                            ),
+                            **retry_context,
                         )
                     if retry_response.status == 404:
                         raise GuestyNotFoundError(
@@ -890,12 +956,14 @@ class GuestyApiClient:
                                 retry_response.status,
                                 retry_body,
                                 retry_response.headers,
-                            )
+                            ),
+                            **retry_context,
                         )
                     if retry_response.status in RETRYABLE_STATUS_CODES:
                         raise GuestyRetryableError(
                             f"Retryable error ({retry_response.status})",
                             self._retry_delay_from_response(retry_response),
+                            **retry_context,
                         )
                     if retry_response.status >= 400:
                         raise GuestyApiError(
@@ -905,7 +973,7 @@ class GuestyApiClient:
                                 retry_body,
                                 retry_response.headers,
                             ),
-                            retry_response.status,
+                            **retry_context,
                         )
                     return self._parse_response_body(
                         retry_body,
@@ -921,7 +989,8 @@ class GuestyApiClient:
                         response.status,
                         body,
                         response.headers,
-                    )
+                    ),
+                    **context,
                 )
             if response.status == 403:
                 raise GuestyPermissionError(
@@ -930,7 +999,8 @@ class GuestyApiClient:
                         response.status,
                         body,
                         response.headers,
-                    )
+                    ),
+                    **context,
                 )
             if response.status == 404:
                 raise GuestyNotFoundError(
@@ -939,7 +1009,8 @@ class GuestyApiClient:
                         response.status,
                         body,
                         response.headers,
-                    )
+                    ),
+                    **context,
                 )
 
             if response.status in RETRYABLE_STATUS_CODES:
@@ -947,6 +1018,7 @@ class GuestyApiClient:
                 raise GuestyRetryableError(
                     f"Retryable error ({response.status})",
                     delay,
+                    **context,
                 )
 
             if response.status >= 400:
@@ -957,7 +1029,7 @@ class GuestyApiClient:
                         body,
                         response.headers,
                     ),
-                    response.status,
+                    **context,
                 )
 
             return self._parse_response_body(
@@ -1001,7 +1073,12 @@ class GuestyApiClient:
             if request_id:
                 context.append(f"request_id={request_id}")
             raise GuestyApiError(
-                f"Invalid JSON response from Guesty ({', '.join(context)})"
+                f"Invalid JSON response from Guesty ({', '.join(context)})",
+                **GuestyApiClient._structured_error_context(
+                    path,
+                    status,
+                    headers,
+                ),
             ) from err
 
     @staticmethod
@@ -1035,6 +1112,19 @@ class GuestyApiClient:
                 safe_value = re.sub(r"[^A-Za-z0-9._:-]", "_", value)
                 return safe_value[:100] or None
         return None
+
+    @staticmethod
+    def _structured_error_context(
+        path: str | None,
+        status: int | None,
+        headers: Any,
+    ) -> dict[str, Any]:
+        """Return privacy-safe fields that callers may log independently."""
+        return {
+            "status_code": status,
+            "request_id": GuestyApiClient._request_id(headers),
+            "endpoint": GuestyApiClient._endpoint_label(path),
+        }
 
     @staticmethod
     async def _async_read_response_text(response: aiohttp.ClientResponse) -> str:
