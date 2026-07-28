@@ -28,6 +28,7 @@ from .api import (
 from .const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
+    CONF_CLIENT_ID,
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
@@ -72,6 +73,9 @@ _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
+_GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
+_GUESTY_RETRY_STATE_VERSION = 1
+_GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
     "custom_field_unavailable",
     "guesty_custom_field_rejected",
@@ -248,23 +252,105 @@ class GuestyLoxoneManager:
     async def async_setup(self) -> None:
         """Load private state and start one reconciliation pass."""
         self._data = await self._storage.async_load()
-        # Version 1.8.0 could put every booking into an independent exponential
-        # retry after a bulk custom-field migration exhausted Guesty's request
-        # allowance. Convert those reason-less retries into the bounded queue so
-        # the nearest stays recover immediately after upgrading.
-        recovered_retry = False
-        for record in self._records.values():
-            if (
-                not record.get("field_synced")
-                and self._retry_at(record, "guesty") is not None
-                and not record.get("last_error")
-            ):
-                self._clear_retry(record, "guesty")
-                record["last_error"] = _GUESTY_SYNC_QUEUED
-                recovered_retry = True
-        if recovered_retry:
+        recovered_retries, state_changed = self._migrate_guesty_retry_state()
+        if state_changed:
             await self._storage.async_save(self._data)
+        if recovered_retries:
+            _LOGGER.warning(
+                "Rescheduled persisted Guesty Keycode retries "
+                "count=%s operation=native_keycode_write reason=state_migration",
+                recovered_retries,
+            )
+        else:
+            self._log_persisted_guesty_retry_summary()
         self.async_schedule_reconcile()
+
+    def _guesty_client_fingerprint(self) -> str | None:
+        """Return a private stable marker for credential-change recovery."""
+        client_id = self.entry.data.get(CONF_CLIENT_ID)
+        if not isinstance(client_id, str) or not client_id.strip():
+            return None
+        return hashlib.sha256(client_id.strip().encode()).hexdigest()
+
+    def _migrate_guesty_retry_state(self) -> tuple[int, bool]:
+        """Recover stale retry state once and after Guesty credential changes."""
+        raw_version = self._data.get(_GUESTY_RETRY_STATE_VERSION_KEY, 0)
+        version = (
+            raw_version
+            if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+            else 0
+        )
+        current_fingerprint = self._guesty_client_fingerprint()
+        previous_fingerprint = self._data.get(_GUESTY_CLIENT_FINGERPRINT_KEY)
+        credentials_changed = bool(
+            current_fingerprint
+            and isinstance(previous_fingerprint, str)
+            and previous_fingerprint != current_fingerprint
+        )
+
+        recovered = 0
+        state_changed = False
+        for record in self._records.values():
+            if record.get("field_synced") or self._retry_at(record, "guesty") is None:
+                continue
+            last_error = record.get("last_error")
+            legacy_reasonless_retry = not last_error
+            stale_native_404 = (
+                version < _GUESTY_RETRY_STATE_VERSION
+                and last_error == "guesty_reservation_not_found"
+            )
+            if not (legacy_reasonless_retry or stale_native_404 or credentials_changed):
+                continue
+            self._clear_retry(record, "guesty")
+            record["last_error"] = _GUESTY_SYNC_QUEUED
+            recovered += 1
+            state_changed = True
+
+        if version != _GUESTY_RETRY_STATE_VERSION:
+            self._data[_GUESTY_RETRY_STATE_VERSION_KEY] = _GUESTY_RETRY_STATE_VERSION
+            state_changed = True
+        if (
+            current_fingerprint is not None
+            and previous_fingerprint != current_fingerprint
+        ):
+            self._data[_GUESTY_CLIENT_FINGERPRINT_KEY] = current_fingerprint
+            state_changed = True
+        return recovered, state_changed
+
+    def _guesty_retry_summary(self) -> tuple[dict[str, int], datetime | None]:
+        """Return bounded safe retry counts and the next retry time."""
+        counts: dict[str, int] = {}
+        next_retry: datetime | None = None
+        for record in self._records.values():
+            retry_at = self._retry_at(record, "guesty")
+            if retry_at is None or record.get("last_error") == _GUESTY_SYNC_QUEUED:
+                continue
+            raw_reason = record.get("last_error")
+            reason = (
+                raw_reason
+                if isinstance(raw_reason, str)
+                and re.fullmatch(r"[a-z0-9_]{1,64}", raw_reason)
+                else "unknown"
+            )
+            counts[reason] = counts.get(reason, 0) + 1
+            next_retry = self._earlier(next_retry, retry_at)
+        return counts, next_retry
+
+    def _log_persisted_guesty_retry_summary(self) -> None:
+        """Make a restored silent retry state visible after startup."""
+        counts, next_retry = self._guesty_retry_summary()
+        if not counts:
+            return
+        reasons = ",".join(
+            f"{reason}:{count}" for reason, count in sorted(counts.items())
+        )
+        _LOGGER.warning(
+            "Guesty Keycode synchronization is waiting for persisted retries "
+            "count=%s reasons=%s next_retry_at=%s",
+            sum(counts.values()),
+            reasons,
+            next_retry.isoformat() if next_retry is not None else "unknown",
+        )
 
     async def async_unload(self) -> None:
         """Stop timers and background work."""
@@ -1800,6 +1886,7 @@ class GuestyLoxoneManager:
     def diagnostics(self) -> dict[str, Any]:
         """Return a privacy-safe operational summary without PINs or names."""
         records = self._records
+        retry_counts, next_retry = self._guesty_retry_summary()
         return {
             "enabled": bool(self.entry.options.get(CONF_LOXONE_ENABLED, False)),
             "configured_miniservers": len(self._servers),
@@ -1839,6 +1926,14 @@ class GuestyLoxoneManager:
                 if isinstance(record, dict)
                 and self._retry_at(record, "guesty") is not None
                 and record.get("last_error") != _GUESTY_SYNC_QUEUED
+            ),
+            "native_keycode_error_counts": retry_counts,
+            "next_native_keycode_retry_at": (
+                next_retry.isoformat() if next_retry is not None else None
+            ),
+            "retry_state_version": self._data.get(
+                _GUESTY_RETRY_STATE_VERSION_KEY,
+                0,
             ),
             "remote_users": sum(
                 1

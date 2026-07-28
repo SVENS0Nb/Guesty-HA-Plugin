@@ -219,9 +219,10 @@ vorhandener Keycode-Baustein verwendet.
 
 Die Funktion prüft keinen Zahlungsstatus. Sie arbeitet mit denselben aktiven
 Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
-`checked_in` und entsprechende Guesty-Varianten). Dadurch wird der Code auch
-für eine zukünftige Reservierung unmittelbar nach Webhook oder spätestens beim
-nächsten normalen Reservierungsabgleich erzeugt. Der gemeinsame Guesty-Client,
+`awaiting_payment`, `checked_in` und entsprechende Guesty-Varianten). Dadurch
+wird der Code auch für eine zukünftige Reservierung unmittelbar nach Webhook
+oder spätestens beim nächsten normalen Reservierungsabgleich erzeugt. Der
+gemeinsame Guesty-Client,
 OAuth-Token, Webhook, Reservierungs-Cache und 5-Minuten-Abgleich werden
 wiederverwendet; es gibt keinen zweiten Poller. Da Guestys älterer
 Reservierungs-Endpunkt das native `notes.keyCode` nicht ausliefert, ergänzt der
@@ -649,8 +650,8 @@ flowchart TD
 
 Check-in/out Zeiten in dieser Priorität:
 
-1. UTC-Felder `checkIn` / `checkOut` (wenn vorhanden)
-2. `plannedArrival` / `plannedDeparture`
+1. Gültige `plannedArrival` / `plannedDeparture` zusammen mit dem lokalisierten Datum
+2. UTC-Felder `checkIn` / `checkOut` (wenn vorhanden)
 3. Listing-Defaults
 4. Fallback: 15:00 / 11:00
 
@@ -682,8 +683,10 @@ python -m pytest
 
   Keycode-Fehler enthalten dann eine anonymisierte Reservierungskennung,
   Operation, HTTP-Status, Guesty-`x-request-id`, Retry-Zähler und verfügbares
-  API-Limit. PINs, Gastnamen und vollständige Reservierungs-IDs werden nicht
-  protokolliert.
+  API-Limit. Beim Start wird außerdem ein vorhandener gespeicherter
+  Retry-Zustand zusammengefasst, damit eine laufende Wartezeit nicht wie ein
+  inaktiver Abgleich aussieht. PINs, Gastnamen und vollständige
+  Reservierungs-IDs werden nicht protokolliert.
 
 ## Lizenz
 

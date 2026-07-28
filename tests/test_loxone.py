@@ -18,6 +18,7 @@ from custom_components.guesty.api import (
 from custom_components.guesty.const import (
     CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_LATE_MINUTES,
+    CONF_CLIENT_ID,
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LOXONE_CODE_PREFIX,
@@ -69,12 +70,13 @@ def _reservation(
     check_out: datetime,
     key_code: str | None = None,
     reservation_id: str = "reservation-1",
+    status: str = "confirmed",
 ) -> GuestyReservation:
     result = GuestyReservation.from_api(
         {
             "_id": reservation_id,
             "listingId": "listing-1",
-            "status": "confirmed",
+            "status": status,
             "checkIn": check_in.isoformat(),
             "checkOut": check_out.isoformat(),
             "guest": {"fullName": "Max Mustermann"},
@@ -120,7 +122,11 @@ def _manager(
     *,
     options: dict | None = None,
 ):
-    entry = MockConfigEntry(domain=DOMAIN, options=options or _options())
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client-id"},
+        options=options or _options(),
+    )
     entry.add_to_hass(hass)
     coordinator = SimpleNamespace(
         data=SimpleNamespace(
@@ -437,6 +443,226 @@ async def test_setup_recovers_reasonless_v180_guesty_backoff(hass, monkeypatch) 
     assert record["last_error"] == "guesty_sync_queued"
     manager._storage.async_save.assert_awaited_once()
     manager.async_schedule_reconcile.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_setup_recovers_persisted_native_404_backoff_once(
+    hass, monkeypatch, caplog
+) -> None:
+    """The native-Keycode rollout retries old 404 records without PIN rotation."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    retry_at = NOW + timedelta(hours=1)
+    manager._storage.async_load = AsyncMock(
+        return_value={
+            "records": {
+                reservation.id: {
+                    "code": "712345",
+                    "field_synced": False,
+                    "last_error": "guesty_reservation_not_found",
+                    "guesty_retry_at": retry_at.isoformat(),
+                    "guesty_retry_count": 4,
+                }
+            }
+        }
+    )
+    manager.async_schedule_reconcile = MagicMock()
+    caplog.set_level("WARNING", logger="custom_components.guesty.loxone")
+
+    await manager.async_setup()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert "guesty_retry_at" not in record
+    assert "guesty_retry_count" not in record
+    assert record["last_error"] == "guesty_sync_queued"
+    assert manager._data["guesty_retry_state_version"] == 1
+    assert manager._data["guesty_client_fingerprint"] == (
+        manager._guesty_client_fingerprint()
+    )
+    assert "reason=state_migration" in caplog.text
+    assert reservation.id not in caplog.text
+    assert "712345" not in caplog.text
+    manager._storage.async_save.assert_awaited_once()
+    manager.async_schedule_reconcile.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_recovered_404_backlog_resumes_through_global_write_budget(
+    hass, monkeypatch
+) -> None:
+    """A production-sized stale retry state resumes without a write burst."""
+    reservations = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            reservation_id=f"reservation-{days}",
+        )
+        for days in range(1, 5)
+    ]
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservations[0]
+    )
+    coordinator.data.reservations = reservations
+    original_codes = {
+        reservation.id: f"71234{index}"
+        for index, reservation in enumerate(reservations)
+    }
+    manager._storage.async_load = AsyncMock(
+        return_value={
+            "records": {
+                reservation.id: {
+                    "code": original_codes[reservation.id],
+                    "field_synced": False,
+                    "last_error": "guesty_reservation_not_found",
+                    "guesty_retry_at": (NOW + timedelta(hours=1)).isoformat(),
+                    "guesty_retry_count": 4,
+                }
+                for reservation in reservations
+            }
+        }
+    )
+    manager.async_schedule_reconcile = MagicMock()
+
+    await manager.async_setup()
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_key_code.await_args_list
+    ] == [reservations[0].id, reservations[1].id]
+    assert {
+        reservation_id: record["code"]
+        for reservation_id, record in manager._records.items()
+    } == original_codes
+    assert all(
+        manager._records[reservation.id]["field_synced"] is True
+        for reservation in reservations[:2]
+    )
+    assert all(
+        manager._records[reservation.id]["last_error"] == "guesty_sync_queued"
+        for reservation in reservations[2:]
+    )
+    assert manager.diagnostics()["native_keycodes_queued"] == 2
+
+
+@pytest.mark.asyncio
+async def test_setup_preserves_current_persisted_native_backoff(
+    hass, monkeypatch, caplog
+) -> None:
+    """A current retry remains bounded and becomes visible after restart."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    retry_at = NOW + timedelta(hours=1)
+    manager._storage.async_load = AsyncMock(
+        return_value={
+            "records": {
+                reservation.id: {
+                    "code": "712345",
+                    "field_synced": False,
+                    "last_error": "guesty_reservation_not_found",
+                    "guesty_retry_at": retry_at.isoformat(),
+                    "guesty_retry_count": 4,
+                }
+            },
+            "guesty_retry_state_version": 1,
+            "guesty_client_fingerprint": manager._guesty_client_fingerprint(),
+        }
+    )
+    manager.async_schedule_reconcile = MagicMock()
+    caplog.set_level("WARNING", logger="custom_components.guesty.loxone")
+
+    await manager.async_setup()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["guesty_retry_at"] == retry_at.isoformat()
+    assert record["guesty_retry_count"] == 4
+    assert record["last_error"] == "guesty_reservation_not_found"
+    assert "waiting for persisted retries" in caplog.text
+    assert "guesty_reservation_not_found:1" in caplog.text
+    assert reservation.id not in caplog.text
+    assert "712345" not in caplog.text
+    manager._storage.async_save.assert_not_awaited()
+    manager.async_schedule_reconcile.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_setup_recovers_guesty_backoff_after_client_change(
+    hass, monkeypatch
+) -> None:
+    """New Guesty credentials retry pending writes while preserving each PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    manager._storage.async_load = AsyncMock(
+        return_value={
+            "records": {
+                reservation.id: {
+                    "code": "712345",
+                    "field_synced": False,
+                    "last_error": "guesty_permission_denied",
+                    "guesty_retry_at": (NOW + timedelta(hours=1)).isoformat(),
+                    "guesty_retry_count": 4,
+                }
+            },
+            "guesty_retry_state_version": 1,
+            "guesty_client_fingerprint": "previous-client",
+        }
+    )
+    manager.async_schedule_reconcile = MagicMock()
+
+    await manager.async_setup()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["last_error"] == "guesty_sync_queued"
+    assert "guesty_retry_at" not in record
+    assert "guesty_retry_count" not in record
+    assert manager._data["guesty_client_fingerprint"] == (
+        manager._guesty_client_fingerprint()
+    )
+    manager._storage.async_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_awaiting_payment_reservation_receives_native_keycode(
+    hass, monkeypatch
+) -> None:
+    """Payment state cannot silently exclude an otherwise active booking."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        status="awaiting_payment",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["field_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        record["code"],
+    )
+    remote.async_add_or_update_user.assert_not_awaited()
 
 
 @pytest.mark.asyncio

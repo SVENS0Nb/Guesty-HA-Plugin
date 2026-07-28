@@ -129,6 +129,7 @@ ACTIVE_RESERVATION_STATUSES: Final = frozenset(
     {
         "confirmed",
         "reserved",
+        "awaiting_payment",
         "checked_in",
         "checked-in",
         "in_house",

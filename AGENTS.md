@@ -2,20 +2,76 @@
 
 ## Purpose and authority
 
-This file is the durable engineering memory for the whole repository. Read it
-before changing code, tests, configuration flows, documentation, or release
-metadata.
+This file is the operating contract for agents and maintainers. The canonical
+durable engineering memory is [`KNOWLEDGE.md`](KNOWLEDGE.md). Read both files
+completely before changing code, tests, configuration flows, documentation, or
+release metadata.
 
 - The current code and regression tests are the source of truth for implemented
   behavior. The README is the user-facing contract and must be kept aligned.
+- `KNOWLEDGE.md` records validated architecture, external API behavior, product
+  decisions, failure lessons, and retired assumptions. Safety-critical
+  invariants are intentionally summarized in this file as enforceable rules;
+  when either file changes, check the other for drift.
 - Preserve the product decisions and safety invariants below unless the user
   explicitly changes them.
-- Record only durable architecture, behavior, and maintenance lessons here.
+- Record durable technical knowledge in `KNOWLEDGE.md`, not in ad-hoc comments,
+  release notes, or chat-only memory.
   Never add real credentials, tokens, reservation IDs, guest data, private URLs,
   or details copied from diagnostic exports.
-- Update this file when a change introduces a new long-lived integration,
-  invariant, data owner, failure mode, or release requirement. Do not turn it
-  into a changelog or duplicate every implementation detail.
+- Update this file when the agent workflow, a mandatory safety invariant, or a
+  release requirement changes. Do not turn it into a changelog.
+
+## Mandatory knowledge-base workflow
+
+Every development, diagnosis, review, and release task must use
+`KNOWLEDGE.md` as follows:
+
+1. **Read before reasoning.** Read the entire current knowledge base before
+   designing or editing. Identify the entries and retired assumptions relevant
+   to the task.
+2. **Verify, do not merely trust.** For an affected fact, inspect the cited
+   production code and regression tests. Current reproducible evidence outranks
+   old prose. If code, tests, README, `AGENTS.md`, and the knowledge base
+   disagree, resolve the conflict rather than silently choosing one.
+3. **Perform a knowledge-impact check.** Before finishing, explicitly decide
+   whether the work confirmed, changed, added, or retired durable knowledge.
+   Routine refactors, release numbers, transient logs, and one-off debugging
+   details do not need entries.
+4. **Update in the same change.** When durable behavior, ownership, an external
+   API constraint, a safety boundary, or a known failure mode changes, update
+   the existing entry or add a stable new entry in `KNOWLEDGE.md` in the same
+   commit. Update matching rules here and the user-facing README when required.
+5. **Keep entries evidence-based.** Each new or materially changed entry needs
+   a stable ID, status, validation date, evidence paths or test names, the
+   validated fact, and its engineering consequence. Unverified ideas must be
+   marked `Provisional` with a concrete validation need and must not be treated
+   as an implementation contract.
+6. **Correct instead of accumulating.** Edit or retire obsolete entries; do not
+   append contradictory advice. Retired entries remain only when remembering
+   the rejected assumption prevents a likely regression, and must name their
+   replacement.
+7. **Review regularly.** Before every release, review all entries touched by the
+   release. During an explicit whole-project audit, review every active entry
+   and update the knowledge-base review register. Do not change the
+   project-wide review date after only a narrow check.
+8. **Protect secrets and privacy.** Never store credentials, tokens, PINs,
+   bearer URLs, guest names, confirmation codes, real reservation/listing IDs,
+   private endpoints, raw diagnostic payloads, or other personal data in the
+   knowledge base.
+
+Use this entry shape for new knowledge:
+
+```markdown
+### KB-AREA-NNN — Short title
+
+- Status: Validated | Provisional | Retired
+- Last validated: YYYY-MM-DD
+- Evidence: `path`, `test_name`, or an official public specification
+- Replaces / Superseded by: optional stable knowledge ID
+
+Fact, boundaries, and engineering consequence.
+```
 
 ## Product intent
 
@@ -124,9 +180,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 
 ## Reservation semantics and time handling
 
-- Active reservation statuses are the configured confirmed/reserved/checked-in/
-  in-house variants. Cancelled, closed, declined, and expired reservations are
-  inactive. Payment status is intentionally not a criterion.
+- Active reservation statuses are the configured confirmed/reserved/
+  awaiting-payment/checked-in/in-house variants. Cancelled, closed, declined,
+  and expired reservations are inactive. Payment status is intentionally not a
+  criterion.
 - Future active reservations are valid input. Codes and door links can be
   created when the reservation is first observed; remote lock-system objects
   are deferred by their provisioning lead.
@@ -432,8 +489,9 @@ Home Assistant supplies `aiohttp` and `voluptuous`.
 ## Documentation and release rules
 
 - Update README, config-flow strings, German/English Home Assistant
-  translations, tests, and this file whenever the user-facing contract changes.
-  The guest portal itself must retain German, English, Spanish, and French.
+  translations, tests, this file, and affected `KNOWLEDGE.md` entries whenever
+  the user-facing contract changes. The guest portal itself must retain German,
+  English, Spanish, and French.
 - When documenting times, use the actual tested precedence in this file. Do not
   reintroduce the older “UTC always wins over planned time” description.
 - Do not publish, push, tag, or create a GitHub release merely because code was
