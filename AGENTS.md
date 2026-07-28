@@ -149,6 +149,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   for that listing.
 - Auth or permission failures start Home Assistant reauthentication. Transient
   failures use the last valid cache in a visible degraded/stale state.
+- Guesty Client ID and Client Secret are stable application credentials; the
+  derived Bearer token expires. Reuse the shared serialized token lifecycle.
+  Do not mint diagnostic tokens repeatedly because Guesty's OAuth endpoint may
+  respond with a long `Retry-After`.
 - Reservation/listing managers must use bounded, persistent backoff. Never
   create a rapid retry loop after an outage, rate limit, or malformed response.
 - Preserve API headroom for normal synchronization. Guesty Keycode and door-link
@@ -212,15 +216,20 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   reservation custom field. Never confuse the two data paths.
 - Write the native field with
   `PUT /v1/reservations-v3/{reservationId}/notes` and the minimal payload
-  `{"notes":{"keyCode":"..."}}`. Do not round-trip or overwrite unrelated notes.
-  Treat the write as successful only after exact confirmation.
+  `{"notes":{"keyCode":"..."}}`. Treat the write as successful only after exact
+  response or bounded v3 read-back confirmation. This is the only supported
+  Keycode write route. The general legacy `PUT /v1/reservations/{id}` updater
+  can return success and emit reservation-change events while ignoring
+  `notes.keyCode`; never use it as a Keycode fallback.
 - Read native Keycodes only from `GET /v1/reservations-v3`. The legacy
   `/reservations` endpoints do not expose `notes.keyCode` even when it is
-  projected. The v3 response is a top-level array and accepts at most ten
-  reservation IDs per request. Enrich only active reservations for listings
-  mapped to an enabled PIN provider: changed reservations on incremental polls,
-  one targeted batch after a single webhook, and all applicable reservations
-  during the daily/startup full sync. Do not add a second poller.
+  projected. A v3 reservation may identify itself with `reservationId`, `_id`,
+  or `id`; accept a top-level array or one reservation object and associate only
+  an exact requested ID. The endpoint accepts at most ten reservation IDs per
+  request. Enrich only active reservations for listings mapped to an enabled
+  PIN provider: changed reservations on incremental polls, one targeted batch
+  after a single webhook, and all applicable reservations during the
+  daily/startup full sync. Do not add a second poller.
 - Guesty's returned `notes.keyCode` is authoritative. A valid, unique manual
   change must propagate to existing Loxone and TTLock objects. Once Guesty has
   confirmed a PIN, the integration must never change its six digits
@@ -249,7 +258,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Use one persistent global limit of at most two Guesty Keycode write attempts
   in any 30-second window. Normal queue passes, reservation-specific retries,
   webhook-triggered passes, and restarts share this limit. Failed and ambiguous
-  PUTs consume a slot. Prioritize current and nearest stays.
+  PUTs consume a slot. Every attempted Keycode consumes exactly one slot.
+  Prioritize current and nearest stays. An application-wide failure of the
+  dedicated notes route may stop the current batch so identical failures do not
+  waste the second slot or Guesty's normal synchronization headroom.
 - Every native-Keycode path must consume that same write budget, including
   sparse cached snapshots and one-time migrations from private stored PINs.
   Never bypass the queue merely because Guesty omitted the `notes` projection.
@@ -259,10 +271,12 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Loxone and TTLock collisions never rotate an already confirmed Guesty PIN.
   Delete any tentative remote object, expose a conflict, and use persistent
   retry backoff until a manual Guesty edit supplies a different PIN.
-- A reservation-specific Guesty 404 consumes its own bounded write attempt and
-  enters retry backoff, but must never stop unrelated reservations in the same
-  batch. Account-wide authentication, permission, transport, or payload errors
-  may stop the batch to avoid unnecessary traffic.
+- A 404 from the dedicated v3 notes route is not proof that the reservation is
+  missing when an exact v3 read still returns it. Classify that case as a
+  Keycode-endpoint outage, preserve the original `x-request-id`, do not issue a
+  legacy write, and use bounded persistent retry. Account-wide endpoint,
+  authentication, permission, transport, or payload errors may stop the batch
+  to avoid unnecessary traffic.
 - Native Keycode failures log only the hashed reservation marker, stable
   operation/reason, safe endpoint label, HTTP status, bounded `x-request-id`,
   retry count/delay, and available rate-limit headroom. A successful write may
@@ -439,6 +453,13 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 Before editing, trace the entire affected path: API/model → coordinator/storage
 → manager → entity/config flow → diagnostics/documentation. Preserve
 backward-compatible config-entry and private-store migrations.
+
+When a release changes how a persisted failure is resolved, increment the
+corresponding retry-state migration version and add a fixture using the exact
+previous version. Corrected code alone does not clear stored future retry
+timestamps. A migration may clear obsolete retry metadata and requeue the exact
+stored operation, but must preserve PINs, tokens, remote ownership, cleanup
+state, and all global traffic limits.
 
 For every bug:
 

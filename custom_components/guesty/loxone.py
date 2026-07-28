@@ -21,11 +21,10 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
-    GuestyKeyCodeWriteResult,
+    GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
-    KEYCODE_WRITE_ROUTE_LEGACY,
     KEYCODE_WRITE_ROUTE_V3,
 )
 from .const import (
@@ -74,11 +73,11 @@ LOXONE_STORAGE_KEY = "guesty_loxone"
 _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
-_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
+_LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
-_GUESTY_RETRY_STATE_VERSION = 2
+_GUESTY_RETRY_STATE_VERSION = 3
 _GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
     "custom_field_unavailable",
@@ -291,22 +290,19 @@ class GuestyLoxoneManager:
             and isinstance(previous_fingerprint, str)
             and previous_fingerprint != current_fingerprint
         )
-        if credentials_changed:
-            # Route availability belongs to the Guesty Open API application.
-            # A replacement Client ID must probe the primary v3 route again.
-            self._data.pop(_GUESTY_KEYCODE_WRITE_ROUTE_KEY, None)
-
         recovered = 0
-        state_changed = False
+        state_changed = (
+            self._data.pop(_LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY, None) is not None
+        )
         for record in self._records.values():
             if record.get("field_synced") or self._retry_at(record, "guesty") is None:
                 continue
             last_error = record.get("last_error")
             legacy_reasonless_retry = not last_error
-            stale_native_404 = (
-                version < _GUESTY_RETRY_STATE_VERSION
-                and last_error == "guesty_reservation_not_found"
-            )
+            stale_native_404 = version < _GUESTY_RETRY_STATE_VERSION and last_error in {
+                "guesty_reservation_not_found",
+                "guesty_keycode_rejected",
+            }
             if not (legacy_reasonless_retry or stale_native_404 or credentials_changed):
                 continue
             self._clear_retry(record, "guesty")
@@ -805,23 +801,6 @@ class GuestyLoxoneManager:
         await self._storage.async_save(self._data)
         return True
 
-    async def _async_refund_guesty_write_slots(
-        self,
-        now: datetime,
-        count: int,
-    ) -> None:
-        """Release unused pre-reserved fallback slots after confirmed success."""
-        if count <= 0:
-            return
-        attempts = self._recent_guesty_write_attempts(now)
-        if count >= len(attempts):
-            self._data.pop(_GUESTY_WRITE_ATTEMPTS_KEY, None)
-        else:
-            self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
-                attempt.isoformat() for attempt in attempts[:-count]
-            ]
-        await self._storage.async_save(self._data)
-
     def _reservation_sync_order(
         self,
         reservation: GuestyReservation,
@@ -899,6 +878,8 @@ class GuestyLoxoneManager:
             return "guesty_authentication_failed"
         if isinstance(error, GuestyPermissionError):
             return "guesty_permission_denied"
+        if isinstance(error, GuestyKeyCodeUnavailableError):
+            return "guesty_keycode_endpoint_unavailable"
         if isinstance(error, GuestyNotFoundError):
             return "guesty_reservation_not_found"
         if isinstance(error, GuestyRetryableError):
@@ -1231,20 +1212,7 @@ class GuestyLoxoneManager:
             else 0
         )
         attempted_at = dt_util.utcnow()
-        preferred_route = self._data.get(
-            _GUESTY_KEYCODE_WRITE_ROUTE_KEY,
-            KEYCODE_WRITE_ROUTE_V3,
-        )
-        if preferred_route not in {
-            KEYCODE_WRITE_ROUTE_V3,
-            KEYCODE_WRITE_ROUTE_LEGACY,
-        }:
-            preferred_route = KEYCODE_WRITE_ROUTE_V3
-        allow_legacy_fallback = bool(
-            preferred_route == KEYCODE_WRITE_ROUTE_V3
-            and self._guesty_writes_remaining >= 2
-        )
-        reserved_slots = 2 if allow_legacy_fallback else 1
+        reserved_slots = 1
         if not await self._async_reserve_guesty_write_slots(
             attempted_at,
             reserved_slots,
@@ -1257,18 +1225,10 @@ class GuestyLoxoneManager:
         )
         guesty_value = self._guesty_code_value(code, reservation.listing_id)
         try:
-            if preferred_route == KEYCODE_WRITE_ROUTE_V3 and allow_legacy_fallback:
-                result = await self._client.async_update_reservation_key_code(
-                    reservation.id,
-                    guesty_value,
-                )
-            else:
-                result = await self._client.async_update_reservation_key_code(
-                    reservation.id,
-                    guesty_value,
-                    preferred_route=preferred_route,
-                    allow_legacy_fallback=allow_legacy_fallback,
-                )
+            await self._client.async_update_reservation_key_code(
+                reservation.id,
+                guesty_value,
+            )
         except Exception:
             # Unknown outcomes stay conservatively charged. This prevents a
             # timeout or restart after an accepted write from exceeding the
@@ -1276,32 +1236,7 @@ class GuestyLoxoneManager:
             self._last_guesty_writes += reserved_slots
             raise
 
-        actual_attempts = (
-            result.attempts
-            if isinstance(result, GuestyKeyCodeWriteResult)
-            and 1 <= result.attempts <= reserved_slots
-            else 1
-        )
-        confirmed_route = (
-            result.route
-            if isinstance(result, GuestyKeyCodeWriteResult)
-            and result.route in {KEYCODE_WRITE_ROUTE_V3, KEYCODE_WRITE_ROUTE_LEGACY}
-            else preferred_route
-        )
-        unused_slots = reserved_slots - actual_attempts
-        if unused_slots:
-            await self._async_refund_guesty_write_slots(
-                attempted_at,
-                unused_slots,
-            )
-            self._guesty_writes_remaining += unused_slots
-        self._last_guesty_writes += actual_attempts
-        if confirmed_route != preferred_route or (
-            confirmed_route == KEYCODE_WRITE_ROUTE_LEGACY
-            and self._data.get(_GUESTY_KEYCODE_WRITE_ROUTE_KEY)
-            != KEYCODE_WRITE_ROUTE_LEGACY
-        ):
-            self._data[_GUESTY_KEYCODE_WRITE_ROUTE_KEY] = confirmed_route
+        self._last_guesty_writes += 1
         reservation.key_code = guesty_value
         reservation.key_code_observed = True
         record["field_id"] = field_id
@@ -1990,10 +1925,7 @@ class GuestyLoxoneManager:
             "provisioned_during_last_reconcile": self._last_provisioned,
             "deleted_during_last_reconcile": self._last_deleted,
             "guesty_writes_during_last_reconcile": self._last_guesty_writes,
-            "guesty_keycode_write_route": self._data.get(
-                _GUESTY_KEYCODE_WRITE_ROUTE_KEY,
-                KEYCODE_WRITE_ROUTE_V3,
-            ),
+            "guesty_keycode_write_route": KEYCODE_WRITE_ROUTE_V3,
             "queued_during_last_reconcile": self._last_queued,
             "local_records": len(records),
             "native_keycodes_synced": sum(

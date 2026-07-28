@@ -14,10 +14,10 @@ import pytest
 from custom_components.guesty.api import (
     GuestyApiClient,
     GuestyApiError,
+    GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
-    KEYCODE_WRITE_ROUTE_LEGACY,
     KEYCODE_WRITE_ROUTE_V3,
     is_guesty_object_id,
     is_custom_field_reference_error,
@@ -505,66 +505,44 @@ async def test_native_keycode_accepts_v3_success_using_internal_id(
 
 
 @pytest.mark.asyncio
-async def test_native_keycode_404_uses_verified_legacy_native_fallback(
+async def test_native_keycode_404_verifies_reservation_without_legacy_write(
     monkeypatch,
 ) -> None:
-    """An existing v3 reservation can use the native general update route."""
+    """A route-specific 404 never mutates the reservation through legacy API."""
     client = _client()
     reservation_id = "6a64b5dcec567638fee95de9"
     request = AsyncMock(
         side_effect=[
-            GuestyNotFoundError("notes route unavailable", status_code=404),
+            GuestyNotFoundError(
+                "notes route unavailable",
+                status_code=404,
+                request_id="request-404",
+                endpoint="reservations-v3",
+            ),
             [
                 {
                     "_id": reservation_id,
-                    "notes": {
-                        "other": "keep",
-                        "doneBy": "server-managed",
-                    },
-                }
-            ],
-            {"ok": True},
-            [
-                {
-                    "_id": reservation_id,
-                    "notes": {
-                        "other": "keep",
-                        "keyCode": "712345#",
-                    },
+                    "notes": {},
                 }
             ],
         ]
     )
     monkeypatch.setattr(client, "_async_request", request)
 
-    result = await client.async_update_reservation_key_code(
-        reservation_id,
-        "712345#",
-    )
+    with pytest.raises(GuestyKeyCodeUnavailableError) as raised:
+        await client.async_update_reservation_key_code(
+            reservation_id,
+            "712345#",
+        )
 
-    assert result.attempts == 2
-    assert result.route == KEYCODE_WRITE_ROUTE_LEGACY
+    assert raised.value.status_code == 404
+    assert raised.value.request_id == "request-404"
+    assert raised.value.endpoint == "reservations-v3"
     assert request.await_args_list == [
         call(
             "PUT",
             f"/reservations-v3/{reservation_id}/notes",
             json_body={"notes": {"keyCode": "712345#"}},
-            retry_transport=False,
-        ),
-        call(
-            "GET",
-            "/reservations-v3",
-            params=[("reservationIds[]", reservation_id)],
-        ),
-        call(
-            "PUT",
-            f"/reservations/{reservation_id}",
-            json_body={
-                "notes": {
-                    "other": "keep",
-                    "keyCode": "712345#",
-                }
-            },
             retry_transport=False,
         ),
         call(
@@ -595,63 +573,31 @@ async def test_native_keycode_does_not_fallback_for_permission_error(
 
 
 @pytest.mark.asyncio
-async def test_native_keycode_can_disable_legacy_fallback(monkeypatch) -> None:
-    """A caller with one remaining write slot cannot exceed its write budget."""
-    client = _client()
-    reservation_id = "6a64b5dcec567638fee95de9"
-    request = AsyncMock(
-        side_effect=GuestyNotFoundError("notes route unavailable", status_code=404)
-    )
-    monkeypatch.setattr(client, "_async_request", request)
-
-    with pytest.raises(GuestyNotFoundError):
-        await client.async_update_reservation_key_code(
-            reservation_id,
-            "712345",
-            allow_legacy_fallback=False,
-        )
-
-    request.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_native_keycode_reuses_confirmed_legacy_route(monkeypatch) -> None:
-    """Once learned, the legacy route needs only one actual write attempt."""
+async def test_native_keycode_404_propagates_failed_exact_lookup(monkeypatch) -> None:
+    """A genuinely missing reservation is not mislabeled as a route outage."""
     client = _client()
     reservation_id = "6a64b5dcec567638fee95de9"
     request = AsyncMock(
         side_effect=[
-            [{"_id": reservation_id, "notes": {}}],
-            {"ok": True},
-            [
-                {
-                    "_id": reservation_id,
-                    "notes": {"keyCode": "712345"},
-                }
-            ],
+            GuestyNotFoundError("notes route unavailable", status_code=404),
+            GuestyNotFoundError(
+                "reservation missing",
+                status_code=404,
+                request_id="lookup-404",
+                endpoint="reservations-v3",
+            ),
         ]
     )
     monkeypatch.setattr(client, "_async_request", request)
 
-    result = await client.async_update_reservation_key_code(
-        reservation_id,
-        "712345",
-        preferred_route=KEYCODE_WRITE_ROUTE_LEGACY,
-    )
+    with pytest.raises(GuestyNotFoundError) as raised:
+        await client.async_update_reservation_key_code(
+            reservation_id,
+            "712345",
+        )
 
-    assert result.attempts == 1
-    assert result.route == KEYCODE_WRITE_ROUTE_LEGACY
-    assert request.await_args_list[0] == call(
-        "GET",
-        "/reservations-v3",
-        params=[("reservationIds[]", reservation_id)],
-    )
-    assert request.await_args_list[1] == call(
-        "PUT",
-        f"/reservations/{reservation_id}",
-        json_body={"notes": {"keyCode": "712345"}},
-        retry_transport=False,
-    )
+    assert raised.value.request_id == "lookup-404"
+    assert request.await_count == 2
 
 
 @pytest.mark.asyncio

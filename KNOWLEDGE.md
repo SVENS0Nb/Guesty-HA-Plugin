@@ -186,27 +186,21 @@ the existing coordinator, not another poller.
 - Evidence: redacted live API reproduction on 2026-07-28,
   `custom_components/guesty/api.py`,
   `tests/test_api.py::test_native_keycode_uses_minimal_v3_notes_payload`,
-  `tests/test_api.py::test_native_keycode_404_uses_verified_legacy_native_fallback`,
+  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`,
   `tests/test_api.py::test_native_keycode_requires_exact_success_confirmation`
 
-The primary write route is
+The only supported write route is
 `PUT /v1/reservations-v3/{reservationId}/notes` with only
 `{"notes":{"keyCode":"..."}}`. Some Guesty applications can read the exact
 existing reservation through v3 while that dedicated notes route consistently
-returns HTTP 404. Only for that exact condition, the integration may use the
-general `PUT /v1/reservations/{reservationId}` updater to write the same native
-`notes.keyCode`; it first verifies the exact v3 reservation, preserves supported
-mutable note properties, excludes server-managed `doneBy`, and performs a
-bounded v3 read-back. Authentication, permission, validation, timeout,
-rate-limit, and server errors never trigger this compatibility route.
+returns HTTP 404. The integration verifies the exact reservation through v3 so
+that condition is reported as an unavailable Keycode endpoint rather than a
+missing reservation, and preserves the failed PUT's `x-request-id`.
 
 A write is successful only after Guesty confirms the exact reservation ID and
-value. Confirmed compatibility-route selection is persisted so later writes use
-one actual PUT. The initial route discovery reserves both global write slots
-before attempting the primary PUT and fallback, so the compatibility path
-cannot exceed the two-writes-per-30-seconds budget. Resource IDs must be
-validated before they are interpolated into paths. This is not a custom-field
-fallback.
+value in the response or a bounded v3 read-back. Resource IDs must be validated
+before they are interpolated into paths. Never use the legacy general
+reservation updater or a custom field as a Keycode fallback.
 
 ### KB-GUESTY-004 — Sparse and empty projections have different meanings
 
@@ -272,6 +266,39 @@ An event is marked complete only after the coordinator accepts the handoff so a
 failed handoff can be retried. Existing legacy subscriptions without a signing
 secret are migrated once; failure must fall back to polling rather than enter a
 delete/create loop.
+
+### KB-GUESTY-008 — Live v3 responses are sparse and a notes 404 is route-specific
+
+- Status: Validated
+- Last validated: 2026-07-28
+- Evidence: redacted live API and production-log reproduction on 2026-07-28,
+  `custom_components/guesty/api.py`,
+  `tests/test_api.py::test_native_keycode_accepts_v3_success_using_internal_id`,
+  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`
+
+A redacted live comparison requested 35 future reservations by their internal
+IDs. Reservations v3 returned every exact requested reservation, used `_id`,
+and introduced no unexpected ID. Of those responses, 33 omitted `notes`
+entirely and two returned a `notes` object with a native Keycode. Therefore
+`_id`, `reservationId`, and `id` are all valid identity fields, and omitted
+`notes` is a common sparse response rather than proof that Guesty deleted a
+Keycode.
+
+For the affected Open API application, the same exact reservations remained
+readable through Reservations v3 while repeated dedicated
+`PUT /v1/reservations-v3/{reservationId}/notes` calls returned HTTP 404 with
+distinct request IDs. That 404 is not sufficient evidence that a reservation
+is missing. Production then proved that the general legacy
+`PUT /v1/reservations/{reservationId}` can return success and trigger Guesty
+reservation-change notifications while a bounded v3 read-back remains empty.
+That route is a no-op for `notes.keyCode` and must never be called as a
+fallback. The integration now verifies the exact v3 reservation, reports a
+stable endpoint-unavailable error with the original request ID, and retries
+only the documented v3 route with bounded persistent backoff.
+
+A direct test-access comparison could not be repeated during this validation
+because Guesty's OAuth endpoint returned HTTP 429 with a long `Retry-After`.
+Do not mint more diagnostic tokens until that window expires.
 
 ## Reservation, time, and entity semantics
 
@@ -379,13 +406,21 @@ the PIN.
 - Status: Validated
 - Last validated: 2026-07-28
 - Evidence: `custom_components/guesty/loxone.py`,
-  `tests/test_loxone.py`
+  `tests/test_loxone.py::test_two_keycodes_are_written_per_30_second_window`,
+  `tests/test_loxone.py::test_keycode_endpoint_failure_stops_the_current_write_batch`,
+  `tests/test_loxone.py::test_persisted_guesty_write_limit_survives_manager_restart`
 
 All Keycode publication paths share a persistent global limit of at most two
 write attempts in any 30-second window. Failed and ambiguous writes consume a
 slot. Queue passes, webhook work, reservation-specific retries, source
 migration, suffix changes, and restarts must not bypass it. Current and nearest
 stays are prioritized while preserving Guesty API headroom.
+
+Every documented v3 Keycode PUT consumes exactly one slot. An application-wide
+notes-endpoint, authentication, permission, transport, or payload failure may
+stop the current batch so the remaining slot and normal Guesty synchronization
+headroom are not wasted on the same predictable error. A reservation-specific
+missing-record response does not starve the second bounded write.
 
 ### KB-PIN-004 — Plaintext lifetime is deliberately bounded
 
@@ -407,16 +442,26 @@ sensors report safe states, counts, times, and reasons, never the PIN.
 - Last validated: 2026-07-28
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_setup_recovers_persisted_native_404_backoff_once`,
+  `tests/test_loxone.py::test_recovered_404_backlog_resumes_through_global_write_budget`,
   `tests/test_loxone.py::test_setup_recovers_guesty_backoff_after_client_change`
 
 Guesty Keycode write failures retain bounded persistent retry state across
 restarts. A versioned migration may reschedule a narrowly identified obsolete
 failure state once, and changing the Guesty client ID reschedules pending
 Guesty writes because the new application can have different reservation
-visibility. Neither recovery path rotates or discards the stored six-digit PIN,
-clears confirmed Guesty state, or bypasses the shared two-writes-per-30-seconds
-budget. Persisted retries that remain deferred are summarized safely in the
-startup log and diagnostics.
+visibility. Obsolete persisted route-selection state is removed because every
+application now uses only the documented v3 notes route. Neither recovery path
+rotates or discards the stored six-digit PIN, clears confirmed Guesty state, or
+bypasses the shared two-writes-per-30-seconds budget. Persisted retries that
+remain deferred are summarized safely in the startup log and diagnostics.
+
+Changing the code path that resolves a persisted failure does not invalidate an
+already stored backoff automatically. The release must increment the matching
+retry-state migration version and test a fixture from the immediately previous
+version. Otherwise Home Assistant can load the corrected code but remain silent
+until every old retry timestamp expires. The migration clears only retry
+metadata, preserves each exact private PIN, and still feeds the shared bounded
+write queue.
 
 ## Guest door-access portal
 
@@ -683,6 +728,19 @@ Guesty can retain stale `checkIn`/`checkOut` timestamps after a manual
 `plannedArrival`/`plannedDeparture` edit. Valid planned local times therefore
 take precedence.
 
+### KB-RET-005 — The legacy general updater cannot write native Keycodes
+
+- Status: Retired
+- Last validated: 2026-07-28
+- Superseded by: KB-GUESTY-003
+- Evidence: production log and Guesty UI notifications on 2026-07-28,
+  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`
+
+The general `PUT /v1/reservations/{reservationId}` endpoint can acknowledge a
+payload containing `notes.keyCode` and emit reservation-change notifications
+without persisting the Keycode. Never treat HTTP success from this endpoint as
+a compatibility route, even with a later v3 read-back.
+
 ## Validation and release knowledge
 
 ### KB-REL-001 — Supported validation baseline
@@ -709,3 +767,5 @@ tag points to the same commit and manifest version.
 | Date | Scope | Result |
 | --- | --- | --- |
 | 2026-07-28 | Initial project-wide knowledge extraction from all production modules, configuration constants, README, and regression-test inventory | Established validated architecture, API, lifecycle, security, provider, and retired-assumption records |
+| 2026-07-28 | Focused Guesty Reservations-v3 Keycode compatibility validation for v2.2.9 | Confirmed exact live v3 ID mapping and sparse-note behavior; production disproved the legacy fallback because it emitted change events without persisting Keycode, so only the documented v3 route remains |
+| 2026-07-28 | Post-release v2.2.9 retry-state diagnosis | Production log showed 40 corrected v2.2.8 404 records still waiting on old backoff timestamps; added a version-2-to-3 migration that immediately requeues them without PIN rotation or a write burst |

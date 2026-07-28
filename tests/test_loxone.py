@@ -12,10 +12,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.guesty import loxone
 from custom_components.guesty.api import (
     GuestyApiError,
-    GuestyKeyCodeWriteResult,
+    GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
-    KEYCODE_WRITE_ROUTE_LEGACY,
     KEYCODE_WRITE_ROUTE_V3,
 )
 from custom_components.guesty.const import (
@@ -471,7 +470,10 @@ async def test_setup_recovers_persisted_native_404_backoff_once(
                     "guesty_retry_at": retry_at.isoformat(),
                     "guesty_retry_count": 4,
                 }
-            }
+            },
+            # v2.2.8 persisted version 2 before the native 404 compatibility
+            # route existed. v2.2.9 failed to advance this migration marker.
+            "guesty_retry_state_version": 2,
         }
     )
     manager.async_schedule_reconcile = MagicMock()
@@ -484,7 +486,7 @@ async def test_setup_recovers_persisted_native_404_backoff_once(
     assert "guesty_retry_at" not in record
     assert "guesty_retry_count" not in record
     assert record["last_error"] == "guesty_sync_queued"
-    assert manager._data["guesty_retry_state_version"] == 2
+    assert manager._data["guesty_retry_state_version"] == 3
     assert manager._data["guesty_client_fingerprint"] == (
         manager._guesty_client_fingerprint()
     )
@@ -522,12 +524,17 @@ async def test_recovered_404_backlog_resumes_through_global_write_budget(
                 reservation.id: {
                     "code": original_codes[reservation.id],
                     "field_synced": False,
-                    "last_error": "guesty_reservation_not_found",
+                    "last_error": (
+                        "guesty_reservation_not_found"
+                        if index % 2 == 0
+                        else "guesty_keycode_rejected"
+                    ),
                     "guesty_retry_at": (NOW + timedelta(hours=1)).isoformat(),
                     "guesty_retry_count": 4,
                 }
-                for reservation in reservations
-            }
+                for index, reservation in enumerate(reservations)
+            },
+            "guesty_retry_state_version": 2,
         }
     )
     manager.async_schedule_reconcile = MagicMock()
@@ -574,12 +581,12 @@ async def test_setup_preserves_current_persisted_native_backoff(
                 reservation.id: {
                     "code": "712345",
                     "field_synced": False,
-                    "last_error": "guesty_reservation_not_found",
+                    "last_error": "guesty_keycode_endpoint_unavailable",
                     "guesty_retry_at": retry_at.isoformat(),
                     "guesty_retry_count": 4,
                 }
             },
-            "guesty_retry_state_version": 2,
+            "guesty_retry_state_version": 3,
             "guesty_client_fingerprint": manager._guesty_client_fingerprint(),
         }
     )
@@ -592,9 +599,9 @@ async def test_setup_preserves_current_persisted_native_backoff(
     assert record["code"] == "712345"
     assert record["guesty_retry_at"] == retry_at.isoformat()
     assert record["guesty_retry_count"] == 4
-    assert record["last_error"] == "guesty_reservation_not_found"
+    assert record["last_error"] == "guesty_keycode_endpoint_unavailable"
     assert "waiting for persisted retries" in caplog.text
-    assert "guesty_reservation_not_found:1" in caplog.text
+    assert "guesty_keycode_endpoint_unavailable:1" in caplog.text
     assert reservation.id not in caplog.text
     assert "712345" not in caplog.text
     manager._storage.async_save.assert_not_awaited()
@@ -626,7 +633,7 @@ async def test_setup_recovers_guesty_backoff_after_client_change(
             },
             "guesty_retry_state_version": 2,
             "guesty_client_fingerprint": "previous-client",
-            "guesty_keycode_write_route": KEYCODE_WRITE_ROUTE_LEGACY,
+            "guesty_keycode_write_route": "legacy",
         }
     )
     manager.async_schedule_reconcile = MagicMock()
@@ -825,10 +832,10 @@ async def test_native_keycode_not_found_retries_same_pin_after_sparse_response(
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_keycode_fallback_holds_reserved_write_capacity(
+async def test_keycode_endpoint_failure_stops_the_current_write_batch(
     hass, monkeypatch
 ) -> None:
-    """An uncertain fallback outcome cannot exceed the global write ceiling."""
+    """An application-wide v3 route outage avoids redundant failing traffic."""
     missing = _reservation(
         check_in=NOW + timedelta(days=1),
         check_out=NOW + timedelta(days=2),
@@ -842,7 +849,7 @@ async def test_unconfirmed_keycode_fallback_holds_reserved_write_capacity(
     manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, missing)
     coordinator.data.reservations.append(writable)
     guesty_client.async_update_reservation_key_code.side_effect = [
-        GuestyNotFoundError("reservation missing"),
+        GuestyKeyCodeUnavailableError("notes endpoint unavailable"),
         None,
     ]
 
@@ -851,7 +858,7 @@ async def test_unconfirmed_keycode_fallback_holds_reserved_write_capacity(
     assert guesty_client.async_update_reservation_key_code.await_count == 1
     assert manager._records[missing.id]["field_synced"] is False
     assert manager._records[missing.id]["last_error"] == (
-        "guesty_reservation_not_found"
+        "guesty_keycode_endpoint_unavailable"
     )
     assert manager._records[writable.id].get("field_synced") is not True
     assert manager._records[writable.id]["last_error"] == "guesty_sync_queued"
@@ -859,10 +866,8 @@ async def test_unconfirmed_keycode_fallback_holds_reserved_write_capacity(
 
 
 @pytest.mark.asyncio
-async def test_confirmed_legacy_route_is_persisted_without_exceeding_write_limit(
-    hass, monkeypatch
-) -> None:
-    """The first fallback uses two writes and later writes reuse one route."""
+async def test_two_keycodes_are_written_per_30_second_window(hass, monkeypatch) -> None:
+    """Each documented v3 PUT consumes one of the two global write slots."""
     first = _reservation(
         check_in=NOW + timedelta(days=1),
         check_out=NOW + timedelta(days=2),
@@ -879,41 +884,19 @@ async def test_confirmed_legacy_route_is_persisted_without_exceeding_write_limit
         first,
     )
     coordinator.data.reservations.append(second)
-    guesty_client.async_update_reservation_key_code.side_effect = [
-        GuestyKeyCodeWriteResult(
-            attempts=2,
-            route=KEYCODE_WRITE_ROUTE_LEGACY,
-        ),
-        GuestyKeyCodeWriteResult(
-            attempts=1,
-            route=KEYCODE_WRITE_ROUTE_LEGACY,
-        ),
-    ]
+    manager._data["guesty_keycode_write_route"] = "legacy"
 
-    await manager.async_reconcile()
-
-    assert guesty_client.async_update_reservation_key_code.await_count == 1
-    assert manager._records[first.id]["field_synced"] is True
-    assert manager._records[second.id]["last_error"] == "guesty_sync_queued"
-    assert manager.diagnostics()["guesty_writes_during_last_reconcile"] == 2
-    assert (
-        manager.diagnostics()["guesty_keycode_write_route"]
-        == KEYCODE_WRITE_ROUTE_LEGACY
-    )
-
-    monkeypatch.setattr(
-        loxone.dt_util,
-        "utcnow",
-        lambda: NOW + timedelta(seconds=31),
-    )
     await manager.async_reconcile()
 
     assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert manager._records[first.id]["field_synced"] is True
     assert manager._records[second.id]["field_synced"] is True
-    assert guesty_client.async_update_reservation_key_code.await_args.kwargs == {
-        "preferred_route": KEYCODE_WRITE_ROUTE_LEGACY,
-        "allow_legacy_fallback": False,
-    }
+    assert manager.diagnostics()["guesty_writes_during_last_reconcile"] == 2
+    assert manager.diagnostics()["guesty_keycode_write_route"] == KEYCODE_WRITE_ROUTE_V3
+    assert all(
+        not item.kwargs
+        for item in guesty_client.async_update_reservation_key_code.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -941,12 +924,6 @@ async def test_guesty_write_limit_is_global_across_overlapping_reconciles(
         hass, monkeypatch, missing[0]
     )
     coordinator.data.reservations = missing
-    guesty_client.async_update_reservation_key_code.return_value = (
-        GuestyKeyCodeWriteResult(
-            attempts=1,
-            route=KEYCODE_WRITE_ROUTE_V3,
-        )
-    )
 
     await manager.async_reconcile()
     assert guesty_client.async_update_reservation_key_code.await_count == 2
