@@ -17,6 +17,8 @@ from custom_components.guesty.api import (
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    KEYCODE_WRITE_ROUTE_LEGACY,
+    KEYCODE_WRITE_ROUTE_V3,
     is_guesty_object_id,
     is_custom_field_reference_error,
     is_safe_resource_id,
@@ -462,12 +464,193 @@ async def test_native_keycode_uses_minimal_v3_notes_payload(monkeypatch) -> None
     )
     monkeypatch.setattr(client, "_async_request", request)
 
-    await client.async_update_reservation_key_code(reservation_id, "712345#")
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345#",
+    )
 
+    assert result.attempts == 1
+    assert result.route == KEYCODE_WRITE_ROUTE_V3
     request.assert_awaited_once_with(
         "PUT",
         f"/reservations-v3/{reservation_id}/notes",
         json_body={"notes": {"keyCode": "712345#"}},
+        retry_transport=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_accepts_v3_success_using_internal_id(
+    monkeypatch,
+) -> None:
+    """Guesty's v3 write response may identify a reservation with _id."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        return_value={
+            "_id": reservation_id,
+            "notes": {"keyCode": "712345#"},
+        }
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345#",
+    )
+
+    assert result.attempts == 1
+    assert result.route == KEYCODE_WRITE_ROUTE_V3
+    request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_404_uses_verified_legacy_native_fallback(
+    monkeypatch,
+) -> None:
+    """An existing v3 reservation can use the native general update route."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        side_effect=[
+            GuestyNotFoundError("notes route unavailable", status_code=404),
+            [
+                {
+                    "_id": reservation_id,
+                    "notes": {
+                        "other": "keep",
+                        "doneBy": "server-managed",
+                    },
+                }
+            ],
+            {"ok": True},
+            [
+                {
+                    "_id": reservation_id,
+                    "notes": {
+                        "other": "keep",
+                        "keyCode": "712345#",
+                    },
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345#",
+    )
+
+    assert result.attempts == 2
+    assert result.route == KEYCODE_WRITE_ROUTE_LEGACY
+    assert request.await_args_list == [
+        call(
+            "PUT",
+            f"/reservations-v3/{reservation_id}/notes",
+            json_body={"notes": {"keyCode": "712345#"}},
+            retry_transport=False,
+        ),
+        call(
+            "GET",
+            "/reservations-v3",
+            params=[("reservationIds[]", reservation_id)],
+        ),
+        call(
+            "PUT",
+            f"/reservations/{reservation_id}",
+            json_body={
+                "notes": {
+                    "other": "keep",
+                    "keyCode": "712345#",
+                }
+            },
+            retry_transport=False,
+        ),
+        call(
+            "GET",
+            "/reservations-v3",
+            params=[("reservationIds[]", reservation_id)],
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_does_not_fallback_for_permission_error(
+    monkeypatch,
+) -> None:
+    """Authorization failures can never be hidden by another write route."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(side_effect=GuestyPermissionError("denied", status_code=403))
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyPermissionError, match="denied"):
+        await client.async_update_reservation_key_code(
+            reservation_id,
+            "712345",
+        )
+
+    request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_can_disable_legacy_fallback(monkeypatch) -> None:
+    """A caller with one remaining write slot cannot exceed its write budget."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        side_effect=GuestyNotFoundError("notes route unavailable", status_code=404)
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyNotFoundError):
+        await client.async_update_reservation_key_code(
+            reservation_id,
+            "712345",
+            allow_legacy_fallback=False,
+        )
+
+    request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_reuses_confirmed_legacy_route(monkeypatch) -> None:
+    """Once learned, the legacy route needs only one actual write attempt."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        side_effect=[
+            [{"_id": reservation_id, "notes": {}}],
+            {"ok": True},
+            [
+                {
+                    "_id": reservation_id,
+                    "notes": {"keyCode": "712345"},
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345",
+        preferred_route=KEYCODE_WRITE_ROUTE_LEGACY,
+    )
+
+    assert result.attempts == 1
+    assert result.route == KEYCODE_WRITE_ROUTE_LEGACY
+    assert request.await_args_list[0] == call(
+        "GET",
+        "/reservations-v3",
+        params=[("reservationIds[]", reservation_id)],
+    )
+    assert request.await_args_list[1] == call(
+        "PUT",
+        f"/reservations/{reservation_id}",
+        json_body={"notes": {"keyCode": "712345"}},
+        retry_transport=False,
     )
 
 

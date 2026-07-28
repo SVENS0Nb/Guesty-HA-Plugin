@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Collection
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
@@ -40,6 +41,17 @@ RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 OBJECT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 MAX_NATIVE_KEYCODE_LENGTH = 64
 RequestParams = dict[str, str] | list[tuple[str, str]]
+KEYCODE_WRITE_ROUTE_V3 = "v3"
+KEYCODE_WRITE_ROUTE_LEGACY = "legacy"
+KEYCODE_WRITE_ROUTES = {KEYCODE_WRITE_ROUTE_V3, KEYCODE_WRITE_ROUTE_LEGACY}
+
+
+@dataclass(frozen=True, slots=True)
+class GuestyKeyCodeWriteResult:
+    """Describe the confirmed native Keycode write route and write count."""
+
+    attempts: int
+    route: str
 
 
 def legacy_client_unique_id(client_id: str) -> str:
@@ -316,8 +328,11 @@ class GuestyApiClient:
         self,
         reservation_id: str,
         key_code: str,
-    ) -> None:
-        """Set Guesty's native reservation Keycode with the minimal v3 payload."""
+        *,
+        preferred_route: str = KEYCODE_WRITE_ROUTE_V3,
+        allow_legacy_fallback: bool = True,
+    ) -> GuestyKeyCodeWriteResult:
+        """Set and verify Guesty's native reservation Keycode."""
         if not isinstance(reservation_id, str) or not OBJECT_ID_PATTERN.fullmatch(
             reservation_id
         ):
@@ -328,24 +343,171 @@ class GuestyApiClient:
         value = key_code.strip()
         if len(value) > MAX_NATIVE_KEYCODE_LENGTH:
             raise ValueError("Guesty reservation Keycode is too long")
-        data = await self._async_request(
-            "PUT",
-            f"/reservations-v3/{reservation_id}/notes",
-            # Do not merge or resend unrelated reservation notes. Guesty's
-            # documented notes endpoint accepts partial updates and the minimal
-            # payload avoids the legacy failure caused by round-tripping fields
-            # such as doneBy.
-            json_body={"notes": {"keyCode": value}},
+        if preferred_route not in KEYCODE_WRITE_ROUTES:
+            raise ValueError("Invalid Guesty Keycode write route")
+
+        if preferred_route == KEYCODE_WRITE_ROUTE_LEGACY:
+            await self._async_update_reservation_key_code_legacy(
+                reservation_id,
+                value,
+            )
+            return GuestyKeyCodeWriteResult(
+                attempts=1,
+                route=KEYCODE_WRITE_ROUTE_LEGACY,
+            )
+
+        try:
+            data = await self._async_request(
+                "PUT",
+                f"/reservations-v3/{reservation_id}/notes",
+                # Guesty's documented notes endpoint accepts partial updates.
+                # The minimal payload avoids round-tripping server-managed
+                # fields such as doneBy.
+                json_body={"notes": {"keyCode": value}},
+                retry_transport=False,
+            )
+        except GuestyNotFoundError:
+            if not allow_legacy_fallback:
+                raise
+            await self._async_update_reservation_key_code_legacy(
+                reservation_id,
+                value,
+            )
+            return GuestyKeyCodeWriteResult(
+                attempts=2,
+                route=KEYCODE_WRITE_ROUTE_LEGACY,
+            )
+
+        await self._async_confirm_reservation_key_code(
+            reservation_id,
+            value,
+            data,
+        )
+        return GuestyKeyCodeWriteResult(
+            attempts=1,
+            route=KEYCODE_WRITE_ROUTE_V3,
         )
 
-        if not isinstance(data, dict) or data.get("reservationId") != reservation_id:
-            raise GuestyApiError("Guesty did not confirm the Keycode update")
-        notes = data.get("notes")
-        if (
-            not isinstance(notes, dict)
-            or str(notes.get("keyCode", "")).strip() != value
+    async def _async_update_reservation_key_code_legacy(
+        self,
+        reservation_id: str,
+        value: str,
+    ) -> None:
+        """Use the general updater only when the dedicated notes route is absent."""
+        current = await self._async_get_reservation_v3(reservation_id)
+        notes = self._extract_mutable_reservation_notes(current)
+        notes["keyCode"] = value
+        data = await self._async_request(
+            "PUT",
+            f"/reservations/{reservation_id}",
+            json_body={"notes": notes},
+            retry_transport=False,
+        )
+        await self._async_confirm_reservation_key_code(
+            reservation_id,
+            value,
+            data,
+            always_read_back=True,
+        )
+
+    async def _async_confirm_reservation_key_code(
+        self,
+        reservation_id: str,
+        expected_value: str,
+        response: Any,
+        *,
+        always_read_back: bool = False,
+    ) -> None:
+        """Require an exact response or bounded authoritative read-back."""
+        if not always_read_back and self._reservation_has_key_code(
+            response,
+            reservation_id,
+            expected_value,
         ):
-            raise GuestyApiError("Guesty did not persist the reservation Keycode")
+            return
+
+        for attempt in range(3):
+            current = await self._async_get_reservation_v3(reservation_id)
+            if self._reservation_has_key_code(
+                current,
+                reservation_id,
+                expected_value,
+            ):
+                return
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
+        raise GuestyApiError("Guesty did not persist the reservation Keycode")
+
+    async def _async_get_reservation_v3(
+        self,
+        reservation_id: str,
+    ) -> dict[str, Any]:
+        """Return one exact internal reservation from the v3 collection."""
+        data = await self._async_request(
+            "GET",
+            "/reservations-v3",
+            params=[("reservationIds[]", reservation_id)],
+        )
+        for item in self._normalize_results(data):
+            if self._reservation_id(item) == reservation_id:
+                return item
+        raise GuestyApiError("Guesty v3 returned no matching reservation")
+
+    @staticmethod
+    def _reservation_id(data: Any) -> str | None:
+        """Extract an internal reservation ID from a supported response object."""
+        if not isinstance(data, dict):
+            return None
+        for key in ("reservationId", "_id", "id"):
+            value = data.get(key)
+            if isinstance(value, str):
+                return value
+        return None
+
+    @classmethod
+    def _reservation_has_key_code(
+        cls,
+        data: Any,
+        reservation_id: str,
+        expected_value: str,
+    ) -> bool:
+        """Return whether an exact response object confirms the Keycode."""
+        if isinstance(data, list):
+            return any(
+                cls._reservation_has_key_code(
+                    item,
+                    reservation_id,
+                    expected_value,
+                )
+                for item in data
+            )
+        if not isinstance(data, dict):
+            return False
+        if cls._reservation_id(data) == reservation_id:
+            notes = data.get("notes")
+            return bool(
+                isinstance(notes, dict)
+                and str(notes.get("keyCode", "")).strip() == expected_value
+            )
+        return any(
+            cls._reservation_has_key_code(
+                data.get(key),
+                reservation_id,
+                expected_value,
+            )
+            for key in ("data", "result", "reservation", "reservations", "results")
+        )
+
+    @staticmethod
+    def _extract_mutable_reservation_notes(data: Any) -> dict[str, Any]:
+        """Copy only client-mutable notes and exclude server-managed metadata."""
+        if not isinstance(data, dict):
+            return {}
+        notes = data.get("notes")
+        if not isinstance(notes, dict):
+            return {}
+        allowed = {"other", "cleaning", "guest", "specialRequests", "keyCode"}
+        return {key: value for key, value in notes.items() if key in allowed}
 
     async def async_resolve_custom_field(self, reference: str) -> str:
         """Resolve a Guesty custom field name, variable, or id."""

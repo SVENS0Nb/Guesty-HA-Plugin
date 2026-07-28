@@ -166,10 +166,12 @@ Guesty's legacy `/reservations` endpoints do not expose `notes.keyCode`, even
 when requested in their field projection. Native Keycodes must be read with
 `GET /v1/reservations-v3` using repeated `reservationIds[]` query parameters.
 That endpoint accepts at most ten reservation IDs per request. Guesty identifies
-returned v3 reservations with `reservationId`, not the legacy `_id` property.
-Observed responses use a top-level JSON array, while Guesty's public example
-also shows a single reservation object; the parser therefore supports both
-shapes without associating an unexpected reservation with a requested ID.
+returned v3 reservations with either `reservationId`, `_id`, or `id`. A
+redacted live comparison of 35 future reservations proved that the v3 `_id`
+values exactly match the internal legacy reservation IDs. Observed responses
+use a top-level JSON array, while Guesty's public example also shows a single
+reservation object; the parser therefore supports both shapes without
+associating an unexpected reservation with a requested ID.
 
 Only active reservations belonging to listings mapped to an enabled Loxone or
 TTLock provider are enriched: changed reservations during incremental polls, a
@@ -181,15 +183,30 @@ the existing coordinator, not another poller.
 
 - Status: Validated
 - Last validated: 2026-07-28
-- Evidence: `custom_components/guesty/api.py`,
+- Evidence: redacted live API reproduction on 2026-07-28,
+  `custom_components/guesty/api.py`,
   `tests/test_api.py::test_native_keycode_uses_minimal_v3_notes_payload`,
+  `tests/test_api.py::test_native_keycode_404_uses_verified_legacy_native_fallback`,
   `tests/test_api.py::test_native_keycode_requires_exact_success_confirmation`
 
-Write the native field using
+The primary write route is
 `PUT /v1/reservations-v3/{reservationId}/notes` with only
-`{"notes":{"keyCode":"..."}}`. Never round-trip or overwrite unrelated note
-properties. A write is successful only after Guesty confirms the exact value.
-Resource IDs must be validated before they are interpolated into paths.
+`{"notes":{"keyCode":"..."}}`. Some Guesty applications can read the exact
+existing reservation through v3 while that dedicated notes route consistently
+returns HTTP 404. Only for that exact condition, the integration may use the
+general `PUT /v1/reservations/{reservationId}` updater to write the same native
+`notes.keyCode`; it first verifies the exact v3 reservation, preserves supported
+mutable note properties, excludes server-managed `doneBy`, and performs a
+bounded v3 read-back. Authentication, permission, validation, timeout,
+rate-limit, and server errors never trigger this compatibility route.
+
+A write is successful only after Guesty confirms the exact reservation ID and
+value. Confirmed compatibility-route selection is persisted so later writes use
+one actual PUT. The initial route discovery reserves both global write slots
+before attempting the primary PUT and fallback, so the compatibility path
+cannot exceed the two-writes-per-30-seconds budget. Resource IDs must be
+validated before they are interpolated into paths. This is not a custom-field
+fallback.
 
 ### KB-GUESTY-004 — Sparse and empty projections have different meanings
 
@@ -235,6 +252,11 @@ starts Home Assistant reauthentication. Retry-safe transient failures use
 bounded exponential backoff and `Retry-After`; permanent failures are not
 blindly retried. During a transient outage the last valid snapshot remains
 visible as degraded/stale, and normal operation resumes automatically.
+
+Guesty Client ID and Client Secret are stable application credentials; the
+derived Bearer access token is the expiring value. Reuse the shared token
+lifecycle rather than repeatedly minting tokens: Guesty's OAuth endpoint can
+rate-limit repeated token requests with a long `Retry-After`.
 
 ### KB-GUESTY-007 — Incoming webhooks are authenticated before work
 

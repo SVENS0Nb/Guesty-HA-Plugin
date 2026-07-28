@@ -21,9 +21,12 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyKeyCodeWriteResult,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    KEYCODE_WRITE_ROUTE_LEGACY,
+    KEYCODE_WRITE_ROUTE_V3,
 )
 from .const import (
     CONF_ACCESS_EARLY_MINUTES,
@@ -71,6 +74,7 @@ LOXONE_STORAGE_KEY = "guesty_loxone"
 _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
+_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
@@ -287,6 +291,10 @@ class GuestyLoxoneManager:
             and isinstance(previous_fingerprint, str)
             and previous_fingerprint != current_fingerprint
         )
+        if credentials_changed:
+            # Route availability belongs to the Guesty Open API application.
+            # A replacement Client ID must probe the primary v3 route again.
+            self._data.pop(_GUESTY_KEYCODE_WRITE_ROUTE_KEY, None)
 
         recovered = 0
         state_changed = False
@@ -779,19 +787,40 @@ class GuestyLoxoneManager:
             seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS
         )
 
-    async def _async_consume_guesty_write_slot(self, now: datetime) -> bool:
-        """Persist one Guesty write attempt before making the network request."""
+    async def _async_reserve_guesty_write_slots(
+        self,
+        now: datetime,
+        count: int,
+    ) -> bool:
+        """Persist Guesty write attempts before making network requests."""
         attempts = self._recent_guesty_write_attempts(now)
-        if len(attempts) >= _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
+        if count < 1 or len(attempts) + count > _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
             return False
-        attempts.append(now)
+        attempts.extend([now] * count)
         self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
             attempt.isoformat() for attempt in attempts
         ]
-        # Persist before the PUT. A timeout or restart after Guesty accepted the
-        # request must still consume the shared traffic allowance.
+        # Persist before every possible PUT. A timeout or restart after Guesty
+        # accepted a request must still consume the shared traffic allowance.
         await self._storage.async_save(self._data)
         return True
+
+    async def _async_refund_guesty_write_slots(
+        self,
+        now: datetime,
+        count: int,
+    ) -> None:
+        """Release unused pre-reserved fallback slots after confirmed success."""
+        if count <= 0:
+            return
+        attempts = self._recent_guesty_write_attempts(now)
+        if count >= len(attempts):
+            self._data.pop(_GUESTY_WRITE_ATTEMPTS_KEY, None)
+        else:
+            self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
+                attempt.isoformat() for attempt in attempts[:-count]
+            ]
+        await self._storage.async_save(self._data)
 
     def _reservation_sync_order(
         self,
@@ -1202,16 +1231,77 @@ class GuestyLoxoneManager:
             else 0
         )
         attempted_at = dt_util.utcnow()
-        if not await self._async_consume_guesty_write_slot(attempted_at):
+        preferred_route = self._data.get(
+            _GUESTY_KEYCODE_WRITE_ROUTE_KEY,
+            KEYCODE_WRITE_ROUTE_V3,
+        )
+        if preferred_route not in {
+            KEYCODE_WRITE_ROUTE_V3,
+            KEYCODE_WRITE_ROUTE_LEGACY,
+        }:
+            preferred_route = KEYCODE_WRITE_ROUTE_V3
+        allow_legacy_fallback = bool(
+            preferred_route == KEYCODE_WRITE_ROUTE_V3
+            and self._guesty_writes_remaining >= 2
+        )
+        reserved_slots = 2 if allow_legacy_fallback else 1
+        if not await self._async_reserve_guesty_write_slots(
+            attempted_at,
+            reserved_slots,
+        ):
             self._guesty_writes_remaining = 0
             raise _GuestyWriteDeferred(self._queue_keycode_write(record, attempted_at))
-        self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
-        self._last_guesty_writes += 1
-        guesty_value = self._guesty_code_value(code, reservation.listing_id)
-        await self._client.async_update_reservation_key_code(
-            reservation.id,
-            guesty_value,
+        self._guesty_writes_remaining = max(
+            0,
+            self._guesty_writes_remaining - reserved_slots,
         )
+        guesty_value = self._guesty_code_value(code, reservation.listing_id)
+        try:
+            if preferred_route == KEYCODE_WRITE_ROUTE_V3 and allow_legacy_fallback:
+                result = await self._client.async_update_reservation_key_code(
+                    reservation.id,
+                    guesty_value,
+                )
+            else:
+                result = await self._client.async_update_reservation_key_code(
+                    reservation.id,
+                    guesty_value,
+                    preferred_route=preferred_route,
+                    allow_legacy_fallback=allow_legacy_fallback,
+                )
+        except Exception:
+            # Unknown outcomes stay conservatively charged. This prevents a
+            # timeout or restart after an accepted write from exceeding the
+            # persistent two-writes-per-30-seconds ceiling.
+            self._last_guesty_writes += reserved_slots
+            raise
+
+        actual_attempts = (
+            result.attempts
+            if isinstance(result, GuestyKeyCodeWriteResult)
+            and 1 <= result.attempts <= reserved_slots
+            else 1
+        )
+        confirmed_route = (
+            result.route
+            if isinstance(result, GuestyKeyCodeWriteResult)
+            and result.route in {KEYCODE_WRITE_ROUTE_V3, KEYCODE_WRITE_ROUTE_LEGACY}
+            else preferred_route
+        )
+        unused_slots = reserved_slots - actual_attempts
+        if unused_slots:
+            await self._async_refund_guesty_write_slots(
+                attempted_at,
+                unused_slots,
+            )
+            self._guesty_writes_remaining += unused_slots
+        self._last_guesty_writes += actual_attempts
+        if confirmed_route != preferred_route or (
+            confirmed_route == KEYCODE_WRITE_ROUTE_LEGACY
+            and self._data.get(_GUESTY_KEYCODE_WRITE_ROUTE_KEY)
+            != KEYCODE_WRITE_ROUTE_LEGACY
+        ):
+            self._data[_GUESTY_KEYCODE_WRITE_ROUTE_KEY] = confirmed_route
         reservation.key_code = guesty_value
         reservation.key_code_observed = True
         record["field_id"] = field_id
@@ -1900,6 +1990,10 @@ class GuestyLoxoneManager:
             "provisioned_during_last_reconcile": self._last_provisioned,
             "deleted_during_last_reconcile": self._last_deleted,
             "guesty_writes_during_last_reconcile": self._last_guesty_writes,
+            "guesty_keycode_write_route": self._data.get(
+                _GUESTY_KEYCODE_WRITE_ROUTE_KEY,
+                KEYCODE_WRITE_ROUTE_V3,
+            ),
             "queued_during_last_reconcile": self._last_queued,
             "local_records": len(records),
             "native_keycodes_synced": sum(
