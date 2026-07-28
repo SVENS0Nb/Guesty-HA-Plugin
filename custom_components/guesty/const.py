@@ -166,7 +166,7 @@ RESERVATION_FIELDS: Final = (
     "checkIn checkOut checkInDateLocalized checkOutDateLocalized "
     "plannedArrival plannedDeparture lastUpdatedAt "
     "listing.defaultCheckInTime listing.defaultCheckOutTime "
-    "guest.fullName customFields notes.keyCode"
+    "guest.fullName customFields"
 )
 
 WEBHOOK_SUBSCRIPTION_EVENTS: Final = (

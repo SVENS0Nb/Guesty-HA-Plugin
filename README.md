@@ -223,9 +223,13 @@ Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
 für eine zukünftige Reservierung unmittelbar nach Webhook oder spätestens beim
 nächsten normalen Reservierungsabgleich erzeugt. Der gemeinsame Guesty-Client,
 OAuth-Token, Webhook, Reservierungs-Cache und 5-Minuten-Abgleich werden
-wiederverwendet; es gibt keinen zweiten Poller. `notes.keyCode` wird direkt aus
-demselben Reservierungsabruf übernommen. Pro neuem oder geändertem Code entsteht
-genau ein minimaler Guesty-Schreibzugriff, der ausschließlich
+wiederverwendet; es gibt keinen zweiten Poller. Da Guestys älterer
+Reservierungs-Endpunkt das native `notes.keyCode` nicht ausliefert, ergänzt der
+Coordinator nur aktive Reservierungen von Listings mit eingeschaltetem Loxone
+oder TTLock über Reservations v3. Geänderte Reservierungen werden
+inkrementell, ein einzelner Webhook gezielt und der tägliche Vollabgleich in
+von Guesty erlaubten Zehner-Batches gelesen. Pro neuem oder geändertem Code
+entsteht genau ein minimaler Guesty-Schreibzugriff, der ausschließlich
 `{"notes":{"keyCode":"…"}}` überträgt.
 
 Der Loxone-Benutzer wird dagegen erst kurz vor dem erlaubten Zeitraum angelegt.

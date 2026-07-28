@@ -19,15 +19,20 @@ from .api import (
     GuestyApiError,
     GuestyAuthError,
     GuestyPermissionError,
+    is_guesty_object_id,
     is_safe_resource_id,
 )
 from .const import (
     CONF_EXPOSE_GUEST_DETAILS,
     CONF_LISTING_SYNC_INTERVAL,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_LISTING_MAPPINGS,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_SCAN_INTERVAL,
     CONF_STALE_THRESHOLD_HOURS,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LISTING_SYNC_INTERVAL,
     DEFAULT_RESERVATION_DAYS_FUTURE,
@@ -244,6 +249,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     days_future,
                     updated_since=None if full_reservation_sync else updated_since,
                 )
+
+            await self._async_enrich_native_keycodes(reservations_result)
 
             if listings_result is not None:
                 listings = {listing.id: listing for listing in listings_result}
@@ -568,6 +575,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         err,
                     )
                 else:
+                    await self._async_enrich_native_keycodes(listing_reservations)
                     reservations = merge_reservations(
                         reservations,
                         listing_reservations,
@@ -604,6 +612,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         """Refresh a single reservation from a webhook event."""
         try:
             reservation = await self._client.async_get_reservation(reservation_id)
+            if reservation is not None:
+                await self._async_enrich_native_keycodes([reservation])
         except (GuestyApiError, GuestyAuthError) as err:
             _LOGGER.warning(
                 "Webhook reservation refresh failed; running incremental sync: %s",
@@ -644,6 +654,49 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 cache,
                 reservation_overrides={reservation.id: reservation},
             )
+
+    def _native_keycode_listing_ids(self) -> set[str]:
+        """Return listings whose enabled PIN provider needs native Keycodes."""
+        listing_ids: set[str] = set()
+        options = self.config_entry.options
+        if options.get(CONF_LOXONE_ENABLED, False):
+            mappings = options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
+            if isinstance(mappings, dict):
+                listing_ids.update(
+                    value for value in mappings if is_safe_resource_id(value)
+                )
+        if options.get(CONF_TTLOCK_ENABLED, False):
+            mappings = options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
+            if isinstance(mappings, dict):
+                listing_ids.update(
+                    value for value in mappings if is_safe_resource_id(value)
+                )
+        return listing_ids
+
+    async def _async_enrich_native_keycodes(
+        self,
+        reservations: list[GuestyReservation],
+    ) -> None:
+        """Overlay authoritative Reservations v3 Keycodes on shared results."""
+        mapped_listing_ids = self._native_keycode_listing_ids()
+        if not mapped_listing_ids:
+            return
+        targets = {
+            reservation.id
+            for reservation in reservations
+            if reservation.listing_id in mapped_listing_ids
+            and reservation.is_active_status()
+            and is_guesty_object_id(reservation.id)
+        }
+        if not targets:
+            return
+
+        key_codes = await self._client.async_get_reservation_key_codes(targets)
+        for reservation in reservations:
+            if reservation.id not in key_codes:
+                continue
+            reservation.key_code = key_codes[reservation.id]
+            reservation.key_code_observed = True
 
     async def _async_remove_reservation_from_cache(self, reservation_id: str) -> None:
         """Remove a reservation Guesty reports as no longer existing."""

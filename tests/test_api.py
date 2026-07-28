@@ -17,6 +17,7 @@ from custom_components.guesty.api import (
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    is_guesty_object_id,
     is_custom_field_reference_error,
     is_safe_resource_id,
 )
@@ -40,6 +41,13 @@ def test_custom_field_error_classification_is_narrow() -> None:
         GuestyApiError("Reservation payload is invalid", 400)
     )
     assert not is_custom_field_reference_error(GuestyRetryableError("offline"))
+
+
+def test_guesty_object_id_validation_is_strict() -> None:
+    """Reservations v3 accepts only Guesty's internal 24-hex identifiers."""
+    assert is_guesty_object_id("507f1f77bcf86cd799439011")
+    assert not is_guesty_object_id("GY-vUX2hCRe")
+    assert not is_guesty_object_id(None)
 
 
 @pytest.mark.asyncio
@@ -461,6 +469,74 @@ async def test_native_keycode_uses_minimal_v3_notes_payload(monkeypatch) -> None
         f"/reservations-v3/{reservation_id}/notes",
         json_body={"notes": {"keyCode": "712345#"}},
     )
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_reads_use_batched_v3_array_responses(
+    monkeypatch,
+) -> None:
+    """Native Keycodes are read from v3 in documented batches of at most ten."""
+    client = _client()
+    reservation_ids = [f"{index:024x}" for index in range(12)]
+    request = AsyncMock(
+        side_effect=[
+            [
+                {"_id": reservation_ids[0], "notes": {"keyCode": 712345}},
+                {"_id": reservation_ids[1], "notes": {}},
+                # Missing notes are sparse, not an observed empty Keycode.
+                {"_id": reservation_ids[2]},
+            ],
+            [
+                {"_id": reservation_ids[10], "notes": {"keyCode": "734567#"}},
+                # Ignore an unexpected reservation rather than associating its
+                # Keycode with one of the requested IDs.
+                {
+                    "_id": "ffffffffffffffffffffffff",
+                    "notes": {"keyCode": "799999"},
+                },
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_get_reservation_key_codes(reversed(reservation_ids))
+
+    assert result == {
+        reservation_ids[0]: "712345",
+        reservation_ids[1]: None,
+        reservation_ids[10]: "734567#",
+    }
+    assert request.await_args_list == [
+        call(
+            "GET",
+            "/reservations-v3",
+            params=[
+                ("reservationIds[]", reservation_id)
+                for reservation_id in reservation_ids[:10]
+            ],
+        ),
+        call(
+            "GET",
+            "/reservations-v3",
+            params=[
+                ("reservationIds[]", reservation_id)
+                for reservation_id in reservation_ids[10:]
+            ],
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_read_rejects_non_internal_id(monkeypatch) -> None:
+    """A confirmation code can never be interpolated into a v3 batch request."""
+    client = _client()
+    request = AsyncMock()
+    monkeypatch.setattr(client, "_async_request", request)
+
+    with pytest.raises(GuestyApiError, match="Invalid reservation id"):
+        await client.async_get_reservation_key_codes({"GY-vUX2hCRe"})
+
+    request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

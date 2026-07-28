@@ -15,6 +15,10 @@ from custom_components.guesty.api import GuestyAuthError
 from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
@@ -35,6 +39,17 @@ def _entry() -> MockConfigEntry:
     )
 
 
+def _mapped_entry() -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={
+            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+        },
+    )
+
+
 def _empty_cache() -> dict:
     return {
         "listings": {},
@@ -50,8 +65,13 @@ def _empty_cache() -> dict:
     }
 
 
-def _coordinator(hass, client=None, storage=None) -> GuestyDataUpdateCoordinator:
-    entry = _entry()
+def _coordinator(
+    hass,
+    client=None,
+    storage=None,
+    entry=None,
+) -> GuestyDataUpdateCoordinator:
+    entry = entry or _entry()
     entry.add_to_hass(hass)
     return GuestyDataUpdateCoordinator(
         hass,
@@ -309,6 +329,160 @@ def _reservation(
         key_code=key_code,
         key_code_observed=key_code is not None,
     )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {
+            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+        },
+        {
+            CONF_TTLOCK_ENABLED: True,
+            CONF_TTLOCK_LISTING_MAPPINGS: {"listing-1": {}},
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_mapped_active_reservations_receive_authoritative_v3_keycodes(
+    hass,
+    options,
+) -> None:
+    """Each enabled provider receives v3 Keycodes only for its mapped listings."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options=options,
+    )
+    mapped_id = "507f1f77bcf86cd799439011"
+    unmapped_id = "507f1f77bcf86cd799439012"
+    inactive_id = "507f1f77bcf86cd799439013"
+    mapped = _reservation(mapped_id)
+    unmapped = _reservation(unmapped_id)
+    unmapped.listing_id = "listing-2"
+    inactive = _reservation(inactive_id)
+    inactive.status = "canceled"
+    client = SimpleNamespace(
+        async_get_reservation_key_codes=AsyncMock(return_value={mapped_id: "799999"})
+    )
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([mapped, unmapped, inactive])
+
+    client.async_get_reservation_key_codes.assert_awaited_once_with({mapped_id})
+    assert mapped.key_code == "799999"
+    assert mapped.key_code_observed is True
+    assert unmapped.key_code_observed is False
+    assert inactive.key_code_observed is False
+
+
+@pytest.mark.asyncio
+async def test_v3_observed_empty_keycode_remains_authoritative(hass) -> None:
+    """An explicit empty v3 Keycode is distinct from a sparse response."""
+    entry = _mapped_entry()
+    reservation_id = "507f1f77bcf86cd799439011"
+    reservation = _reservation(reservation_id, key_code="712345")
+    client = SimpleNamespace(
+        async_get_reservation_key_codes=AsyncMock(return_value={reservation_id: None})
+    )
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([reservation])
+
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is True
+
+
+@pytest.mark.asyncio
+async def test_sparse_v3_keycode_response_is_not_an_observed_deletion(hass) -> None:
+    """A missing v3 reservation or notes object cannot revoke a private PIN."""
+    entry = _mapped_entry()
+    reservation_id = "507f1f77bcf86cd799439011"
+    reservation = _reservation(reservation_id)
+    client = SimpleNamespace(async_get_reservation_key_codes=AsyncMock(return_value={}))
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([reservation])
+
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is False
+
+
+@pytest.mark.asyncio
+async def test_full_poll_enriches_mapped_reservations_from_v3(
+    hass,
+    monkeypatch,
+) -> None:
+    """The normal shared poll publishes v3 Keycodes to downstream managers."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    reservation_id = "507f1f77bcf86cd799439011"
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_listing_sync": NOW.isoformat(),
+        }
+    )
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_reservations=AsyncMock(return_value=[_reservation(reservation_id)]),
+        async_get_reservation_key_codes=AsyncMock(
+            return_value={reservation_id: "799999"}
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    result = await instance._async_fetch_data(full_reservation_sync=True)
+
+    client.async_get_reservation_key_codes.assert_awaited_once_with({reservation_id})
+    assert result.reservations[0].key_code == "799999"
+    assert result.reservations[0].key_code_observed is True
+    saved = storage.async_save.await_args.args[0]["reservations"][0]
+    assert "key_code" not in saved
+
+
+@pytest.mark.asyncio
+async def test_targeted_webhook_enriches_mapped_reservation_from_v3(hass) -> None:
+    """A manual native Keycode edit reaches managers through one targeted read."""
+    reservation_id = "507f1f77bcf86cd799439011"
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(return_value=_reservation(reservation_id)),
+        async_get_reservation_key_codes=AsyncMock(
+            return_value={reservation_id: "788888"}
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    await instance._async_apply_reservation_webhook(reservation_id)
+
+    client.async_get_reservation.assert_awaited_once_with(reservation_id)
+    client.async_get_reservation_key_codes.assert_awaited_once_with({reservation_id})
+    assert instance.data.reservations[0].key_code == "788888"
+    assert instance.data.reservations[0].key_code_observed is True
 
 
 @pytest.mark.asyncio

@@ -34,10 +34,12 @@ from .models import GuestyListing, GuestyReservation, build_reservation_filters
 _LOGGER = logging.getLogger(__name__)
 
 PAGE_LIMIT = 100
+V3_RESERVATION_BATCH_SIZE = 10
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 OBJECT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 MAX_NATIVE_KEYCODE_LENGTH = 64
+RequestParams = dict[str, str] | list[tuple[str, str]]
 
 
 def legacy_client_unique_id(client_id: str) -> str:
@@ -48,6 +50,11 @@ def legacy_client_unique_id(client_id: str) -> str:
 def is_safe_resource_id(value: Any) -> bool:
     """Return whether a value is safe to insert into an API URL path."""
     return isinstance(value, str) and RESOURCE_ID_PATTERN.fullmatch(value) is not None
+
+
+def is_guesty_object_id(value: Any) -> bool:
+    """Return whether a value is a Guesty MongoDB-style object ID."""
+    return isinstance(value, str) and OBJECT_ID_PATTERN.fullmatch(value) is not None
 
 
 class GuestyAuthError(Exception):
@@ -264,6 +271,44 @@ class GuestyApiClient:
         if isinstance(data, dict):
             return GuestyReservation.from_api(data)
         return None
+
+    async def async_get_reservation_key_codes(
+        self,
+        reservation_ids: Collection[str],
+    ) -> dict[str, str | None]:
+        """Fetch authoritative native Keycodes from Reservations v3 in batches."""
+        unique_ids = sorted(set(reservation_ids))
+        if not unique_ids:
+            return {}
+        if any(not is_guesty_object_id(value) for value in unique_ids):
+            raise GuestyApiError("Invalid reservation id")
+
+        await self._async_ensure_token()
+        key_codes: dict[str, str | None] = {}
+        for offset in range(0, len(unique_ids), V3_RESERVATION_BATCH_SIZE):
+            batch = unique_ids[offset : offset + V3_RESERVATION_BATCH_SIZE]
+            data = await self._async_request(
+                "GET",
+                "/reservations-v3",
+                params=[
+                    ("reservationIds[]", reservation_id) for reservation_id in batch
+                ],
+            )
+            requested = set(batch)
+            for item in self._normalize_results(data):
+                reservation_id = item.get("_id") or item.get("id")
+                if reservation_id not in requested:
+                    continue
+                notes = item.get("notes")
+                if not isinstance(notes, dict):
+                    # A sparse v3 response must not masquerade as an explicitly
+                    # empty Keycode.
+                    continue
+                raw_key_code = notes.get("keyCode")
+                key_codes[str(reservation_id)] = (
+                    str(raw_key_code).strip() if raw_key_code is not None else None
+                )
+        return key_codes
 
     async def async_update_reservation_key_code(
         self,
@@ -826,7 +871,7 @@ class GuestyApiClient:
         method: str,
         path: str,
         *,
-        params: dict[str, str] | None = None,
+        params: RequestParams | None = None,
         json_body: dict[str, Any] | None = None,
         retry_auth: bool = True,
         retry_transport: bool = True,
@@ -878,7 +923,7 @@ class GuestyApiClient:
         method: str,
         path: str,
         *,
-        params: dict[str, str] | None = None,
+        params: RequestParams | None = None,
         json_body: dict[str, Any] | None = None,
         retry_auth: bool = True,
     ) -> Any:

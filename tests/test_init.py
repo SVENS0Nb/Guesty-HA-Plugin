@@ -24,17 +24,22 @@ from custom_components.guesty.const import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("keycode_observed", "expected_calls"), [(False, 1), (True, 0)]
+    ("keycode_observed", "provider_enabled", "expected_calls"),
+    [(False, True, 1), (True, True, 0), (False, False, 0)],
 )
 async def test_setup_refreshes_privacy_stripped_native_keycodes(
-    hass, monkeypatch, keycode_observed, expected_calls
+    hass,
+    monkeypatch,
+    keycode_observed,
+    provider_enabled,
+    expected_calls,
 ) -> None:
     """PIN providers require one shared full read when cache omitted Keycodes."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
         options={
-            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_ENABLED: provider_enabled,
             CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
         },
     )

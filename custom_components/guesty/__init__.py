@@ -66,16 +66,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
         # The general cache intentionally strips reservation Keycodes. When a
         # PIN provider is enabled after a restart, perform one shared full read
         # instead of treating the missing cached value as an authoritative edit.
-        mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
-        ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
-        mapped_listing_ids = set(mappings) if isinstance(mappings, dict) else set()
-        if isinstance(ttlock_mappings, dict):
-            mapped_listing_ids.update(ttlock_mappings)
+        mapped_listing_ids: set[str] = set()
+        if entry.options.get(CONF_LOXONE_ENABLED, False):
+            mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
+            if isinstance(mappings, dict):
+                mapped_listing_ids.update(mappings)
+        if entry.options.get(CONF_TTLOCK_ENABLED, False):
+            ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
+            if isinstance(ttlock_mappings, dict):
+                mapped_listing_ids.update(ttlock_mappings)
         if (
-            (
-                entry.options.get(CONF_LOXONE_ENABLED, False)
-                or entry.options.get(CONF_TTLOCK_ENABLED, False)
-            )
+            mapped_listing_ids
             and coordinator.data is not None
             and any(
                 reservation.is_active_status()

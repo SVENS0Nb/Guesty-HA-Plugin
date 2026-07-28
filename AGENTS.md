@@ -157,6 +157,13 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   `PUT /v1/reservations-v3/{reservationId}/notes` and the minimal payload
   `{"notes":{"keyCode":"..."}}`. Do not round-trip or overwrite unrelated notes.
   Treat the write as successful only after exact confirmation.
+- Read native Keycodes only from `GET /v1/reservations-v3`. The legacy
+  `/reservations` endpoints do not expose `notes.keyCode` even when it is
+  projected. The v3 response is a top-level array and accepts at most ten
+  reservation IDs per request. Enrich only active reservations for listings
+  mapped to an enabled PIN provider: changed reservations on incremental polls,
+  one targeted batch after a single webhook, and all applicable reservations
+  during the daily/startup full sync. Do not add a second poller.
 - Guesty's returned `notes.keyCode` is authoritative. A valid, unique manual
   change must propagate to existing Loxone and TTLock objects. Once Guesty has
   confirmed a PIN, the integration must never change its six digits
