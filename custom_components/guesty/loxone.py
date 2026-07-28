@@ -74,7 +74,7 @@ _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
-_GUESTY_RETRY_STATE_VERSION = 1
+_GUESTY_RETRY_STATE_VERSION = 2
 _GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
     "custom_field_unavailable",

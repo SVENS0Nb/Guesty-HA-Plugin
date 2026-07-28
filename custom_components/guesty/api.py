@@ -296,7 +296,9 @@ class GuestyApiClient:
             )
             requested = set(batch)
             for item in self._normalize_results(data):
-                reservation_id = item.get("_id") or item.get("id")
+                reservation_id = (
+                    item.get("reservationId") or item.get("_id") or item.get("id")
+                )
                 if reservation_id not in requested:
                     continue
                 notes = item.get("notes")
@@ -862,7 +864,7 @@ class GuestyApiClient:
             results = data.get("results")
             if isinstance(results, list):
                 return [item for item in results if isinstance(item, dict)]
-            if data.get("_id") or data.get("id"):
+            if data.get("reservationId") or data.get("_id") or data.get("id"):
                 return [data]
         return []
 

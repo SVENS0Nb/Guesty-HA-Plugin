@@ -481,7 +481,7 @@ async def test_setup_recovers_persisted_native_404_backoff_once(
     assert "guesty_retry_at" not in record
     assert "guesty_retry_count" not in record
     assert record["last_error"] == "guesty_sync_queued"
-    assert manager._data["guesty_retry_state_version"] == 1
+    assert manager._data["guesty_retry_state_version"] == 2
     assert manager._data["guesty_client_fingerprint"] == (
         manager._guesty_client_fingerprint()
     )
@@ -576,7 +576,7 @@ async def test_setup_preserves_current_persisted_native_backoff(
                     "guesty_retry_count": 4,
                 }
             },
-            "guesty_retry_state_version": 1,
+            "guesty_retry_state_version": 2,
             "guesty_client_fingerprint": manager._guesty_client_fingerprint(),
         }
     )
@@ -621,7 +621,7 @@ async def test_setup_recovers_guesty_backoff_after_client_change(
                     "guesty_retry_count": 4,
                 }
             },
-            "guesty_retry_state_version": 1,
+            "guesty_retry_state_version": 2,
             "guesty_client_fingerprint": "previous-client",
         }
     )

@@ -481,17 +481,23 @@ async def test_native_keycode_reads_use_batched_v3_array_responses(
     request = AsyncMock(
         side_effect=[
             [
-                {"_id": reservation_ids[0], "notes": {"keyCode": 712345}},
-                {"_id": reservation_ids[1], "notes": {}},
+                {
+                    "reservationId": reservation_ids[0],
+                    "notes": {"keyCode": 712345},
+                },
+                {"reservationId": reservation_ids[1], "notes": {}},
                 # Missing notes are sparse, not an observed empty Keycode.
-                {"_id": reservation_ids[2]},
+                {"reservationId": reservation_ids[2]},
             ],
             [
-                {"_id": reservation_ids[10], "notes": {"keyCode": "734567#"}},
+                {
+                    "reservationId": reservation_ids[10],
+                    "notes": {"keyCode": "734567#"},
+                },
                 # Ignore an unexpected reservation rather than associating its
                 # Keycode with one of the requested IDs.
                 {
-                    "_id": "ffffffffffffffffffffffff",
+                    "reservationId": "ffffffffffffffffffffffff",
                     "notes": {"keyCode": "799999"},
                 },
             ],
@@ -524,6 +530,26 @@ async def test_native_keycode_reads_use_batched_v3_array_responses(
             ],
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_reads_single_v3_reservation_object(
+    monkeypatch,
+) -> None:
+    """A single v3 object using reservationId is not discarded as empty."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        return_value={
+            "reservationId": reservation_id,
+            "notes": {"keyCode": "712345#"},
+        }
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_get_reservation_key_codes({reservation_id})
+
+    assert result == {reservation_id: "712345#"}
 
 
 @pytest.mark.asyncio

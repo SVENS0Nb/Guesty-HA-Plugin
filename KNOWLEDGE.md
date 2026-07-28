@@ -165,8 +165,11 @@ a new listing requests reservations only for that listing.
 Guesty's legacy `/reservations` endpoints do not expose `notes.keyCode`, even
 when requested in their field projection. Native Keycodes must be read with
 `GET /v1/reservations-v3` using repeated `reservationIds[]` query parameters.
-That response is a top-level JSON array and accepts at most ten reservation IDs
-per request.
+That endpoint accepts at most ten reservation IDs per request. Guesty identifies
+returned v3 reservations with `reservationId`, not the legacy `_id` property.
+Observed responses use a top-level JSON array, while Guesty's public example
+also shows a single reservation object; the parser therefore supports both
+shapes without associating an unexpected reservation with a requested ID.
 
 Only active reservations belonging to listings mapped to an enabled Loxone or
 TTLock provider are enriched: changed reservations during incremental polls, a
