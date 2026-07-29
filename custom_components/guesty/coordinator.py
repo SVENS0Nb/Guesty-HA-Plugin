@@ -138,6 +138,16 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         if self.data:
             self._update_data_webhook_flag()
 
+    def _update_cached_auth_state(self, cache: dict[str, Any]) -> None:
+        """Persist the shared token and OAuth cooldown without exposing it."""
+        cache.update(
+            {
+                "access_token": getattr(self._client, "access_token", None),
+                "token_expires_at": getattr(self._client, "token_expires_at", None),
+                "token_retry_at": getattr(self._client, "token_retry_at", None),
+            }
+        )
+
     def _update_data_webhook_flag(self) -> None:
         """Update webhook flag on current data."""
         if not self.data:
@@ -331,8 +341,6 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         for listing_id, listing in listings.items()
                     },
                     "reservations": self._reservations_for_cache(reservations),
-                    "access_token": self._client.access_token,
-                    "token_expires_at": self._client.token_expires_at,
                     "last_sync": last_sync,
                     "last_listing_sync": last_listing_sync,
                     "last_reservation_sync": last_reservation_sync,
@@ -341,6 +349,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     "last_error": None,
                 }
             )
+            self._update_cached_auth_state(cache)
             await self._storage.async_save(cache)
             api_success = True
 
@@ -355,11 +364,12 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 "Guesty API update failed, using cached data if available: %s",
                 err,
             )
+            self._update_cached_auth_state(cache)
+            cache["last_error"] = last_error
+            await self._storage.async_save(cache)
             if not listings:
                 sync_status = SYNC_STATUS_ERROR
                 raise UpdateFailed(str(err)) from err
-            cache["last_error"] = last_error
-            await self._storage.async_save(cache)
 
         cache_age_minutes = self._calculate_cache_age_minutes(last_sync)
         data_stale = not api_success or (
@@ -651,10 +661,9 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         for listing_id, listing in listings.items()
                     },
                     "reservations": self._reservations_for_cache(reservations),
-                    "access_token": self._client.access_token,
-                    "token_expires_at": self._client.token_expires_at,
                 }
             )
+            self._update_cached_auth_state(cache)
             if use_api_fallback:
                 # Only a complete listing read proves the account-wide listing
                 # snapshot fresh. A targeted payload must not postpone the
@@ -700,6 +709,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 days_future=days_future,
             )
             cache["reservations"] = self._reservations_for_cache(reservations)
+            self._update_cached_auth_state(cache)
             await self._storage.async_save(cache)
             self._async_set_targeted_data_from_cache(
                 cache,

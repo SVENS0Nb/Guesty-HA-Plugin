@@ -71,6 +71,7 @@ async def test_non_mapping_cache_is_reset(hass) -> None:
 
     assert cache["listings"] == {}
     assert cache["reservations"] == []
+    assert cache["token_retry_at"] is None
 
 
 def test_general_cache_is_private_atomic_and_can_strip_guest_pii(hass) -> None:

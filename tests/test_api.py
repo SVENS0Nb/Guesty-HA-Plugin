@@ -222,6 +222,75 @@ async def test_concurrent_token_checks_create_only_one_token(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_oauth_rate_limit_defers_without_sleep_or_repeat(monkeypatch) -> None:
+    """OAuth 429 returns immediately and suppresses more token traffic."""
+    now = 1_000_000.0
+    client = GuestyApiClient(object(), "client", "secret")
+    refresh_once = AsyncMock(
+        side_effect=GuestyRetryableError(
+            "rate limited",
+            1_200.0,
+            status_code=429,
+            endpoint="oauth2",
+        )
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("custom_components.guesty.api.time.time", lambda: now)
+    monkeypatch.setattr(client, "_async_refresh_token_once", refresh_once)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    with pytest.raises(GuestyRetryableError) as first:
+        await client._async_ensure_token()
+
+    assert first.value.status_code == 429
+    assert client.token_retry_at == now + 1_200.0
+    refresh_once.assert_awaited_once_with()
+    sleep.assert_not_awaited()
+
+    with pytest.raises(GuestyRetryableError) as deferred:
+        await client._async_ensure_token()
+
+    assert deferred.value.retry_after == 1_200.0
+    refresh_once.assert_awaited_once_with()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persisted_oauth_cooldown_survives_restart_and_expires(
+    monkeypatch,
+) -> None:
+    """A restart cannot bypass Retry-After, but expiry permits one new request."""
+    now = 2_000_000.0
+    monkeypatch.setattr("custom_components.guesty.api.time.time", lambda: now)
+    client = GuestyApiClient(
+        object(),
+        "client",
+        "secret",
+        token_retry_at=now + 900.0,
+    )
+    refresh_once = AsyncMock()
+    monkeypatch.setattr(client, "_async_refresh_token_once", refresh_once)
+
+    with pytest.raises(GuestyRetryableError) as deferred:
+        await client._async_ensure_token()
+
+    assert deferred.value.retry_after == 900.0
+    refresh_once.assert_not_awaited()
+
+    now += 901.0
+
+    async def refresh_successfully() -> None:
+        client._access_token = "fresh-token"
+        client._token_expires_at = float("inf")
+
+    refresh_once.side_effect = refresh_successfully
+    await client._async_ensure_token()
+
+    refresh_once.assert_awaited_once_with()
+    assert client.token_retry_at is None
+
+
+@pytest.mark.asyncio
 async def test_late_unauthorized_response_reuses_newer_token(monkeypatch) -> None:
     """A late 401 response cannot spend another token after a peer refreshed it."""
     client = _client(token="new-token")
@@ -300,6 +369,52 @@ async def test_expired_token_response_refreshes_once(
         "Bearer expired-token",
         "Bearer fresh-token",
     ]
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_refresh_invalidates_rejected_cached_token(
+    monkeypatch,
+) -> None:
+    """A rejected token is not retried against data APIs during OAuth cooldown."""
+
+    class ResponseContext:
+        async def __aenter__(self):
+            return SimpleNamespace(
+                status=401,
+                headers={},
+                content=SimpleNamespace(
+                    read=AsyncMock(side_effect=[b'{"message":"Unauthorized"}', b""])
+                ),
+                charset="utf-8",
+            )
+
+        async def __aexit__(self, *_args):
+            return False
+
+    client = GuestyApiClient(
+        SimpleNamespace(request=MagicMock(return_value=ResponseContext())),
+        "client",
+        "secret",
+        "rejected-token",
+        float("inf"),
+    )
+    monkeypatch.setattr(
+        client,
+        "_async_ensure_token",
+        AsyncMock(
+            side_effect=GuestyRetryableError(
+                "rate limited",
+                900.0,
+                status_code=429,
+                endpoint="oauth2",
+            )
+        ),
+    )
+
+    with pytest.raises(GuestyRetryableError):
+        await client._async_request_once("GET", "/listings")
+
+    assert client.token_expires_at is None
 
 
 @pytest.mark.asyncio

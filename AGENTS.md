@@ -162,6 +162,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   derived Bearer token expires. Reuse the shared serialized token lifecycle.
   Do not mint diagnostic tokens repeatedly because Guesty's OAuth endpoint may
   respond with a long `Retry-After`.
+- An OAuth-endpoint `429` is a deferred retry, never a setup-time sleep loop.
+  Persist the bounded absolute cooldown in the private general store, return
+  cached data immediately as degraded when available, and make every poll or
+  restart before the deadline fail locally without another token request. With
+  no cache, persist the cooldown before the fast setup retry is raised.
 - All OAuth clients used for this Guesty account have the same configured API
   rights. Do not diagnose a Client-ID permission difference or recommend a
   credential change as the root-cause fix unless the same internal reservation

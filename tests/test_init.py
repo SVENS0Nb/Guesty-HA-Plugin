@@ -128,7 +128,9 @@ async def test_setup_reuses_and_then_removes_transient_token(
         },
     )
     entry.add_to_hass(hass)
-    storage = SimpleNamespace(async_load=AsyncMock(return_value={}))
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value={"token_retry_at": 9_876_543_210.0})
+    )
     client = SimpleNamespace()
     coordinator = SimpleNamespace(
         data=None,
@@ -178,6 +180,7 @@ async def test_setup_reuses_and_then_removes_transient_token(
         "secret",
         "validation-token",
         123456.0,
+        9_876_543_210.0,
     )
     assert entry.runtime_data.client is client
     assert entry.runtime_data.ttlock_manager is None

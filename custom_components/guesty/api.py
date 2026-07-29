@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -25,6 +26,7 @@ from .const import (
     API_RETRY_BASE_DELAY,
     API_RETRY_MAX_DELAY,
     LISTING_FIELDS,
+    OAUTH_RATE_LIMIT_MAX_DELAY,
     OAUTH_URL,
     RESERVATION_FIELDS,
     TOKEN_REFRESH_MARGIN,
@@ -160,6 +162,7 @@ class GuestyApiClient:
         client_secret: str,
         token: str | None = None,
         token_expires_at: float | None = None,
+        token_retry_at: float | None = None,
     ) -> None:
         """Initialize the API client."""
         self._session = session
@@ -170,6 +173,18 @@ class GuestyApiClient:
             float(token_expires_at)
             if isinstance(token_expires_at, (int, float))
             and not isinstance(token_expires_at, bool)
+            else None
+        )
+        now = time.time()
+        parsed_retry_at = (
+            float(token_retry_at)
+            if isinstance(token_retry_at, (int, float))
+            and not isinstance(token_retry_at, bool)
+            else None
+        )
+        self._token_retry_at = (
+            min(parsed_retry_at, now + OAUTH_RATE_LIMIT_MAX_DELAY)
+            if parsed_retry_at is not None and parsed_retry_at > now
             else None
         )
         self._token_lock = asyncio.Lock()
@@ -184,6 +199,7 @@ class GuestyApiClient:
         client_secret: str,
         token: str | None = None,
         token_expires_at: float | None = None,
+        token_retry_at: float | None = None,
     ) -> GuestyApiClient:
         """Create a client using Home Assistant's shared aiohttp session."""
         return cls(
@@ -192,6 +208,7 @@ class GuestyApiClient:
             client_secret,
             token,
             token_expires_at,
+            token_retry_at,
         )
 
     @property
@@ -203,6 +220,11 @@ class GuestyApiClient:
     def token_expires_at(self) -> float | None:
         """Return the token expiry timestamp."""
         return self._token_expires_at
+
+    @property
+    def token_retry_at(self) -> float | None:
+        """Return the persisted OAuth rate-limit deadline."""
+        return self._token_retry_at
 
     async def async_validate_credentials(self) -> str:
         """Validate credentials and return a privacy-safe account identity."""
@@ -837,6 +859,7 @@ class GuestyApiClient:
                 return
             if not force_refresh and self._has_valid_token():
                 return
+            self._raise_if_token_refresh_deferred()
             await self._async_refresh_token_locked()
 
     async def _async_refresh_token(self) -> None:
@@ -858,6 +881,9 @@ class GuestyApiClient:
                     endpoint="oauth2",
                 )
             except GuestyRetryableError as err:
+                if err.status_code == 429:
+                    self._defer_token_refresh(err.retry_after)
+                    raise
                 last_error = err
             except GuestyApiError:
                 raise
@@ -932,6 +958,33 @@ class GuestyApiClient:
             from homeassistant.util import dt as dt_util
 
             self._token_expires_at = dt_util.utcnow().timestamp() + expires_in
+            self._token_retry_at = None
+
+    def _raise_if_token_refresh_deferred(self) -> None:
+        """Avoid another OAuth request until Guesty's persisted cooldown ends."""
+        if self._token_retry_at is None:
+            return
+        remaining = self._token_retry_at - time.time()
+        if remaining <= 0:
+            self._token_retry_at = None
+            return
+        raise GuestyRetryableError(
+            "Guesty token request deferred by rate limit",
+            remaining,
+            status_code=429,
+            endpoint="oauth2",
+        )
+
+    def _defer_token_refresh(self, retry_after: float | None) -> None:
+        """Persist a bounded OAuth cooldown without sleeping in HA setup."""
+        delay = (
+            retry_after
+            if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            else API_RETRY_BASE_DELAY
+        )
+        delay = min(max(float(delay), API_RETRY_BASE_DELAY), OAUTH_RATE_LIMIT_MAX_DELAY)
+        self._token_retry_at = time.time() + delay
 
     async def _async_paginate(
         self,
@@ -1081,6 +1134,10 @@ class GuestyApiClient:
             # once for either response, then classify a repeated rejection
             # using the fresh token below.
             if response.status in {401, 403} and retry_auth:
+                if self._access_token == request_token:
+                    # A token rejected by Guesty must not be reused while a
+                    # rate-limited refresh is waiting for its cooldown.
+                    self._token_expires_at = None
                 await self._async_ensure_token(
                     force_refresh=True,
                     invalid_token=request_token,

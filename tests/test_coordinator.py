@@ -8,10 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.guesty.api import GuestyAuthError, GuestyPermissionError
+from custom_components.guesty.api import (
+    GuestyAuthError,
+    GuestyPermissionError,
+    GuestyRetryableError,
+)
 from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -57,6 +62,7 @@ def _empty_cache() -> dict:
         "reservations": [],
         "access_token": None,
         "token_expires_at": None,
+        "token_retry_at": None,
         "last_sync": None,
         "last_listing_sync": None,
         "last_reservation_sync": None,
@@ -149,6 +155,85 @@ async def test_fresh_token_permission_failure_starts_reauthentication(hass) -> N
 
     with pytest.raises(ConfigEntryAuthFailed):
         await instance._async_fetch_data(full_reservation_sync=True)
+
+
+@pytest.mark.asyncio
+async def test_oauth_rate_limit_is_persisted_before_empty_cache_retry(hass) -> None:
+    """First setup exits quickly while preserving Guesty's OAuth cooldown."""
+    retry_at = 2_000_900.0
+    client = SimpleNamespace(
+        access_token=None,
+        token_expires_at=None,
+        token_retry_at=retry_at,
+        async_get_listings=AsyncMock(
+            side_effect=GuestyRetryableError(
+                "Guesty token request deferred by rate limit",
+                900.0,
+                status_code=429,
+                endpoint="oauth2",
+            )
+        ),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    with pytest.raises(UpdateFailed):
+        await instance._async_fetch_data(full_reservation_sync=True)
+
+    saved = storage.async_save.await_args.args[0]
+    assert saved["token_retry_at"] == retry_at
+    assert saved["last_error"] == "Guesty token request deferred by rate limit"
+
+
+@pytest.mark.asyncio
+async def test_oauth_rate_limit_starts_from_cache_in_degraded_state(
+    hass, monkeypatch
+) -> None:
+    """Cached entities remain available when OAuth is rate-limited at startup."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    retry_at = 2_000_900.0
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_sync": NOW.isoformat(),
+            "last_listing_sync": NOW.isoformat(),
+            "last_reservation_sync": NOW.isoformat(),
+            "last_full_reservation_sync": NOW.isoformat(),
+            "last_incremental_sync": NOW.isoformat(),
+        }
+    )
+    client = SimpleNamespace(
+        access_token=None,
+        token_expires_at=None,
+        token_retry_at=retry_at,
+        async_get_reservations=AsyncMock(
+            side_effect=GuestyRetryableError(
+                "Guesty token request deferred by rate limit",
+                900.0,
+                status_code=429,
+                endpoint="oauth2",
+            )
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    result = await instance._async_fetch_data(full_reservation_sync=False)
+
+    assert set(result.listings) == {"listing-1"}
+    assert result.sync_status == SYNC_STATUS_DEGRADED
+    assert result.data_stale is True
+    assert storage.async_save.await_args.args[0]["token_retry_at"] == retry_at
 
 
 @pytest.mark.asyncio

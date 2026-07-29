@@ -671,6 +671,10 @@ python -m pytest
 
 - **Webhook nicht aktiv** – externe URL in Home Assistant konfigurieren (Einstellungen → System → Netzwerk)
 - **Sync-Status `degraded`** – API temporär nicht erreichbar, Cache wird genutzt
+- **Guesty-OAuth ist rate-limitiert (HTTP 429)** – nicht wiederholt neu starten.
+  Die Integration verwendet vorhandene Cache-Daten, beachtet Guestys
+  `Retry-After` auch über einen Neustart hinweg und versucht die Anmeldung
+  danach automatisch genau einmal erneut.
 - **Guesty-Feld bleibt leer** – den deaktivierten Diagnose-Sensor
   „Gast-Zugangslink“ aktivieren: `Synchronisiert` mit `access_url` bestätigt die
   lokale Erzeugung und den von Guesty bestätigten Schreibvorgang; `Ausstehend`

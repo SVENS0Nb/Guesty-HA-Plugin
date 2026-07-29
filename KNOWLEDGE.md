@@ -253,6 +253,9 @@ errors.
 - Last validated: 2026-07-29
 - Evidence: `custom_components/guesty/api.py`,
   `custom_components/guesty/coordinator.py`, `tests/test_api.py`,
+  `tests/test_api.py::test_oauth_rate_limit_defers_without_sleep_or_repeat`,
+  `tests/test_api.py::test_persisted_oauth_cooldown_survives_restart_and_expires`,
+  `tests/test_coordinator.py::test_oauth_rate_limit_starts_from_cache_in_degraded_state`,
   `tests/test_coordinator.py::test_auth_failure_starts_reauthentication`,
   [Guesty Authentication](https://open-api-docs.guesty.com/docs/authentication)
 
@@ -275,6 +278,16 @@ derived Bearer access token is the expiring value. Reuse the shared token
 lifecycle rather than repeatedly minting tokens: Guesty's OAuth endpoint can
 issue at most five tokens per Client ID in a 24-hour period and can rate-limit
 repeated token requests with a long `Retry-After`.
+
+An HTTP `429` from the OAuth endpoint is handled differently from an ordinary
+short in-request retry. The client performs no sleep/retry loop inside Home
+Assistant config-entry setup. It records a bounded absolute cooldown in the
+private general cache and returns immediately. Existing cached entities start
+in a visible degraded state; without cached listings, setup exits quickly after
+persisting the same deadline. Coordinator polls and Home Assistant restarts
+before that deadline fail locally without another OAuth request. Once the
+deadline passes, the shared client permits exactly one serialized token request
+and normal polling clears the persisted cooldown.
 
 ### KB-GUESTY-007 — Incoming webhooks are authenticated before work
 

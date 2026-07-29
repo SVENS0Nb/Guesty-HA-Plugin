@@ -53,6 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
         entry.data[CONF_CLIENT_SECRET],
         entry.data.get(CONF_ACCESS_TOKEN) or cached.get("access_token"),
         entry.data.get(CONF_TOKEN_EXPIRES_AT) or cached.get("token_expires_at"),
+        cached.get("token_retry_at"),
     )
 
     coordinator = GuestyDataUpdateCoordinator(hass, entry, client, storage)
@@ -230,6 +231,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> N
             entry.data[CONF_CLIENT_SECRET],
             cached.get("access_token"),
             cached.get("token_expires_at"),
+            cached.get("token_retry_at"),
         )
     if guesty_webhook_id:
         try:

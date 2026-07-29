@@ -48,6 +48,7 @@ class GuestyStorage:
             "reservations": [],
             "access_token": None,
             "token_expires_at": None,
+            "token_retry_at": None,
             "last_sync": None,
             "last_listing_sync": None,
             "last_reservation_sync": None,
