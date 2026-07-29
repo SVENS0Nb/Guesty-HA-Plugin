@@ -11,9 +11,12 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.guesty.const import (
     CONF_ACCESS_CUSTOM_FIELD,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_FAVICON_URL,
+    CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    CONF_GUESTY_CODE_SUFFIXES,
     CONF_GUESTY_WEBHOOK_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
     CONF_LOXONE_GROUP_UUIDS,
@@ -125,6 +128,10 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
         options={
             CONF_ACCESS_ENABLED: True,
             CONF_ACCESS_CUSTOM_FIELD: "private-field-id",
+            CONF_ACCESS_LOGO_URL: "https://private-branding.test/logo.png",
+            CONF_ACCESS_FAVICON_URL: "https://private-branding.test/favicon.png",
+            CONF_GUESTY_CODE_SUFFIXES: {"private-listing-id": "#"},
+            "future_private_option": "private-future-value",
             CONF_ACCESS_LOCK_MAPPINGS: {
                 "private-listing-id": [
                     {"entity_id": "lock.private_door", "name": "Private door"}
@@ -190,6 +197,7 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
         client=SimpleNamespace(
             token_expires_at=1234,
             last_rate_limit_remaining=8,
+            rate_limit_remaining_by_window={"minute": 8, "hour": 100},
         ),
         access_manager=SimpleNamespace(
             diagnostics=lambda: {
@@ -228,6 +236,8 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "private-webhook-secret" not in serialized
     assert "private-migration-id" not in serialized
     assert "private-field-id" not in serialized
+    assert "private-branding" not in serialized
+    assert "private-future-value" not in serialized
     assert "lock.private_door" not in serialized
     assert "private-loxone" not in serialized
     assert "private-server-id" not in serialized
@@ -235,6 +245,11 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     assert "private-ttlock" not in serialized
     assert "12345" not in serialized
     assert diagnostics["guest_access"]["mapped_locks"] == 1
+    assert diagnostics["options"] == {CONF_ACCESS_ENABLED: True}
+    assert diagnostics["api"]["rate_limit_remaining_by_window"] == {
+        "minute": 8,
+        "hour": 100,
+    }
     assert diagnostics["guest_access"]["eligible_reservations"] == 1
     assert diagnostics["guest_access"]["verified_records"] == 1
     assert diagnostics["loxone_pin_access"]["configured_miniservers"] == 1

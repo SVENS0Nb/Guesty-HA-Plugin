@@ -147,16 +147,37 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   sufficient listing payloads directly; fetch only missing details. A removed
   listing is pruned immediately. A new listing triggers reservation traffic only
   for that listing.
-- Auth or permission failures start Home Assistant reauthentication. Transient
-  failures use the last valid cache in a visible degraded/stale state.
+- A targeted listing or single-reservation webhook must not reset global
+  reservation cache age, the listing safety-scan timestamp, stale/degraded
+  state, or the previous poll error. Only a successful normal reservation
+  synchronization proves the complete reservation snapshot fresh, and only a
+  complete listing read advances the listing safety cursor.
+- Guesty may report an expired Bearer token as either HTTP `401` or `403`.
+  After either response, refresh the shared token exactly once and retry the
+  original request. Only rejection with the fresh token, or a permanent
+  credential rejection from the OAuth endpoint, starts Home Assistant
+  reauthentication. Transient token failures use the last valid cache in a
+  visible degraded/stale state.
 - Guesty Client ID and Client Secret are stable application credentials; the
   derived Bearer token expires. Reuse the shared serialized token lifecycle.
   Do not mint diagnostic tokens repeatedly because Guesty's OAuth endpoint may
   respond with a long `Retry-After`.
+- All OAuth clients used for this Guesty account have the same configured API
+  rights. Do not diagnose a Client-ID permission difference or recommend a
+  credential change as the root-cause fix unless the same internal reservation
+  and identical request produce concrete evidence of that difference; see
+  `KB-GUESTY-009`.
 - Reservation/listing managers must use bounded, persistent backoff. Never
   create a rapid retry loop after an outage, rate limit, or malformed response.
+- A failed remote Guesty webhook registration must recover automatically through
+  one owned, unload-cancellable task with bounded exponential backoff. Reuse the
+  idempotent ensure/migration flow; never add blind subscription creation.
 - Preserve API headroom for normal synchronization. Guesty Keycode and door-link
   migrations are deliberately write-budgeted rather than bulk-written at once.
+  Keep the reported second/minute/hour/day remainders separate. The persistent
+  two-Keycode-writes-per-30-seconds limit already protects the second window;
+  scheduling headroom is therefore derived from the longer windows so a
+  momentarily low second bucket cannot pause work until the next normal poll.
 
 ## HTTP and external API rules
 
@@ -171,13 +192,16 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Do not blindly retry a non-idempotent create. Webhook creation, Loxone user
   creation, and TTLock passcode creation need a persistent in-progress marker
   plus a remote lookup/recovery path after an ambiguous response.
+- TTLock change/delete calls require an explicit integer `errcode == 0`.
+  HTTP 200 or a JSON object without that field is not sufficient confirmation.
 - Validate all resource IDs before interpolating them into URL paths.
 - Restrict service base URLs to HTTPS. Reject credentials embedded in URLs.
   TTLock regions use an explicit host allowlist; do not accept an arbitrary API
   host.
 - Bound and redact error context. Preserve Guesty's `x-request-id` when
   available, but never log OAuth tokens, bearer door links, passwords, PINs,
-  guest names, or unbounded response bodies.
+  guest names, full reservation IDs, or unbounded response bodies. Use the
+  shared non-reversible reservation marker for operational logs.
 - For a Guesty support case, collect the redacted method/path/payload, response
   status, `x-request-id`, affected reservation ID, client ID confirmation, and
   timestamp. Never commit or paste the client secret or access token.
@@ -281,6 +305,18 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   operation/reason, safe endpoint label, HTTP status, bounded `x-request-id`,
   retry count/delay, and available rate-limit headroom. A successful write may
   log the marker and retry count, but never the PIN or full reservation ID.
+- Manual or agent-driven live Keycode tests use
+  `scripts.guesty_live_write_guard.GuestyLiveWriteGuard`; direct unguarded PUTs
+  to the live notes endpoint are forbidden. Arm the guard only after all
+  read-only preflight work has completed and the target and payload are frozen.
+  The first attempt always waits a full 30 seconds after arming. A test run may
+  consume at most two attempts, and a second attempt requires analysis of the
+  first result plus another full 30-second wait. Failed, timed-out, ambiguous,
+  and rejected PUTs all consume an attempt. The guard persists the last permit
+  before network I/O so separate processes cannot bypass the spacing rule.
+  Reuse one OAuth token for the whole test and never mint tokens in a retry
+  loop. This stricter diagnostic rule supplements, but does not change, the
+  integration runtime's own persistent write budget.
 - The privacy-filtered general cache never persists Keycodes. The private PIN
   store owns plaintext only while needed. Remove plaintext locally at
   cancellation/access end before attempting remote cleanup. Guesty's native
@@ -403,6 +439,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   explicit redaction/removal of Guesty credentials, webhook identifiers and
   secrets, access mappings/fields, Loxone servers, TTLock accounts/tokens,
   remote IDs, PINs, names, and confirmation codes.
+- Build diagnostic options from a reviewed safe allowlist. Never copy all
+  config-entry options and then try to subtract known secrets: newly introduced
+  options remain private until explicitly approved for diagnostics.
 
 ## Home Assistant lifecycle, entities, and configuration
 
@@ -426,7 +465,8 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   same Guesty account and preserve all options/mappings/private state.
 - Keep setup/unload cancellation-safe. Managers own their tasks, timers, and
   listeners and must cancel them on unload. No background task should survive a
-  failed setup or reload.
+  failed setup or reload. The exact occupancy transition callback is an owned
+  task too, not an untracked fire-and-forget coroutine.
 - The bundled brand asset is user-provided and should not be regenerated or
   replaced casually. Home Assistant integration branding and the HACS catalog
   icon have separate metadata/cache paths; do not assume one automatically
@@ -494,9 +534,9 @@ before a release is:
   --cov=custom_components/guesty \
   --cov-report=term-missing \
   --cov-fail-under=65
-.venv/bin/ruff check custom_components tests
-.venv/bin/ruff format --check custom_components tests
-.venv/bin/python -m compileall -q custom_components tests
+.venv/bin/ruff check custom_components scripts tests
+.venv/bin/ruff format --check custom_components scripts tests
+.venv/bin/python -m compileall -q custom_components scripts tests
 .venv/bin/bandit -q -r custom_components/guesty -ll
 .venv/bin/python -m pip_audit -r requirements-runtime.txt
 .venv/bin/python -m pip check

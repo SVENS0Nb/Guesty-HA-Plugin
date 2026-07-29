@@ -44,6 +44,7 @@ from .const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_SCAN_INTERVAL,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_ACCESS_EARLY_MINUTES,
@@ -52,6 +53,7 @@ from .const import (
     DEFAULT_GUESTY_CODE_SUFFIX,
     DEFAULT_LOXONE_CODE_PREFIX,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
+    DEFAULT_SCAN_INTERVAL,
     GUESTY_CODE_SUFFIX_MAX_LENGTH,
     LOXONE_ACCESS_CODE_LENGTH,
     LOXONE_RETRY_BASE_SECONDS,
@@ -65,13 +67,14 @@ from .loxone_api import (
     LoxoneAuthError,
     LoxoneCodeConflictError,
 )
-from .models import GuestyListing, GuestyReservation
+from .models import GuestyListing, GuestyReservation, reservation_log_marker
 
 _LOGGER = logging.getLogger(__name__)
 
 LOXONE_STORAGE_KEY = "guesty_loxone"
 _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
+_GUESTY_RATE_LIMIT_RESERVE = 4
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
@@ -368,6 +371,8 @@ class GuestyLoxoneManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._task = None
+        self._pending = False
         self._clients.clear()
         self._listeners.clear()
 
@@ -398,6 +403,10 @@ class GuestyLoxoneManager:
                     self._notify_listeners()
         except asyncio.CancelledError:
             raise
+        finally:
+            self._task = None
+            if self._pending and not self._unloaded:
+                self.async_schedule_reconcile()
 
     async def async_reconcile(self) -> None:
         """Reconcile cached Guesty reservations without any extra listing poll."""
@@ -771,17 +780,33 @@ class GuestyLoxoneManager:
             return global_capacity
         # Native Keycode synchronization normally needs only one minimal PUT.
         # Keep several requests available for reservation and webhook traffic.
-        capacity = max(1, remaining - 4)
+        capacity = max(0, remaining - _GUESTY_RATE_LIMIT_RESERVE)
         return min(global_capacity, capacity)
 
     def _next_guesty_write_at(self, now: datetime) -> datetime:
         """Return the earliest time another global write slot is available."""
         attempts = self._recent_guesty_write_attempts(now)
-        if len(attempts) < _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
-            return now
-        return attempts[-_GUESTY_KEYCODE_WRITE_BATCH_SIZE] + timedelta(
-            seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS
-        )
+        retry_at = now
+        if len(attempts) >= _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
+            retry_at = attempts[-_GUESTY_KEYCODE_WRITE_BATCH_SIZE] + timedelta(
+                seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS
+            )
+
+        remaining = getattr(self._client, "last_rate_limit_remaining", None)
+        if isinstance(remaining, int) and remaining <= _GUESTY_RATE_LIMIT_RESERVE:
+            raw_interval = self.entry.options.get(
+                CONF_SCAN_INTERVAL,
+                self.entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            )
+            try:
+                interval = max(
+                    _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS,
+                    int(raw_interval),
+                )
+            except (TypeError, ValueError):
+                interval = DEFAULT_SCAN_INTERVAL
+            retry_at = max(retry_at, now + timedelta(seconds=interval))
+        return retry_at
 
     async def _async_reserve_guesty_write_slots(
         self,
@@ -959,12 +984,15 @@ class GuestyLoxoneManager:
         # otherwise non-writable record while unrelated reservations remain
         # writable. Its failed request already consumed one write-budget slot;
         # do not let it starve the rest of the bounded batch.
-        return not isinstance(error, GuestyNotFoundError)
+        return not isinstance(
+            error,
+            (GuestyKeyCodeUnavailableError, GuestyNotFoundError),
+        )
 
     @staticmethod
     def _reservation_marker(reservation_id: str) -> str:
         """Return a non-reversible marker for safe operational logging."""
-        return hashlib.sha256(reservation_id.encode()).hexdigest()[:12]
+        return reservation_log_marker(reservation_id)
 
     async def _async_observe_keycode(
         self,

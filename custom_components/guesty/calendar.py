@@ -19,7 +19,12 @@ from .const import (
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
-from .models import GuestyListing, GuestyReservation, reservation_overlaps_range
+from .models import (
+    GuestyListing,
+    GuestyReservation,
+    reservation_log_marker,
+    reservation_overlaps_range,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -180,8 +185,8 @@ class GuestyReservationCalendar(
                     events.append(self._reservation_to_event(reservation, listing))
                 except (TypeError, ValueError):
                     _LOGGER.debug(
-                        "Skipping invalid reservation %s for calendar",
-                        reservation.id,
+                        "Skipping invalid reservation marker=%s for calendar",
+                        reservation_log_marker(reservation.id),
                     )
 
         events.sort(key=lambda event: event.start)

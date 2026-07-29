@@ -11,7 +11,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.guesty.api import GuestyAuthError
+from custom_components.guesty.api import GuestyAuthError, GuestyPermissionError
 from custom_components.guesty.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -21,6 +21,7 @@ from custom_components.guesty.const import (
     CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    SYNC_STATUS_DEGRADED,
 )
 from custom_components.guesty.coordinator import (
     GuestyDataUpdateCoordinator,
@@ -132,6 +133,25 @@ async def test_auth_failure_starts_reauthentication(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fresh_token_permission_failure_starts_reauthentication(hass) -> None:
+    """A permission denial that survives token refresh requires intervention."""
+    client = SimpleNamespace(
+        async_get_listings=AsyncMock(
+            side_effect=GuestyPermissionError("denied", status_code=403)
+        ),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await instance._async_fetch_data(full_reservation_sync=True)
+
+
+@pytest.mark.asyncio
 async def test_sparse_listing_webhook_uses_listing_only_api_fallback(
     hass, monkeypatch
 ) -> None:
@@ -156,6 +176,7 @@ async def test_sparse_listing_webhook_uses_listing_only_api_fallback(
 
     client.async_get_listings.assert_awaited_once_with()
     client.async_get_reservations.assert_not_awaited()
+    assert storage.async_save.await_args.args[0]["last_listing_sync"] is not None
 
 
 @pytest.mark.asyncio
@@ -279,6 +300,74 @@ async def test_shutdown_cancels_the_owned_webhook_worker(hass, monkeypatch) -> N
     assert task.cancelled()
     assert instance._webhook_batch_task is None
     assert not instance._pending_reservation_ids
+
+
+@pytest.mark.asyncio
+async def test_webhook_registration_recovers_with_bounded_backoff(
+    hass, monkeypatch
+) -> None:
+    """A transient remote registration failure recovers without a reload."""
+    instance = _coordinator(hass)
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _sleep(delay: float) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    register = AsyncMock(side_effect=[None, "remote-webhook"])
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.asyncio.sleep",
+        _sleep,
+    )
+    monkeypatch.setattr(
+        "custom_components.guesty.webhook.async_register_guesty_webhook",
+        register,
+    )
+
+    instance.async_start_webhook_registration_recovery("local-webhook")
+    task = instance._webhook_registration_task
+    assert task is not None
+    await task
+
+    assert delays == [300, 600]
+    assert register.await_count == 2
+    assert instance._webhook_active is True
+    assert instance._webhook_registration_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_webhook_registration_recovery(
+    hass, monkeypatch
+) -> None:
+    """Config-entry unload cannot leak the registration retry task."""
+    instance = _coordinator(hass)
+    sleep_started = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def _wait_forever(delay: float) -> None:
+        if delay == 300:
+            sleep_started.set()
+            await asyncio.Event().wait()
+            return
+        await real_sleep(delay)
+
+    register = AsyncMock()
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.asyncio.sleep",
+        _wait_forever,
+    )
+    monkeypatch.setattr(
+        "custom_components.guesty.webhook.async_register_guesty_webhook",
+        register,
+    )
+
+    instance.async_start_webhook_registration_recovery("local-webhook")
+    await sleep_started.wait()
+    await instance.async_shutdown()
+
+    register.assert_not_awaited()
+    assert instance._webhook_registration_task is None
 
 
 def test_v2_webhook_id_is_extracted() -> None:
@@ -633,6 +722,100 @@ async def test_targeted_reservation_does_not_advance_global_cursor(hass) -> None
 
     saved_cache = storage.async_save.await_args.args[0]
     assert saved_cache["last_incremental_sync"] == "2026-07-13T11:55:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_targeted_reservation_webhook_preserves_global_stale_state(
+    hass, monkeypatch
+) -> None:
+    """One fresh reservation cannot make an old account snapshot trustworthy."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow",
+        lambda: NOW,
+    )
+    stale_sync = (NOW - timedelta(hours=7)).isoformat()
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_sync": stale_sync,
+            "last_reservation_sync": stale_sync,
+            "last_error": "Guesty temporarily unavailable",
+        }
+    )
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(return_value=_reservation())
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    saved_cache = storage.async_save.await_args.args[0]
+    assert saved_cache["last_sync"] == stale_sync
+    assert saved_cache["last_reservation_sync"] == stale_sync
+    assert saved_cache["last_error"] == "Guesty temporarily unavailable"
+    assert instance.data.data_stale is True
+    assert instance.data.cache_age_minutes == 420.0
+    assert instance.data.sync_status == SYNC_STATUS_DEGRADED
+    assert instance.data.last_error == "Guesty temporarily unavailable"
+
+
+@pytest.mark.asyncio
+async def test_targeted_listing_webhook_does_not_refresh_reservation_age(
+    hass, monkeypatch
+) -> None:
+    """A listing payload cannot reset the age of cached reservations."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow",
+        lambda: NOW,
+    )
+    stale_sync = (NOW - timedelta(hours=7)).isoformat()
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "reservations": [_reservation().to_dict()],
+            "last_sync": stale_sync,
+            "last_listing_sync": stale_sync,
+            "last_reservation_sync": stale_sync,
+        }
+    )
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_listings=AsyncMock(),
+        async_get_reservations=AsyncMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, client, storage)
+
+    await instance._async_apply_listing_webhooks(
+        [
+            {
+                "event": "listing.updated",
+                "listing": {
+                    "_id": "listing-1",
+                    "title": "Updated Apartment",
+                    "timezone": "Europe/Berlin",
+                },
+            }
+        ]
+    )
+
+    saved_cache = storage.async_save.await_args.args[0]
+    assert saved_cache["last_sync"] == stale_sync
+    assert saved_cache["last_listing_sync"] == stale_sync
+    assert saved_cache["last_reservation_sync"] == stale_sync
+    assert instance.data.data_stale is True
+    assert instance.data.cache_age_minutes == 420.0
+    assert instance.data.sync_status == SYNC_STATUS_DEGRADED
 
 
 @pytest.mark.asyncio

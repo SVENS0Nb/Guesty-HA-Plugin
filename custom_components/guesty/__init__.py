@@ -143,6 +143,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
                 hass, entry, client, webhook_id
             )
             coordinator.set_webhook_active(guesty_webhook_id is not None)
+            if guesty_webhook_id is None:
+                coordinator.async_start_webhook_registration_recovery(webhook_id)
 
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -174,7 +176,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
         if access_registered:
             async_unregister_access_manager(hass, entry.entry_id)
         with suppress(Exception):
-            scheduler.async_unschedule()
+            await scheduler.async_shutdown()
         with suppress(Exception):
             await coordinator.async_shutdown()
         raise
@@ -182,7 +184,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bool:
     """Unload a config entry."""
-    entry.runtime_data.scheduler.async_unschedule()
+    await entry.runtime_data.scheduler.async_shutdown()
 
     webhook_id = entry.data.get(CONF_WEBHOOK_ID)
     if webhook_id:

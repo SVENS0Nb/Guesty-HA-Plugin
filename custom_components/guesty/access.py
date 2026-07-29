@@ -59,18 +59,20 @@ from .const import (
     CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
+    CONF_SCAN_INTERVAL,
     CONF_STALE_THRESHOLD_HOURS,
     DEFAULT_ACCESS_CUSTOM_FIELD,
     DEFAULT_ACCESS_EARLY_MINUTES,
     DEFAULT_ACCESS_FAVICON_URL,
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_ACCESS_LOGO_URL,
+    DEFAULT_SCAN_INTERVAL,
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
     EVENT_DOOR_ACCESS,
 )
 from .coordinator import GuestyDataUpdateCoordinator
-from .models import GuestyReservation
+from .models import GuestyReservation, reservation_log_marker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +81,7 @@ ACCESS_STORAGE_KEY = "guesty_access"
 ACCESS_MANAGERS = "access_managers"
 ACCESS_VIEW_REGISTERED = "access_view_registered"
 _ACCESS_FIELD_WRITE_BATCH_SIZE = 2
+_GUESTY_RATE_LIMIT_RESERVE = 4
 
 ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
     "de": {
@@ -455,7 +458,7 @@ class GuestyAccessManager:
                     self._last_deferred_count += 1
                     next_run = self._earlier(
                         next_run,
-                        now + timedelta(seconds=30),
+                        self._next_guesty_write_at(now),
                     )
                     continue
                 field_id, publish_error = await self._async_publish_access_link(
@@ -470,8 +473,9 @@ class GuestyAccessManager:
                 if publish_error is not None:
                     self._record_retry_failure(record, "publish", now)
                     _LOGGER.warning(
-                        "Could not publish a Guesty access link for reservation %s: %s",
-                        reservation_id,
+                        "Could not publish a Guesty access link "
+                        "for reservation marker=%s: %s",
+                        reservation_log_marker(reservation_id),
                         publish_error,
                     )
                     self._last_reconcile_result = "partial"
@@ -628,8 +632,23 @@ class GuestyAccessManager:
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
         if not isinstance(remaining, int):
             return _ACCESS_FIELD_WRITE_BATCH_SIZE
-        capacity = max(1, (remaining - 4) // 2)
+        capacity = max(0, (remaining - _GUESTY_RATE_LIMIT_RESERVE) // 2)
         return min(_ACCESS_FIELD_WRITE_BATCH_SIZE, capacity)
+
+    def _next_guesty_write_at(self, now: datetime) -> datetime:
+        """Avoid a rapid no-traffic loop while Guesty headroom is exhausted."""
+        remaining = getattr(self._client, "last_rate_limit_remaining", None)
+        if not isinstance(remaining, int) or remaining > _GUESTY_RATE_LIMIT_RESERVE:
+            return now + timedelta(seconds=30)
+        raw_interval = self.entry.options.get(
+            CONF_SCAN_INTERVAL,
+            self.entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+        )
+        try:
+            interval = max(30, int(raw_interval))
+        except (TypeError, ValueError):
+            interval = DEFAULT_SCAN_INTERVAL
+        return now + timedelta(seconds=interval)
 
     def _schedule_at(self, moment: datetime | None) -> None:
         """Schedule the next bounded publish or retry continuation."""
@@ -677,8 +696,9 @@ class GuestyAccessManager:
             )
         except (GuestyApiError, GuestyAuthError) as err:
             _LOGGER.warning(
-                "Could not clear an obsolete Guesty access field for reservation %s: %s",
-                reservation_id,
+                "Could not clear an obsolete Guesty access field "
+                "for reservation marker=%s: %s",
+                reservation_log_marker(reservation_id),
                 err,
             )
 
@@ -876,8 +896,8 @@ class GuestyAccessManager:
                         continue
                     _LOGGER.warning(
                         "Discarding an expired Guesty access cleanup tombstone for "
-                        "reservation %s; its old URL remains locally invalid",
-                        reservation_id,
+                        "reservation marker=%s; its old URL remains locally invalid",
+                        reservation_log_marker(reservation_id),
                     )
                     self._remove_record(reservation_id)
                     continue
@@ -890,8 +910,8 @@ class GuestyAccessManager:
                     self._record_retry_failure(record, "cleanup", now)
                     _LOGGER.warning(
                         "Access is revoked locally, but its Guesty field could not "
-                        "yet be cleared for reservation %s: %s",
-                        reservation_id,
+                        "yet be cleared for reservation marker=%s: %s",
+                        reservation_log_marker(reservation_id),
                         err,
                     )
                     if not retention_expired:

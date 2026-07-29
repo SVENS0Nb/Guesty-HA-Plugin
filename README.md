@@ -172,7 +172,8 @@ Endpunkt für Reservierungs-Custom-Fields.
 - Ein einzelner fehlgeschlagener Guesty-Poll sperrt einen bereits bestätigten
   Gastlink nicht sofort. Erst wenn der letzte bestätigte Reservierungsstand den
   konfigurierten Stale-Schwellenwert überschreitet, arbeitet der Türzugang
-  „fail closed“ und verweigert die Öffnung.
+  „fail closed“ und verweigert die Öffnung. Ein einzelner Listing- oder
+  Reservierungs-Webhook setzt dieses globale Alter nicht zurück.
 - Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
 - Neue Links werden pro Abgleich in kleinen Batches veröffentlicht. Dadurch
   bleibt auch bei vielen zukünftigen Reservierungen API-Kapazität für den
@@ -345,7 +346,8 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
    ein Neustart teilen sich dasselbe persistent gespeicherte Limit. Der nächste
    Teil folgt automatisch, sobald wieder ein Schreibplatz frei ist; dadurch
    bleibt Guestys API auch während der Migration für normale
-   Reservierungsabgleiche verfügbar.
+   Reservierungsabgleiche verfügbar. Die letzten vier von Guesty gemeldeten
+   API-Aufrufen bleiben vollständig für normale Synchronisierung reserviert.
 2. Der Sensor **Guesty-Code-Status** muss `Synchronisiert` anzeigen. Vor dem
    eingestellten Loxone-Vorlauf zeigt **Loxone-PIN-Status** zunächst `Geplant`.
 3. Innerhalb des Vorlaufs muss in Loxone ein zeitlich begrenzter Benutzer mit
@@ -643,6 +645,9 @@ flowchart TD
    möglichst wenige API-Aufrufe. Bestehende Abonnements ohne Signatur-Secret
    werden einmalig sicher neu erstellt; schlägt auch danach der Secret-Abruf
    fehl, bleibt der Polling-Fallback aktiv, ohne eine Neuanlage-Schleife.
+   Vorübergehende Registrierungsfehler werden mit begrenztem exponentiellem
+   Backoff automatisch erneut geprüft; ein Home-Assistant-Neustart ist dafür
+   nicht erforderlich.
 3. **Scheduler** – Belegung wechselt punktgenau bei Check-in/out
 4. **Täglicher Vollsync** – verhindert Drift im Cache
 

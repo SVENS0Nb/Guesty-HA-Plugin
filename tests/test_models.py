@@ -60,6 +60,17 @@ def _reservation(
     )
 
 
+def test_reservation_log_marker_is_stable_and_non_reversible() -> None:
+    """Operational logs never need the full upstream reservation identifier."""
+    reservation_id = "507f1f77bcf86cd799439011"
+
+    marker = models.reservation_log_marker(reservation_id)
+
+    assert marker == models.reservation_log_marker(reservation_id)
+    assert len(marker) == 12
+    assert reservation_id not in marker
+
+
 @pytest.mark.parametrize(
     ("moment", "expected"),
     [

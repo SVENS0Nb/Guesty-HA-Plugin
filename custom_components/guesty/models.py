@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+import hashlib
 import logging
 from typing import Any
 
@@ -18,6 +19,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def reservation_log_marker(reservation_id: str) -> str:
+    """Return a non-reversible reservation marker for logs and diagnostics."""
+    return hashlib.sha256(reservation_id.encode()).hexdigest()[:12]
 
 
 def _parse_time(value: str | None, default: str) -> time:
@@ -422,7 +428,10 @@ def calculate_listing_occupancy(
         try:
             check_in, check_out = reservation.stay_datetimes(listing)
         except (TypeError, ValueError):
-            _LOGGER.debug("Skipping invalid reservation %s", reservation.id)
+            _LOGGER.debug(
+                "Skipping invalid reservation marker=%s",
+                reservation_log_marker(reservation.id),
+            )
             continue
 
         if check_in <= now < check_out:
@@ -584,8 +593,8 @@ def merge_reservations(
         )
         if checkout_day is None:
             _LOGGER.debug(
-                "Dropping reservation %s with no valid checkout date",
-                reservation.id,
+                "Dropping reservation marker=%s with no valid checkout date",
+                reservation_log_marker(reservation.id),
             )
             continue
         if checkout_day >= window_start and (

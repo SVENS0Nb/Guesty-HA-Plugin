@@ -64,6 +64,7 @@ async def test_setup_refreshes_privacy_stripped_native_keycodes(
     scheduler = SimpleNamespace(
         async_schedule=MagicMock(),
         async_unschedule=MagicMock(),
+        async_shutdown=AsyncMock(),
     )
     access_manager = SimpleNamespace(
         async_setup=AsyncMock(),
@@ -112,7 +113,10 @@ async def test_setup_refreshes_privacy_stripped_native_keycodes(
 
 
 @pytest.mark.asyncio
-async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) -> None:
+@pytest.mark.parametrize("remote_webhook_id", ["remote-webhook", None])
+async def test_setup_reuses_and_then_removes_transient_token(
+    hass, monkeypatch, remote_webhook_id
+) -> None:
     """The validation token reaches runtime storage without remaining in entry data."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -133,10 +137,12 @@ async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) 
         async_recalculate_occupancy=AsyncMock(),
         async_add_listener=MagicMock(return_value=lambda: None),
         set_webhook_active=MagicMock(),
+        async_start_webhook_registration_recovery=MagicMock(),
     )
     scheduler = SimpleNamespace(
         async_schedule=MagicMock(),
         async_unschedule=MagicMock(),
+        async_shutdown=AsyncMock(),
     )
     from_hass = MagicMock(return_value=client)
 
@@ -156,7 +162,7 @@ async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) 
     monkeypatch.setattr(
         guesty_init,
         "async_register_guesty_webhook",
-        AsyncMock(return_value="remote-webhook"),
+        AsyncMock(return_value=remote_webhook_id),
     )
     monkeypatch.setattr(
         hass.config_entries,
@@ -177,7 +183,15 @@ async def test_setup_reuses_and_then_removes_transient_token(hass, monkeypatch) 
     assert entry.runtime_data.ttlock_manager is None
     assert CONF_ACCESS_TOKEN not in entry.data
     assert CONF_TOKEN_EXPIRES_AT not in entry.data
-    coordinator.set_webhook_active.assert_called_once_with(True)
+    coordinator.set_webhook_active.assert_called_once_with(
+        remote_webhook_id is not None
+    )
+    if remote_webhook_id is None:
+        coordinator.async_start_webhook_registration_recovery.assert_called_once_with(
+            "local-webhook"
+        )
+    else:
+        coordinator.async_start_webhook_registration_recovery.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -200,6 +214,7 @@ async def test_partial_setup_failure_rolls_back_started_resources(
     scheduler = SimpleNamespace(
         async_schedule=MagicMock(),
         async_unschedule=MagicMock(),
+        async_shutdown=AsyncMock(),
     )
     access_manager = SimpleNamespace(
         async_setup=AsyncMock(),
@@ -240,7 +255,7 @@ async def test_partial_setup_failure_rolls_back_started_resources(
     with pytest.raises(RuntimeError, match="broken setup"):
         await async_setup_entry(hass, entry)
 
-    scheduler.async_unschedule.assert_called_once_with()
+    scheduler.async_shutdown.assert_awaited_once_with()
     access_manager.async_unload.assert_awaited_once_with()
     loxone_manager.async_unload.assert_awaited_once_with()
     coordinator.async_shutdown.assert_awaited_once_with()
@@ -292,7 +307,10 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
         },
     )
     entry.add_to_hass(hass)
-    scheduler = SimpleNamespace(async_unschedule=MagicMock())
+    scheduler = SimpleNamespace(
+        async_unschedule=MagicMock(),
+        async_shutdown=AsyncMock(),
+    )
     coordinator = SimpleNamespace(async_shutdown=AsyncMock())
     entry.runtime_data = SimpleNamespace(scheduler=scheduler, coordinator=coordinator)
     unregister = MagicMock()
@@ -305,6 +323,6 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
 
     assert await async_unload_entry(hass, entry)
 
-    scheduler.async_unschedule.assert_called_once_with()
+    scheduler.async_shutdown.assert_awaited_once_with()
     coordinator.async_shutdown.assert_awaited_once_with()
     unregister.assert_called_once_with(hass, "local-webhook")

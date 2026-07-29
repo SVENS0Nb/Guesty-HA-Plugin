@@ -203,6 +203,8 @@ class GuestyTTLockManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._task = None
+        self._pending = False
         self._listeners.clear()
         self._fallback_clients.clear()
         self._client = None
@@ -235,6 +237,10 @@ class GuestyTTLockManager:
                     self._notify_listeners()
         except asyncio.CancelledError:
             raise
+        finally:
+            self._task = None
+            if self._pending and not self._unloaded:
+                self.async_schedule_reconcile()
 
     async def async_reconcile(self) -> None:
         """Reconcile TTLock from the existing Guesty reservation snapshot."""

@@ -12,7 +12,7 @@
       },
       "reauth_confirm": {
         "title": "Reconnect Guesty",
-        "description": "The Guesty credentials are no longer valid. Enter a new Client ID and Client Secret.",
+        "description": "Guesty rejected access again after the access token was refreshed automatically. Re-enter the Client ID and Client Secret, or replace them if they changed.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret"

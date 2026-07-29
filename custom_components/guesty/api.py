@@ -174,6 +174,7 @@ class GuestyApiClient:
         )
         self._token_lock = asyncio.Lock()
         self.last_rate_limit_remaining: int | None = None
+        self.rate_limit_remaining_by_window: dict[str, int] = {}
 
     @classmethod
     def from_hass(
@@ -996,8 +997,10 @@ class GuestyApiClient:
         retry_transport: bool = True,
     ) -> Any:
         """Perform an authenticated API request with retries."""
-        if not self._access_token:
-            await self._async_ensure_token()
+        # Some callers intentionally use this shared primitive directly.
+        # Always check the cached expiry before network I/O so those paths
+        # cannot send a token that is already due for refresh.
+        await self._async_ensure_token()
 
         last_error: GuestyApiError | None = None
         for attempt in range(API_MAX_RETRIES + 1):
@@ -1025,11 +1028,12 @@ class GuestyApiClient:
                 break
             delay = self._retry_delay(last_error, attempt)
             _LOGGER.debug(
-                "Retrying Guesty request %s %s in %.1fs (%s)",
+                "Retrying Guesty request method=%s endpoint=%s "
+                "delay_seconds=%.1f reason=%s",
                 method,
-                path,
+                self._endpoint_label(path),
                 delay,
-                last_error,
+                type(last_error).__name__,
             )
             await asyncio.sleep(delay)
 
@@ -1072,7 +1076,11 @@ class GuestyApiClient:
                 response.headers,
             )
 
-            if response.status == 401 and retry_auth:
+            # Guesty documents an expired access token as HTTP 403 on some
+            # Open API paths, while other paths can return HTTP 401. Refresh
+            # once for either response, then classify a repeated rejection
+            # using the fresh token below.
+            if response.status in {401, 403} and retry_auth:
                 await self._async_ensure_token(
                     force_refresh=True,
                     invalid_token=request_token,
@@ -1359,24 +1367,40 @@ class GuestyApiClient:
         )
 
     def _capture_rate_limit_headers(self, headers: Any) -> None:
-        """Store rate limit headers for diagnostics."""
-        values = []
-        for name in (
-            "RateLimit-Remaining",
-            "X-RateLimit-Remaining-Second",
-            "X-RateLimit-Remaining-Minute",
-            "X-RateLimit-Remaining-Hour",
-            "X-RateLimit-Remaining-Day",
+        """Store rate windows and derive usable long-window write headroom."""
+        values: dict[str, int] = {}
+        for window, name in (
+            ("generic", "RateLimit-Remaining"),
+            ("second", "X-RateLimit-Remaining-Second"),
+            ("minute", "X-RateLimit-Remaining-Minute"),
+            ("hour", "X-RateLimit-Remaining-Hour"),
+            ("day", "X-RateLimit-Remaining-Day"),
         ):
             remaining = headers.get(name)
             if remaining is None:
                 continue
             try:
-                values.append(int(remaining))
+                parsed = int(remaining)
             except (TypeError, ValueError):
-                pass
-        if values:
-            self.last_rate_limit_remaining = min(values)
+                continue
+            if parsed >= 0:
+                values[window] = parsed
+
+        # Headers describe the current response. Never retain stale values when
+        # a later response omits or corrupts them.
+        self.rate_limit_remaining_by_window = values
+        long_window_values = [
+            value
+            for window, value in values.items()
+            if window in {"minute", "hour", "day"}
+        ]
+        # The integration's persistent two-writes-per-30-seconds limit already
+        # stays far below Guesty's per-second allowance. Using that short-lived
+        # bucket for scheduling could otherwise pause writes until the next
+        # full reservation poll even though capacity returns one second later.
+        self.last_rate_limit_remaining = (
+            min(long_window_values) if long_window_values else None
+        )
 
     @staticmethod
     def _validate_resource_id(value: str, resource: str) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -194,6 +195,27 @@ def _manager(
     manager._client = remote
     monkeypatch.setattr(ttlock.dt_util, "utcnow", lambda: NOW)
     return manager, coordinator, pin_manager, remote
+
+
+@pytest.mark.asyncio
+async def test_unload_clears_pending_reconcile_task(hass, monkeypatch) -> None:
+    """Reload cannot leave a TTLock worker or pending follow-up pass behind."""
+    reservation = _reservation()
+    manager, _coordinator, _pin_manager, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    manager._pending = True
+    manager._task = hass.async_create_task(
+        asyncio.Event().wait(),
+        "test_guesty_ttlock_reconcile",
+    )
+    await asyncio.sleep(0)
+
+    await manager.async_unload()
+
+    assert manager._task is None
+    assert manager._pending is False
+    assert manager._unloaded is True
 
 
 @pytest.mark.asyncio

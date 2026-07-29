@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import logging
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
@@ -14,6 +15,7 @@ import pytest
 from custom_components.guesty.api import (
     GuestyApiClient,
     GuestyApiError,
+    GuestyAuthError,
     GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
@@ -105,6 +107,21 @@ async def test_permanent_api_error_is_not_retried(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_request_checks_cached_token_expiry(monkeypatch) -> None:
+    """Shared request paths cannot bypass the proactive token check."""
+    client = _client()
+    ensure_token = AsyncMock()
+    request_once = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(client, "_async_ensure_token", ensure_token)
+    monkeypatch.setattr(client, "_async_request_once", request_once)
+
+    assert await client._async_request("GET", "/listings") == {"ok": True}
+
+    ensure_token.assert_awaited_once_with()
+    request_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_retry_after_header_controls_delay(monkeypatch) -> None:
     """A server-provided retry delay is used by the retry loop."""
     client = _client()
@@ -118,6 +135,34 @@ async def test_retry_after_header_controls_delay(monkeypatch) -> None:
     await client._async_request("GET", "/listings")
 
     sleep.assert_awaited_once_with(7.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_debug_log_omits_resource_path_and_error_detail(
+    monkeypatch, caplog
+) -> None:
+    """Retry telemetry uses a safe endpoint label without IDs or response text."""
+    client = _client()
+    reservation_id = "507f1f77bcf86cd799439011"
+    private_detail = "private-response-detail"
+    request_once = AsyncMock(
+        side_effect=[
+            GuestyRetryableError(private_detail),
+            {"ok": True},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request_once", request_once)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    caplog.set_level(logging.DEBUG, logger="custom_components.guesty.api")
+
+    await client._async_request(
+        "PUT",
+        f"/reservations-v3/{reservation_id}/notes",
+    )
+
+    assert "endpoint=reservations-v3" in caplog.text
+    assert reservation_id not in caplog.text
+    assert private_detail not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -192,6 +237,242 @@ async def test_late_unauthorized_response_reuses_newer_token(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expired_status", [401, 403])
+async def test_expired_token_response_refreshes_once(
+    monkeypatch, expired_status: int
+) -> None:
+    """Guesty's 401 and documented 403 expiry responses refresh and retry once."""
+
+    class ResponseContext:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def response(status: int, body: bytes):
+        return SimpleNamespace(
+            status=status,
+            headers={},
+            content=SimpleNamespace(read=AsyncMock(side_effect=[body, b""])),
+            charset="utf-8",
+        )
+
+    old_response = response(
+        expired_status,
+        b'{"message":"You do not have permission"}',
+    )
+    fresh_response = response(200, b'{"ok":true}')
+    responses = [old_response, fresh_response]
+
+    class Session:
+        def __init__(self):
+            self.authorizations: list[str] = []
+
+        def request(self, *_args, **kwargs):
+            self.authorizations.append(kwargs["headers"]["Authorization"])
+            return ResponseContext(responses.pop(0))
+
+    session = Session()
+    client = GuestyApiClient(
+        session,
+        "client",
+        "secret",
+        "expired-token",
+        float("inf"),
+    )
+    refresh = AsyncMock()
+
+    async def refresh_token(*_args, **_kwargs) -> None:
+        client._access_token = "fresh-token"
+        client._token_expires_at = (dt_util.utcnow() + timedelta(hours=24)).timestamp()
+        await refresh()
+
+    monkeypatch.setattr(client, "_async_ensure_token", refresh_token)
+
+    assert await client._async_request_once("GET", "/listings") == {"ok": True}
+
+    refresh.assert_awaited_once()
+    assert session.authorizations == [
+        "Bearer expired-token",
+        "Bearer fresh-token",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_token_permission_denial_stops_after_one_refresh(
+    monkeypatch,
+) -> None:
+    """A genuine repeated 403 is not refreshed or retried in a loop."""
+
+    class ResponseContext:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def forbidden_response():
+        return SimpleNamespace(
+            status=403,
+            headers={"x-request-id": "permission-request"},
+            content=SimpleNamespace(
+                read=AsyncMock(side_effect=[b'{"message":"Permission denied"}', b""])
+            ),
+            charset="utf-8",
+        )
+
+    session = SimpleNamespace(
+        request=MagicMock(
+            side_effect=[
+                ResponseContext(forbidden_response()),
+                ResponseContext(forbidden_response()),
+            ]
+        )
+    )
+    client = GuestyApiClient(
+        session,
+        "client",
+        "secret",
+        "old-token",
+        float("inf"),
+    )
+    refresh = AsyncMock()
+
+    async def refresh_token(*_args, **_kwargs) -> None:
+        client._access_token = "fresh-token"
+        client._token_expires_at = (dt_util.utcnow() + timedelta(hours=24)).timestamp()
+        await refresh()
+
+    monkeypatch.setattr(client, "_async_ensure_token", refresh_token)
+
+    with pytest.raises(GuestyPermissionError, match="Permission denied"):
+        await client._async_request_once("GET", "/listings")
+
+    refresh.assert_awaited_once()
+    assert session.request.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expired_403_responses_share_one_token_refresh(
+    monkeypatch,
+) -> None:
+    """Concurrent Guesty 403 expiry responses spend only one token request."""
+    old_requests_ready = asyncio.Event()
+    old_request_count = 0
+    request_headers: list[str] = []
+
+    class ResponseContext:
+        def __init__(self, authorization: str):
+            self.authorization = authorization
+
+        async def __aenter__(self):
+            nonlocal old_request_count
+            request_headers.append(self.authorization)
+            if self.authorization == "Bearer old-token":
+                old_request_count += 1
+                if old_request_count == 2:
+                    old_requests_ready.set()
+                await old_requests_ready.wait()
+                status = 403
+                body = b'{"message":"You do not have permission"}'
+            else:
+                status = 200
+                body = b'{"ok":true}'
+            return SimpleNamespace(
+                status=status,
+                headers={},
+                content=SimpleNamespace(read=AsyncMock(side_effect=[body, b""])),
+                charset="utf-8",
+            )
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        @staticmethod
+        def request(*_args, **kwargs):
+            return ResponseContext(kwargs["headers"]["Authorization"])
+
+    client = GuestyApiClient(
+        Session(),
+        "client",
+        "secret",
+        "old-token",
+        float("inf"),
+    )
+    refresh_count = 0
+
+    async def refresh_once() -> None:
+        nonlocal refresh_count
+        refresh_count += 1
+        client._access_token = "fresh-token"
+        client._token_expires_at = (dt_util.utcnow() + timedelta(hours=24)).timestamp()
+
+    monkeypatch.setattr(client, "_async_refresh_token_once", refresh_once)
+
+    results = await asyncio.gather(
+        client._async_request_once("GET", "/listings"),
+        client._async_request_once("GET", "/reservations"),
+    )
+
+    assert results == [{"ok": True}, {"ok": True}]
+    assert refresh_count == 1
+    assert request_headers.count("Bearer old-token") == 2
+    assert request_headers.count("Bearer fresh-token") == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_401_after_refresh_is_auth_failure(monkeypatch) -> None:
+    """A fresh token rejected with 401 still starts reauthentication."""
+
+    class ResponseContext:
+        def __init__(self):
+            self.response = SimpleNamespace(
+                status=401,
+                headers={},
+                content=SimpleNamespace(
+                    read=AsyncMock(side_effect=[b'{"message":"Unauthorized"}', b""])
+                ),
+                charset="utf-8",
+            )
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, *_args):
+            return False
+
+    session = SimpleNamespace(
+        request=MagicMock(side_effect=[ResponseContext(), ResponseContext()])
+    )
+    client = GuestyApiClient(
+        session,
+        "client",
+        "secret",
+        "old-token",
+        float("inf"),
+    )
+
+    async def refresh_token(*_args, **_kwargs) -> None:
+        client._access_token = "fresh-token"
+        client._token_expires_at = (dt_util.utcnow() + timedelta(hours=24)).timestamp()
+
+    monkeypatch.setattr(client, "_async_ensure_token", refresh_token)
+
+    with pytest.raises(GuestyAuthError, match="Authentication failed"):
+        await client._async_request_once("GET", "/listings")
+
+    assert session.request.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_pagination_detects_repeated_pages(monkeypatch) -> None:
     """A broken API cursor cannot loop until memory is exhausted."""
     client = _client()
@@ -214,17 +495,46 @@ def test_resource_ids_are_restricted_to_safe_path_segments() -> None:
     assert not is_safe_resource_id(None)
 
 
-def test_rate_limit_headers_use_lowest_available_window() -> None:
-    """Diagnostics report the most constrained Guesty rate window."""
+def test_rate_limit_headers_keep_windows_but_ignore_second_for_write_headroom() -> None:
+    """A short second-bucket spike cannot pause the bounded write queue."""
     client = _client()
     client._capture_rate_limit_headers(
         {
+            "RateLimit-Remaining": "1",
             "X-RateLimit-Remaining-Second": "8",
             "X-RateLimit-Remaining-Minute": "42",
             "X-RateLimit-Remaining-Hour": "100",
         }
     )
-    assert client.last_rate_limit_remaining == 8
+    assert client.rate_limit_remaining_by_window == {
+        "generic": 1,
+        "second": 8,
+        "minute": 42,
+        "hour": 100,
+    }
+    assert client.last_rate_limit_remaining == 42
+
+
+def test_rate_limit_headers_do_not_retain_stale_values() -> None:
+    """A response without valid headers clears an obsolete scheduling block."""
+    client = _client()
+    client._capture_rate_limit_headers(
+        {
+            "X-RateLimit-Remaining-Minute": "4",
+            "X-RateLimit-Remaining-Hour": "100",
+        }
+    )
+    assert client.last_rate_limit_remaining == 4
+
+    client._capture_rate_limit_headers(
+        {
+            "X-RateLimit-Remaining-Second": "2",
+            "X-RateLimit-Remaining-Minute": "invalid",
+        }
+    )
+
+    assert client.rate_limit_remaining_by_window == {"second": 2}
+    assert client.last_rate_limit_remaining is None
 
 
 def test_paginated_results_ignore_non_objects() -> None:

@@ -47,6 +47,8 @@ from .const import (
     WEBHOOK_DEBOUNCE_SECONDS,
     WEBHOOK_EVENTS,
     WEBHOOK_INACTIVE_LISTING_SYNC_INTERVAL,
+    WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS,
+    WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS,
 )
 from .models import (
     GuestyListing,
@@ -115,6 +117,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._pending_reservation_ids: set[str] = set()
         self._pending_listing_payloads: dict[str, dict[str, Any]] = {}
         self._webhook_batch_task: asyncio.Task[None] | None = None
+        self._webhook_registration_task: asyncio.Task[None] | None = None
         self._unloaded = False
         super().__init__(
             hass,
@@ -156,6 +159,52 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 webhook_active=self._webhook_active,
             )
         )
+
+    def async_start_webhook_registration_recovery(self, webhook_id: str) -> None:
+        """Retry a failed remote webhook registration with bounded backoff."""
+        if self._unloaded or self._webhook_active:
+            return
+        task = self._webhook_registration_task
+        if task is not None and not task.done():
+            return
+        self._webhook_registration_task = self.hass.async_create_task(
+            self._async_recover_webhook_registration(webhook_id),
+            "guesty_recover_webhook_registration",
+        )
+
+    async def _async_recover_webhook_registration(self, webhook_id: str) -> None:
+        """Recover push delivery without requiring a config-entry reload."""
+        from .webhook import async_register_guesty_webhook
+
+        delay = WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS
+        try:
+            while not self._unloaded and not self._webhook_active:
+                await asyncio.sleep(delay)
+                if self._unloaded:
+                    return
+                try:
+                    guesty_webhook_id = await async_register_guesty_webhook(
+                        self.hass,
+                        self.config_entry,
+                        self._client,
+                        webhook_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # Defensive background-task boundary.
+                    _LOGGER.exception(
+                        "Unexpected Guesty webhook registration recovery failure"
+                    )
+                    guesty_webhook_id = None
+                if guesty_webhook_id is not None:
+                    self.set_webhook_active(True)
+                    return
+                delay = min(
+                    delay * 2,
+                    WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS,
+                )
+        finally:
+            self._webhook_registration_task = None
 
     async def _async_update_data(self) -> GuestyCoordinatorData:
         """Fetch data from Guesty and merge with cache."""
@@ -456,14 +505,18 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._unloaded = True
         self._pending_reservation_ids.clear()
         self._pending_listing_payloads.clear()
-        task = self._webhook_batch_task
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task in (
+            self._webhook_batch_task,
+            self._webhook_registration_task,
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._webhook_batch_task = None
+        self._webhook_registration_task = None
 
     @staticmethod
     def _reservation_id_from_webhook(payload: dict[str, Any]) -> str | None:
@@ -600,13 +653,15 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     "reservations": self._reservations_for_cache(reservations),
                     "access_token": self._client.access_token,
                     "token_expires_at": self._client.token_expires_at,
-                    "last_sync": now,
-                    "last_listing_sync": now,
-                    "last_error": None,
                 }
             )
+            if use_api_fallback:
+                # Only a complete listing read proves the account-wide listing
+                # snapshot fresh. A targeted payload must not postpone the
+                # periodic safety scan for unrelated missed events.
+                cache["last_listing_sync"] = now
             await self._storage.async_save(cache)
-            self._async_set_fresh_data_from_cache(cache)
+            self._async_set_targeted_data_from_cache(cache)
 
     async def _async_apply_reservation_webhook(self, reservation_id: str) -> None:
         """Refresh a single reservation from a webhook event."""
@@ -644,13 +699,9 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 days_past=days_past,
                 days_future=days_future,
             )
-            now = dt_util.utcnow().isoformat()
             cache["reservations"] = self._reservations_for_cache(reservations)
-            cache["last_sync"] = now
-            cache["last_reservation_sync"] = now
-            cache["last_error"] = None
             await self._storage.async_save(cache)
-            self._async_set_fresh_data_from_cache(
+            self._async_set_targeted_data_from_cache(
                 cache,
                 reservation_overrides={reservation.id: reservation},
             )
@@ -710,25 +761,21 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             ]
             if len(remaining) == len(reservations):
                 return
-            now = dt_util.utcnow().isoformat()
             cache.update(
                 {
                     "reservations": self._reservations_for_cache(remaining),
-                    "last_sync": now,
-                    "last_reservation_sync": now,
-                    "last_error": None,
                 }
             )
             await self._storage.async_save(cache)
-            self._async_set_fresh_data_from_cache(cache)
+            self._async_set_targeted_data_from_cache(cache)
 
-    def _async_set_fresh_data_from_cache(
+    def _async_set_targeted_data_from_cache(
         self,
         cache: dict[str, Any],
         *,
         reservation_overrides: dict[str, GuestyReservation] | None = None,
     ) -> None:
-        """Publish targeted data while keeping access codes out of disk storage."""
+        """Publish targeted data without resetting global reservation freshness."""
         listings = GuestyStorage.listings_from_cache(cache)
         reservations = GuestyStorage.reservations_from_cache(cache)
         if reservation_overrides:
@@ -737,20 +784,45 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             ]
         occupancy = self._calculate_occupancy(listings, reservations)
         self._fire_occupancy_events(occupancy)
+        last_sync = cache.get("last_sync")
+        cache_age_minutes = self._calculate_cache_age_minutes(last_sync)
+        stale_threshold_hours = self.config_entry.options.get(
+            CONF_STALE_THRESHOLD_HOURS,
+            DEFAULT_STALE_THRESHOLD_HOURS,
+        )
+        age_is_stale = cache_age_minutes is None or (
+            cache_age_minutes > stale_threshold_hours * 60
+        )
+        previous = self.data
+        last_error = (
+            previous.last_error
+            if previous is not None and previous.last_error is not None
+            else cache.get("last_error")
+        )
+        data_stale = bool(
+            age_is_stale or last_error or (previous is not None and previous.data_stale)
+        )
+        sync_status = (
+            previous.sync_status
+            if previous is not None
+            else (SYNC_STATUS_DEGRADED if data_stale else SYNC_STATUS_OK)
+        )
+        if data_stale and sync_status == SYNC_STATUS_OK:
+            sync_status = SYNC_STATUS_DEGRADED
         self.async_set_updated_data(
             GuestyCoordinatorData(
                 listings=listings,
                 reservations=reservations,
                 occupancy=occupancy,
-                last_sync=cache.get("last_sync"),
+                last_sync=last_sync,
                 last_listing_sync=cache.get("last_listing_sync"),
                 last_reservation_sync=cache.get("last_reservation_sync"),
                 last_full_reservation_sync=cache.get("last_full_reservation_sync"),
                 last_incremental_sync=cache.get("last_incremental_sync"),
-                data_stale=False,
-                cache_age_minutes=0.0,
-                sync_status=SYNC_STATUS_OK,
-                last_error=None,
+                data_stale=data_stale,
+                cache_age_minutes=cache_age_minutes,
+                sync_status=sync_status,
+                last_error=last_error,
                 webhook_active=self._webhook_active,
             )
         )

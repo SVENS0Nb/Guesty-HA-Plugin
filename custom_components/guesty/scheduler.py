@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -35,9 +36,13 @@ class GuestyTransitionScheduler:
         self._coordinator = coordinator
         self._on_transition = on_transition
         self._unsub: CALLBACK_TYPE | None = None
+        self._transition_task: asyncio.Task[None] | None = None
+        self._unloaded = False
 
     def async_schedule(self) -> None:
         """Schedule the next occupancy transition across all listings."""
+        if self._unloaded:
+            return
         self.async_unschedule()
         if not self._coordinator.data:
             return
@@ -65,7 +70,12 @@ class GuestyTransitionScheduler:
         @callback
         def _handle_transition(now: datetime) -> None:
             self._unsub = None
-            self.hass.async_create_task(self._on_transition())
+            if self._unloaded:
+                return
+            self._transition_task = self.hass.async_create_task(
+                self._async_run_transition(),
+                "guesty_occupancy_transition",
+            )
 
         self._unsub = async_track_point_in_time(
             self.hass,
@@ -78,3 +88,26 @@ class GuestyTransitionScheduler:
         if self._unsub:
             self._unsub()
             self._unsub = None
+
+    async def _async_run_transition(self) -> None:
+        """Run one tracked transition callback."""
+        try:
+            await self._on_transition()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # Defensive task boundary.
+            _LOGGER.exception("Unexpected Guesty occupancy transition failure")
+        finally:
+            self._transition_task = None
+
+    async def async_shutdown(self) -> None:
+        """Cancel the timer and any transition already in flight."""
+        self._unloaded = True
+        self.async_unschedule()
+        if self._transition_task and not self._transition_task.done():
+            self._transition_task.cancel()
+            try:
+                await self._transition_task
+            except asyncio.CancelledError:
+                pass
+        self._transition_task = None

@@ -23,6 +23,7 @@ from custom_components.guesty.const import (
     CONF_ACCESS_FAVICON_URL,
     CONF_ACCESS_LOGO_URL,
     CONF_ACCESS_LOCK_MAPPINGS,
+    CONF_SCAN_INTERVAL,
     DOMAIN,
 )
 from custom_components.guesty.models import GuestyListing, GuestyReservation
@@ -256,6 +257,35 @@ async def test_bulk_link_publication_has_a_bounded_write_budget(
     assert client.async_update_reservation_custom_field.await_count == 2
     assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
     assert manager._cancel_timer is not None
+
+
+@pytest.mark.asyncio
+async def test_link_publication_preserves_guesty_headroom_without_fast_loop(
+    hass, monkeypatch
+) -> None:
+    """Exhausted long-window capacity queues links until the normal poll."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record.update({"field_synced": False, "write_verified": False, "url_hash": None})
+    client.async_update_reservation_custom_field.reset_mock()
+    client.last_rate_limit_remaining = 4
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={
+            **manager.entry.options,
+            CONF_SCAN_INTERVAL: 120,
+        },
+    )
+    scheduled_at = MagicMock()
+    manager._schedule_at = scheduled_at
+    now = dt_util.utcnow()
+    monkeypatch.setattr(access.dt_util, "utcnow", lambda: now)
+
+    await manager.async_reconcile()
+
+    client.async_update_reservation_custom_field.assert_not_awaited()
+    assert scheduled_at.call_args_list[-1].args == (now + timedelta(seconds=120),)
+    assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
 
 
 @pytest.mark.asyncio

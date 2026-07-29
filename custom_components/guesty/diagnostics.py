@@ -10,21 +10,26 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_ACCESS_CUSTOM_FIELD,
+    CONF_ACCESS_EARLY_MINUTES,
     CONF_ACCESS_ENABLED,
+    CONF_ACCESS_LATE_MINUTES,
     CONF_ACCESS_LOCK_MAPPINGS,
+    CONF_EXPOSE_GUEST_DETAILS,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_ACCESS_TOKEN,
     CONF_GUESTY_WEBHOOK_ID,
     CONF_GUESTY_WEBHOOK_SECRET,
     CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID,
-    CONF_LOXONE_LISTING_MAPPINGS,
-    CONF_LOXONE_LISTINGS,
-    CONF_LOXONE_MINISERVERS,
-    CONF_TTLOCK_ACCOUNT,
-    CONF_TTLOCK_LISTING_MAPPINGS,
-    CONF_TTLOCK_LISTINGS,
-    CONF_TTLOCK_LOCKS,
+    CONF_LISTING_SYNC_INTERVAL,
+    CONF_LOXONE_ENABLED,
+    CONF_LOXONE_PROVISION_LEAD_MINUTES,
+    CONF_RESERVATION_DAYS_FUTURE,
+    CONF_RESERVATION_DAYS_PAST,
+    CONF_SCAN_INTERVAL,
+    CONF_STALE_THRESHOLD_HOURS,
+    CONF_TTLOCK_ENABLED,
+    CONF_TTLOCK_PROVISION_LEAD_MINUTES,
     CONF_WEBHOOK_ID,
 )
 from .data import GuestyConfigEntry
@@ -40,6 +45,24 @@ TO_REDACT = {
     CONF_ACCESS_TOKEN,
 }
 
+SAFE_OPTION_KEYS = frozenset(
+    {
+        CONF_SCAN_INTERVAL,
+        CONF_LISTING_SYNC_INTERVAL,
+        CONF_RESERVATION_DAYS_PAST,
+        CONF_RESERVATION_DAYS_FUTURE,
+        CONF_STALE_THRESHOLD_HOURS,
+        CONF_EXPOSE_GUEST_DETAILS,
+        CONF_ACCESS_ENABLED,
+        CONF_ACCESS_EARLY_MINUTES,
+        CONF_ACCESS_LATE_MINUTES,
+        CONF_LOXONE_ENABLED,
+        CONF_LOXONE_PROVISION_LEAD_MINUTES,
+        CONF_TTLOCK_ENABLED,
+        CONF_TTLOCK_PROVISION_LEAD_MINUTES,
+    }
+)
+
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: GuestyConfigEntry
@@ -48,16 +71,15 @@ async def async_get_config_entry_diagnostics(
     coordinator = entry.runtime_data.coordinator
     client = entry.runtime_data.client
     data = coordinator.data
-    options = dict(entry.options)
-    mappings = options.pop(CONF_ACCESS_LOCK_MAPPINGS, {})
-    options.pop(CONF_LOXONE_MINISERVERS, None)
-    options.pop(CONF_LOXONE_LISTING_MAPPINGS, None)
-    options.pop(CONF_LOXONE_LISTINGS, None)
-    options.pop(CONF_ACCESS_CUSTOM_FIELD, None)
-    options.pop(CONF_TTLOCK_ACCOUNT, None)
-    options.pop(CONF_TTLOCK_LISTING_MAPPINGS, None)
-    options.pop(CONF_TTLOCK_LISTINGS, None)
-    options.pop(CONF_TTLOCK_LOCKS, None)
+    # Diagnostics are deliberately opt-in rather than copy-and-redact. A newly
+    # added option is private until explicitly reviewed and added here.
+    options = {
+        key: entry.options[key] for key in SAFE_OPTION_KEYS if key in entry.options
+    }
+    mappings = entry.options.get(CONF_ACCESS_LOCK_MAPPINGS, {})
+    rate_limit_windows = getattr(client, "rate_limit_remaining_by_window", {})
+    if not isinstance(rate_limit_windows, dict):
+        rate_limit_windows = {}
     mapped_listings = len(mappings) if isinstance(mappings, dict) else 0
     mapped_locks = (
         sum(len(value) for value in mappings.values() if isinstance(value, list))
@@ -77,6 +99,7 @@ async def async_get_config_entry_diagnostics(
         "api": {
             "token_expires_at": client.token_expires_at,
             "rate_limit_remaining": client.last_rate_limit_remaining,
+            "rate_limit_remaining_by_window": dict(rate_limit_windows),
         },
     }
     access_manager = getattr(entry.runtime_data, "access_manager", None)

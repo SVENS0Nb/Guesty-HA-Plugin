@@ -40,15 +40,16 @@ jobs:
 
       - name: Run static checks
         run: |
-          ruff check custom_components tests
-          ruff format --check custom_components tests
-          python -m compileall -q custom_components tests
+          ruff check custom_components scripts tests
+          ruff format --check custom_components scripts tests
+          python -m compileall -q custom_components scripts tests
 
       - name: Run security checks
         if: matrix.python-version == '3.13'
         run: |
           bandit -q -r custom_components/guesty -ll
           python -m pip_audit -r requirements-runtime.txt
+          python -m pip check
 
       - name: Validate JSON files
         run: |

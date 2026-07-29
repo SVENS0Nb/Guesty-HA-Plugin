@@ -234,7 +234,7 @@ class TTLockApiClient:
     ) -> None:
         """Change code, name, and validity through a Wi-Fi gateway."""
         self._validate_code(code)
-        await self._async_api_request(
+        payload = await self._async_api_request(
             "/v3/keyboardPwd/change",
             {
                 "lockId": lock_id,
@@ -246,10 +246,11 @@ class TTLockApiClient:
                 "changeType": 2,
             },
         )
+        self._require_explicit_mutation_success(payload)
 
     async def async_delete_passcode(self, *, lock_id: int, password_id: int) -> None:
         """Delete one managed passcode through a Wi-Fi gateway."""
-        await self._async_api_request(
+        payload = await self._async_api_request(
             "/v3/keyboardPwd/delete",
             {
                 "lockId": lock_id,
@@ -257,6 +258,7 @@ class TTLockApiClient:
                 "deleteType": 2,
             },
         )
+        self._require_explicit_mutation_success(payload)
 
     async def _async_token_request(self, form: dict[str, Any]) -> dict[str, Any]:
         """Run an OAuth request with bounded transport retries."""
@@ -401,11 +403,27 @@ class TTLockApiClient:
     @staticmethod
     def _error_code(payload: dict[str, Any]) -> int:
         """Return a normalized TTLock error code."""
-        raw = payload.get("errcode", 0 if "keyboardPwdId" in payload else 0)
+        raw = payload.get("errcode", 0)
         try:
             return int(raw)
         except (TypeError, ValueError):
             return 1
+
+    @staticmethod
+    def _require_explicit_mutation_success(payload: dict[str, Any]) -> None:
+        """Reject ambiguous TTLock mutation responses without an error code."""
+        if "errcode" not in payload:
+            raise TTLockApiError(
+                "TTLock mutation response did not include an error code"
+            )
+        try:
+            code = int(payload["errcode"])
+        except (TypeError, ValueError) as err:
+            raise TTLockApiError(
+                "TTLock mutation response included an invalid error code"
+            ) from err
+        if code != 0:
+            raise TTLockApiError("TTLock mutation was not confirmed", code)
 
     @staticmethod
     def _error_text(payload: dict[str, Any]) -> str:

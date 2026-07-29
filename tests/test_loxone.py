@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
@@ -11,6 +12,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty import loxone
 from custom_components.guesty.api import (
+    GuestyApiClient,
     GuestyApiError,
     GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
@@ -35,6 +37,7 @@ from custom_components.guesty.const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_SCAN_INTERVAL,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
     CONF_TTLOCK_LOCK_IDS,
@@ -156,6 +159,30 @@ def _manager(
     )
     monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW)
     return manager, coordinator, guesty_client, remote
+
+
+@pytest.mark.asyncio
+async def test_unload_clears_pending_reconcile_task(hass, monkeypatch) -> None:
+    """Reload cannot leave a Loxone worker or pending follow-up pass behind."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    manager._pending = True
+    manager._task = hass.async_create_task(
+        asyncio.Event().wait(),
+        "test_guesty_loxone_reconcile",
+    )
+    await asyncio.sleep(0)
+
+    await manager.async_unload()
+
+    assert manager._task is None
+    assert manager._pending is False
+    assert manager._unloaded is True
 
 
 @pytest.mark.asyncio
@@ -744,6 +771,67 @@ async def test_sparse_private_code_migration_respects_guesty_write_budget(
     assert manager._records["reservation-4"]["last_error"] == "guesty_sync_queued"
 
 
+def test_guesty_write_budget_preserves_reported_api_headroom(hass, monkeypatch) -> None:
+    """No Keycode PUT is attempted inside the four-request API reserve."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    options = _options()
+    options[CONF_SCAN_INTERVAL] = 120
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        options=options,
+    )
+
+    guesty_client.last_rate_limit_remaining = 4
+    assert manager._guesty_write_budget(NOW) == 0
+    assert manager._next_guesty_write_at(NOW) == NOW + timedelta(seconds=120)
+
+    guesty_client.last_rate_limit_remaining = 5
+    assert manager._guesty_write_budget(NOW) == 1
+    assert manager._next_guesty_write_at(NOW) == NOW
+
+    GuestyApiClient._capture_rate_limit_headers(
+        guesty_client,
+        {
+            "X-RateLimit-Remaining-Second": "0",
+            "X-RateLimit-Remaining-Minute": "20",
+            "X-RateLimit-Remaining-Hour": "100",
+        },
+    )
+    assert manager._guesty_write_budget(NOW) == 2
+    assert manager._next_guesty_write_at(NOW) == NOW
+
+
+@pytest.mark.asyncio
+async def test_exhausted_guesty_headroom_queues_without_a_put(
+    hass, monkeypatch
+) -> None:
+    """A low response-header allowance never causes another Keycode request."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    options = _options()
+    options[CONF_SCAN_INTERVAL] = 120
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        options=options,
+    )
+    guesty_client.last_rate_limit_remaining = 4
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    assert manager._records[reservation.id]["last_error"] == "guesty_sync_queued"
+    manager._schedule_at.assert_called_once_with(NOW + timedelta(seconds=120))
+
+
 @pytest.mark.asyncio
 async def test_native_keycode_not_found_is_reported_without_fallback(
     hass, monkeypatch, caplog
@@ -832,10 +920,10 @@ async def test_native_keycode_not_found_retries_same_pin_after_sparse_response(
 
 
 @pytest.mark.asyncio
-async def test_keycode_endpoint_failure_stops_the_current_write_batch(
+async def test_keycode_endpoint_failure_does_not_stop_unrelated_write(
     hass, monkeypatch
 ) -> None:
-    """An application-wide v3 route outage avoids redundant failing traffic."""
+    """A reservation-specific v3 route failure does not starve another booking."""
     missing = _reservation(
         check_in=NOW + timedelta(days=1),
         check_out=NOW + timedelta(days=2),
@@ -855,13 +943,13 @@ async def test_keycode_endpoint_failure_stops_the_current_write_batch(
 
     await manager.async_reconcile()
 
-    assert guesty_client.async_update_reservation_key_code.await_count == 1
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
     assert manager._records[missing.id]["field_synced"] is False
     assert manager._records[missing.id]["last_error"] == (
         "guesty_keycode_endpoint_unavailable"
     )
-    assert manager._records[writable.id].get("field_synced") is not True
-    assert manager._records[writable.id]["last_error"] == "guesty_sync_queued"
+    assert manager._records[writable.id]["field_synced"] is True
+    assert manager._records[writable.id].get("last_error") is None
     assert manager.diagnostics()["native_keycode_failures"] == 1
 
 

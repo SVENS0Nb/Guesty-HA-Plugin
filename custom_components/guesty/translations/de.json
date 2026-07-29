@@ -12,7 +12,7 @@
       },
       "reauth_confirm": {
         "title": "Guesty erneut verbinden",
-        "description": "Die Guesty-Zugangsdaten sind nicht mehr gültig. Gib eine neue Client ID und ein neues Client Secret ein.",
+        "description": "Guesty hat den Zugriff auch nach der automatischen Erneuerung des Zugriffstokens abgelehnt. Gib Client ID und Client Secret erneut ein oder ersetze sie, falls sie geändert wurden.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret"

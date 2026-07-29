@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from custom_components.guesty.ttlock_api import (
+    TTLockApiError,
     TTLockApiClient,
     TTLockCodeConflictError,
     TTLockGatewayError,
@@ -174,6 +175,32 @@ async def test_add_change_and_delete_use_gateway_operations(monkeypatch) -> None
     assert request.await_args_list[0].kwargs["retry_transport"] is False
     assert request.await_args_list[1].args[1]["changeType"] == 2
     assert request.await_args_list[2].args[1]["deleteType"] == 2
+
+
+@pytest.mark.asyncio
+async def test_change_and_delete_require_explicit_ttlock_success(
+    monkeypatch,
+) -> None:
+    """Ambiguous HTTP-200 mutation responses are never accepted as success."""
+    client = _client()
+    request = AsyncMock(return_value={"description": "gateway result unavailable"})
+    monkeypatch.setattr(client, "_async_api_request", request)
+    start = datetime.fromisoformat("2026-07-20T13:00:00+00:00")
+    end = datetime.fromisoformat("2026-07-22T09:00:00+00:00")
+
+    with pytest.raises(TTLockApiError, match="did not include an error code"):
+        await client.async_change_passcode(
+            lock_id=42,
+            password_id=1234,
+            code="712345",
+            name="Guesty-ABC",
+            valid_from=start,
+            valid_until=end,
+        )
+    with pytest.raises(TTLockApiError, match="did not include an error code"):
+        await client.async_delete_passcode(lock_id=42, password_id=1234)
+
+    assert request.await_count == 2
 
 
 @pytest.mark.asyncio

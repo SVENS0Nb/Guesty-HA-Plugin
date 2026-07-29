@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -79,6 +80,47 @@ async def test_scheduler_tracks_and_runs_next_transition(hass, monkeypatch) -> N
     callback_holder["callback"](callback_holder["time"])
     await hass.async_block_till_done()
     on_transition.assert_awaited_once_with()
+    assert scheduler._unsub is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_transition_already_in_flight(hass, monkeypatch) -> None:
+    """Config-entry unload owns and cancels a transition callback task."""
+    callback_holder = {}
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    def track(hass, callback, point_in_time):
+        callback_holder["callback"] = callback
+        return MagicMock()
+
+    async def on_transition() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(scheduler_module.dt_util, "now", lambda: NOW)
+    monkeypatch.setattr(scheduler_module, "async_track_point_in_time", track)
+    coordinator = SimpleNamespace(
+        data=SimpleNamespace(
+            listings={"listing-1": _listing()},
+            reservations=[_reservation()],
+        )
+    )
+    scheduler = GuestyTransitionScheduler(hass, coordinator, on_transition)
+    scheduler.async_schedule()
+    callback_holder["callback"](NOW)
+    await started.wait()
+
+    await scheduler.async_shutdown()
+
+    assert cancelled.is_set()
+    assert scheduler._transition_task is None
+    assert scheduler._unsub is None
+    scheduler.async_schedule()
     assert scheduler._unsub is None
 
 
