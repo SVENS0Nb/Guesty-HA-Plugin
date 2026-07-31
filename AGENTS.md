@@ -445,6 +445,12 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   refresh tokens live in the private store and are bound to the matching region,
   client ID, and username. Blank secrets during reconfiguration mean “keep the
   existing secret”; never put stored secrets back into UI fields.
+- TTLock refresh tokens rotate. Repeated options-flow validation for an unchanged
+  account must use the live manager session and persist any rotated token before
+  returning. A successful password-based repair must update the live client and
+  private store and immediately release `authentication_failed` retry backoff.
+  Never let a temporary config-flow client consume the worker's refresh token
+  without handing the replacement back.
 - TTLock's OAuth protocol requires an MD5 digest of the app password. Keep the
   narrowly scoped `usedforsecurity=False` implementation and its explanation;
   do not replace it as a generic password-hashing choice or expose the password.

@@ -31,6 +31,7 @@ from custom_components.guesty.const import (
     CONF_TTLOCK_PROVISION_LEAD_MINUTES,
     CONF_TTLOCK_REFRESH_TOKEN,
     CONF_TTLOCK_REGION,
+    CONF_TTLOCK_TOKEN_EXPIRES_AT,
     CONF_TTLOCK_USERNAME,
     DOMAIN,
 )
@@ -1040,6 +1041,132 @@ def test_private_tokens_are_used_only_for_the_matching_ttlock_account(
 
     assert account[CONF_TTLOCK_ACCESS_TOKEN] == "current-private-access"
     assert account[CONF_TTLOCK_REFRESH_TOKEN] == "current-private-refresh"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_validation_persists_rotated_live_tokens(
+    hass, monkeypatch
+) -> None:
+    """Opening options cannot strand the worker on a consumed refresh token."""
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, _reservation()
+    )
+    remote.access_token = "old-access"
+    remote.refresh_token = "old-refresh"
+    remote.token_expires_at = "2026-07-20T12:01:00+00:00"
+
+    async def _list_locks():
+        remote.access_token = "new-access"
+        remote.refresh_token = "new-refresh"
+        remote.token_expires_at = "2026-10-20T12:00:00+00:00"
+        return [{"lockId": 101}]
+
+    remote.async_list_locks = AsyncMock(side_effect=_list_locks)
+    remote.token_snapshot = lambda: {
+        CONF_TTLOCK_ACCESS_TOKEN: remote.access_token,
+        CONF_TTLOCK_REFRESH_TOKEN: remote.refresh_token,
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: remote.token_expires_at,
+    }
+
+    locks, account = await manager.async_validate_reconfigure_account()
+
+    assert locks == [{"lockId": 101}]
+    assert account[CONF_TTLOCK_ACCESS_TOKEN] == "new-access"
+    assert account[CONF_TTLOCK_REFRESH_TOKEN] == "new-refresh"
+    assert manager._data["tokens"] == {
+        "account_key": manager._account_key(manager._account),
+        CONF_TTLOCK_ACCESS_TOKEN: "new-access",
+        CONF_TTLOCK_REFRESH_TOKEN: "new-refresh",
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-20T12:00:00+00:00",
+    }
+    manager._storage.async_save.assert_awaited_once_with(manager._data)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_validation_keeps_rotated_token_after_list_failure(
+    hass, monkeypatch
+) -> None:
+    """A post-refresh discovery failure cannot discard TTLock's new token."""
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, _reservation()
+    )
+    remote.access_token = "old-access"
+    remote.refresh_token = "old-refresh"
+    remote.token_expires_at = "2026-07-20T12:01:00+00:00"
+
+    async def _failed_list():
+        remote.access_token = "new-access"
+        remote.refresh_token = "new-refresh"
+        remote.token_expires_at = "2026-10-20T12:00:00+00:00"
+        raise TTLockApiError("lock discovery failed")
+
+    remote.async_list_locks = AsyncMock(side_effect=_failed_list)
+    remote.token_snapshot = lambda: {
+        CONF_TTLOCK_ACCESS_TOKEN: remote.access_token,
+        CONF_TTLOCK_REFRESH_TOKEN: remote.refresh_token,
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: remote.token_expires_at,
+    }
+
+    with pytest.raises(TTLockApiError, match="lock discovery failed"):
+        await manager.async_validate_reconfigure_account()
+
+    assert manager._data["tokens"][CONF_TTLOCK_ACCESS_TOKEN] == "new-access"
+    assert manager._data["tokens"][CONF_TTLOCK_REFRESH_TOKEN] == "new-refresh"
+    manager._storage.async_save.assert_awaited_once_with(manager._data)
+
+
+@pytest.mark.asyncio
+async def test_successful_reauthentication_requeues_auth_failures(
+    hass, monkeypatch
+) -> None:
+    """A repaired TTLock login immediately releases persisted auth backoff."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(hours=1),
+        check_out=NOW + timedelta(days=1),
+    )
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    manager.async_schedule_reconcile = MagicMock()
+    manager._records[reservation.id] = {
+        "listing_id": reservation.listing_id,
+        "access_start": reservation.check_in_utc,
+        "access_end": reservation.check_out_utc,
+        "locks": {},
+        "last_error": "authentication_failed",
+        "retry_count": 6,
+        "retry_at": (NOW + timedelta(hours=1)).isoformat(),
+    }
+    repaired = {
+        **manager._account,
+        CONF_TTLOCK_ACCESS_TOKEN: "repaired-access",
+        CONF_TTLOCK_REFRESH_TOKEN: "repaired-refresh",
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-20T12:00:00+00:00",
+    }
+
+    adopted = await manager.async_adopt_reconfigure_account(repaired)
+
+    assert adopted is True
+    assert remote.access_token == "repaired-access"
+    assert remote.refresh_token == "repaired-refresh"
+    record = manager._records[reservation.id]
+    assert "last_error" not in record
+    assert "retry_count" not in record
+    assert "retry_at" not in record
+    assert manager._data["tokens"][CONF_TTLOCK_REFRESH_TOKEN] == "repaired-refresh"
+    manager._storage.async_save.assert_awaited_once_with(manager._data)
+    manager.async_schedule_reconcile.assert_called_once_with()
+
+    await manager.async_reconcile()
+
+    assert remote.async_add_passcode.await_count == 2
+    assert all(
+        call.kwargs["code"] == "712345"
+        and call.kwargs["valid_from"] == NOW
+        and call.kwargs["valid_until"] == NOW + timedelta(days=1)
+        for call in remote.async_add_passcode.await_args_list
+    )
+    assert "last_error" not in manager._records[reservation.id]
 
 
 @pytest.mark.asyncio

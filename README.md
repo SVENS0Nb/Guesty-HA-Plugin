@@ -509,7 +509,10 @@ Ende   = Check-out + „Zugang nach Check-out"
 2. Ein TTLock-App-Konto verwenden, das die gewünschten Schlösser verwaltet.
    Das App-Passwort wird beim Einrichten nur zum OAuth-Austausch verwendet und
    nicht gespeichert. Danach arbeitet die Integration mit Access- und
-   Refresh-Token.
+   Refresh-Token. Beim späteren Öffnen der Konfiguration bleibt das Passwortfeld
+   leer; die vorhandene Sitzung wird weiterverwendet. Nur wenn TTLock diese
+   Sitzung tatsächlich ablehnt, muss das App-Passwort einmal erneut eingegeben
+   werden.
 3. Sicherstellen, dass jedes gewünschte Schloss `keyboardPwdVersion=4` meldet
    und über ein erreichbares Gateway verfügt (`hasGateway=1`). Nur solche
    Schlösser werden in der Auswahl angezeigt.
@@ -559,6 +562,11 @@ ist dafür nicht erforderlich.
 - Transportfehler, Rate-Limits und Offline-Gateways verwenden ein persistentes,
   begrenztes exponentielles Backoff. Nach einer Netzwerkunterbrechung wird die
   Arbeit automatisch fortgesetzt; es gibt keine schnelle Wiederholungsschleife.
+- Bei einer erfolgreichen erneuten TTLock-Anmeldung werden rotierte OAuth-Tokens
+  sofort privat gespeichert und an den laufenden Abgleich übergeben. Wegen
+  `Authentifizierung fehlgeschlagen` wartende Reservierungen werden unmittelbar
+  erneut eingeplant; dafür ist weder eine neue PIN noch ein erneuter Check-in
+  erforderlich.
 - TTLock wird bei Bereitstellung, Änderung, Löschung und anschließend höchstens
   alle 30 Minuten zur Driftkontrolle abgefragt. Dabei werden Abfragen desselben
   Schlosses innerhalb eines Abgleichs zusammengefasst. So werden manuell

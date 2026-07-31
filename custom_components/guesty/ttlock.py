@@ -1253,6 +1253,73 @@ class GuestyTTLockManager:
             account.update(self._client.token_snapshot())
         return account
 
+    async def async_validate_reconfigure_account(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Validate the current account without forking its OAuth session.
+
+        TTLock rotates refresh tokens.  Reusing the live client here ensures a
+        refresh performed while the options flow lists locks is persisted and
+        remains visible to the running synchronization worker.
+        """
+        async with self._lock:
+            client = self._current_client()
+            try:
+                locks = await client.async_list_locks()
+            finally:
+                # A successful refresh can rotate the refresh token even when
+                # the following lock-list request fails. Never strand the
+                # worker on the consumed predecessor.
+                await self._persist_tokens()
+                await self._storage.async_save(self._data)
+            return locks, self.account_for_reconfigure()
+
+    async def async_adopt_reconfigure_account(self, account: Mapping[str, Any]) -> bool:
+        """Adopt a repaired OAuth session for the unchanged TTLock account."""
+        if self._account_key(account) != self._account_key(self._account):
+            return False
+        if str(account.get(CONF_TTLOCK_CLIENT_SECRET, "")) != str(
+            self._account.get(CONF_TTLOCK_CLIENT_SECRET, "")
+        ):
+            return False
+        tokens = {
+            key: str(account.get(key, ""))
+            for key in (
+                CONF_TTLOCK_ACCESS_TOKEN,
+                CONF_TTLOCK_REFRESH_TOKEN,
+                CONF_TTLOCK_TOKEN_EXPIRES_AT,
+            )
+        }
+        if (
+            not tokens[CONF_TTLOCK_ACCESS_TOKEN]
+            or not tokens[CONF_TTLOCK_REFRESH_TOKEN]
+        ):
+            return False
+
+        recovered = 0
+        async with self._lock:
+            tokens[_TOKEN_ACCOUNT_KEY] = self._account_key(self._account)
+            self._data["tokens"] = tokens
+            if self._client is not None:
+                self._client.access_token = tokens[CONF_TTLOCK_ACCESS_TOKEN]
+                self._client.refresh_token = tokens[CONF_TTLOCK_REFRESH_TOKEN]
+                self._client.token_expires_at = tokens[CONF_TTLOCK_TOKEN_EXPIRES_AT]
+            for record in self._records.values():
+                if record.get("last_error") != "authentication_failed":
+                    continue
+                self._clear_retry(record)
+                record.pop("last_error", None)
+                recovered += 1
+            await self._storage.async_save(self._data)
+
+        if recovered:
+            _LOGGER.warning(
+                "Rescheduled TTLock records after successful reauthentication count=%s",
+                recovered,
+            )
+            self.async_schedule_reconcile()
+        return True
+
     def _schedule_at(self, moment: datetime | None) -> None:
         """Schedule the next provisioning, retry, or checkout transition."""
         if self._cancel_timer is not None:

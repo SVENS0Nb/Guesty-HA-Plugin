@@ -1539,3 +1539,164 @@ async def test_ttlock_reconfigure_reuses_latest_private_refresh_token(
 
     assert rejected["step_id"] == "ttlock"
     assert rejected["errors"] == {"base": "ttlock_invalid_auth"}
+
+
+@pytest.mark.asyncio
+async def test_ttlock_reconfigure_blank_password_uses_live_oauth_session(
+    hass, monkeypatch
+) -> None:
+    """Repeated options visits reuse and persist the running TTLock session."""
+    listing = GuestyListing(
+        id="listing-1",
+        title="Apartment",
+        nickname=None,
+        default_check_in_time="15:00",
+        default_check_out_time="11:00",
+        timezone="Europe/Berlin",
+        active=True,
+    )
+    current_account = {
+        CONF_TTLOCK_REGION: "eu",
+        CONF_TTLOCK_CLIENT_ID: "tt-client",
+        CONF_TTLOCK_CLIENT_SECRET: "tt-secret",
+        CONF_TTLOCK_USERNAME: "owner@example.com",
+        CONF_TTLOCK_ACCESS_TOKEN: "current-access",
+        CONF_TTLOCK_REFRESH_TOKEN: "current-refresh",
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-01T00:00:00+00:00",
+    }
+    locks = [
+        {
+            "lockId": 101,
+            "lockAlias": "Front door",
+            "keyboardPwdVersion": 4,
+            "hasGateway": 1,
+        }
+    ]
+    manager = SimpleNamespace(
+        account_for_reconfigure=lambda: current_account,
+        async_validate_reconfigure_account=AsyncMock(
+            return_value=(locks, current_account)
+        ),
+        async_adopt_reconfigure_account=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={
+            CONF_SCAN_INTERVAL: 300,
+            CONF_TTLOCK_ENABLED: True,
+            CONF_TTLOCK_ACCOUNT: current_account,
+            CONF_TTLOCK_LISTING_MAPPINGS: {"listing-1": {CONF_TTLOCK_LOCK_IDS: [101]}},
+        },
+    )
+    entry.add_to_hass(hass)
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data=SimpleNamespace(listings={listing.id: listing})
+        ),
+        client=SimpleNamespace(
+            async_resolve_custom_field=AsyncMock(return_value="field-id")
+        ),
+        ttlock_manager=manager,
+    )
+    new_client = MagicMock(side_effect=AssertionError("forked TTLock session"))
+    monkeypatch.setattr(config_flow.TTLockApiClient, "from_hass", new_client)
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    ttlock_form = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_SCAN_INTERVAL: 300,
+            "listing_sync_interval": 86400,
+            "reservation_days_past": 30,
+            "reservation_days_future": 365,
+            "stale_threshold_hours": 6,
+            CONF_EXPOSE_GUEST_DETAILS: False,
+            CONF_ACCESS_ENABLED: False,
+            CONF_LOXONE_ENABLED: False,
+            CONF_TTLOCK_ENABLED: True,
+        },
+    )
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_CODE_PREFIX: "7",
+            CONF_ACCESS_EARLY_MINUTES: 0,
+            CONF_ACCESS_LATE_MINUTES: 0,
+            CONF_TTLOCK_PROVISION_LEAD_MINUTES: 360,
+            CONF_TTLOCK_REGION: "eu",
+            CONF_TTLOCK_CLIENT_ID: "tt-client",
+            CONF_TTLOCK_CLIENT_SECRET: "",
+            CONF_TTLOCK_USERNAME: "owner@example.com",
+            config_flow.CONF_TTLOCK_PASSWORD: "",
+            CONF_TTLOCK_LISTINGS: ["listing-1"],
+        },
+    )
+
+    assert ttlock_form["step_id"] == "ttlock"
+    assert result["step_id"] == "ttlock_listing"
+    manager.async_validate_reconfigure_account.assert_awaited_once_with()
+    manager.async_adopt_reconfigure_account.assert_not_awaited()
+    new_client.assert_not_called()
+
+    completed = await hass.config_entries.options.async_configure(
+        form["flow_id"], {CONF_TTLOCK_LOCK_IDS: ["101"]}
+    )
+    assert completed["type"] is FlowResultType.CREATE_ENTRY
+    assert completed["data"][CONF_TTLOCK_ACCOUNT][CONF_TTLOCK_REFRESH_TOKEN] == (
+        "current-refresh"
+    )
+
+    repaired_client = SimpleNamespace(
+        async_authenticate=AsyncMock(),
+        async_refresh_access_token=AsyncMock(),
+        async_list_locks=AsyncMock(return_value=locks),
+        token_snapshot=lambda: {
+            CONF_TTLOCK_ACCESS_TOKEN: "repaired-access",
+            CONF_TTLOCK_REFRESH_TOKEN: "repaired-refresh",
+            CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-11-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        config_flow.TTLockApiClient,
+        "from_hass",
+        lambda *args, **kwargs: repaired_client,
+    )
+    manager.async_adopt_reconfigure_account.reset_mock()
+    repair_flow = await hass.config_entries.options.async_init(entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        repair_flow["flow_id"],
+        {
+            CONF_SCAN_INTERVAL: 300,
+            "listing_sync_interval": 86400,
+            "reservation_days_past": 30,
+            "reservation_days_future": 365,
+            "stale_threshold_hours": 6,
+            CONF_EXPOSE_GUEST_DETAILS: False,
+            CONF_ACCESS_ENABLED: False,
+            CONF_LOXONE_ENABLED: False,
+            CONF_TTLOCK_ENABLED: True,
+        },
+    )
+    repaired_listing = await hass.config_entries.options.async_configure(
+        repair_flow["flow_id"],
+        {
+            CONF_LOXONE_CODE_PREFIX: "7",
+            CONF_ACCESS_EARLY_MINUTES: 0,
+            CONF_ACCESS_LATE_MINUTES: 0,
+            CONF_TTLOCK_PROVISION_LEAD_MINUTES: 360,
+            CONF_TTLOCK_REGION: "eu",
+            CONF_TTLOCK_CLIENT_ID: "tt-client",
+            CONF_TTLOCK_CLIENT_SECRET: "",
+            CONF_TTLOCK_USERNAME: "owner@example.com",
+            config_flow.CONF_TTLOCK_PASSWORD: "app-password",
+            CONF_TTLOCK_LISTINGS: ["listing-1"],
+        },
+    )
+
+    assert repaired_listing["step_id"] == "ttlock_listing"
+    repaired_client.async_authenticate.assert_awaited_once_with(
+        "owner@example.com", "app-password"
+    )
+    adopted_account = manager.async_adopt_reconfigure_account.await_args.args[0]
+    assert adopted_account[CONF_TTLOCK_REFRESH_TOKEN] == "repaired-refresh"

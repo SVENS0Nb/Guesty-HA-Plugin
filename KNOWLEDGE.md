@@ -852,10 +852,14 @@ waits for a manual Guesty edit.
 ### KB-TTLOCK-001 — TTLock reuses the shared PIN and is listing-scoped
 
 - Status: Validated
-- Last validated: 2026-07-29
+- Last validated: 2026-08-01
 - Evidence: `custom_components/guesty/ttlock.py`,
   `custom_components/guesty/ttlock_api.py`, `tests/test_ttlock.py`,
-  `tests/test_ttlock_api.py`
+  `tests/test_ttlock_api.py`,
+  `tests/test_config_flow.py::test_ttlock_reconfigure_blank_password_uses_live_oauth_session`,
+  `tests/test_ttlock.py::test_reconfigure_validation_persists_rotated_live_tokens`,
+  `tests/test_ttlock.py::test_reconfigure_validation_keeps_rotated_token_after_list_failure`,
+  `tests/test_ttlock.py::test_successful_reauthentication_requeues_auth_failures`
 
 TTLock is an independent optional delivery target, not another Guesty/PIN
 owner. A listing maps to one to six V4 locks with `keyboardPwdVersion=4` and an
@@ -870,6 +874,16 @@ The TTLock App password is used once for OAuth and not stored. Tokens are
 private and bound to region, client ID, and username. TTLock's mandated OAuth
 protocol uses an MD5 digest of that password with `usedforsecurity=False`; this
 is protocol compatibility, not a general password-hashing choice.
+
+TTLock issues a replacement refresh token whenever a session is refreshed.
+Therefore an options flow for an unchanged account must validate through the
+live manager client, then atomically persist the resulting token snapshot. A
+temporary options client must never consume the worker's refresh token and
+discard its replacement. When the stored session really is invalid, one
+password-based OAuth exchange is adopted into both the live client and private
+store immediately. All records paused with `authentication_failed` have their
+backoff cleared and are scheduled for immediate reconciliation; the Guesty PIN
+and confirmed access window remain unchanged.
 
 ### KB-TTLOCK-002 — Passcodes are independently recoverable per lock
 
@@ -1140,3 +1154,4 @@ tag points to the same commit and manifest version.
 | 2026-07-31 | Dual Guesty PIN mirror and offline-provider review | Added deterministic per-source baselines for native Keycode and configurable `{{door_code}}`, one-field adoption/restoration, fail-closed ambiguity handling, shared persistent write limits, exact confirmed offline windows for Loxone/TTLock, migration coverage, safe diagnostics, and UI documentation |
 | 2026-07-31 | Selectable Guesty PIN-source review | Added independent Keycode/custom-field switches, removed disabled sources from reads, writes, conflicts, retries, and readiness, retained safe re-enable baselines, and enforced at least one active source for configured PIN providers |
 | 2026-07-31 | Focused TTLock active-stay recovery review | Persisted a one-time per-lock start for retroactive delivery, preserved checkout and healthy legacy passcodes, covered partial multi-lock retry/restart stability, and requeued only matching old failures once |
+| 2026-08-01 | TTLock options-session and active-stay authentication diagnosis | Live status confirmed `authentication_failed`; changed unchanged-account validation to reuse and persist the live rotating OAuth session, made password repair immediately adopt tokens and release auth backoff, and added regression coverage for repeated blank-password configuration and current-stay recovery |

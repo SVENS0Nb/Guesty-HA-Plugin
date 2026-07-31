@@ -1338,38 +1338,84 @@ class GuestyOptionsFlow(OptionsFlow):
                 errors["base"] = "ttlock_invalid_auth"
             else:
                 try:
-                    client = TTLockApiClient.from_hass(
-                        self.hass,
-                        region=region,
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        username=username,
-                        access_token=(
-                            str(existing_account.get(CONF_TTLOCK_ACCESS_TOKEN, ""))
-                            if same_identity
-                            else ""
-                        ),
-                        refresh_token=(
-                            str(existing_account.get(CONF_TTLOCK_REFRESH_TOKEN, ""))
-                            if same_identity
-                            else ""
-                        ),
-                        token_expires_at=(
-                            str(existing_account.get(CONF_TTLOCK_TOKEN_EXPIRES_AT, ""))
-                            if same_identity
-                            else ""
-                        ),
+                    validated_account: dict[str, Any] | None = None
+                    validate_live = getattr(
+                        ttlock_manager,
+                        "async_validate_reconfigure_account",
+                        None,
                     )
-                    if password:
-                        await client.async_authenticate(username, password)
-                    elif not same_identity:
-                        raise TTLockAuthError("TTLock password is required")
-                    elif not credentials_unchanged:
-                        # Existing access tokens can make a mistyped replacement
-                        # secret appear valid. Force a refresh with the new
-                        # secret before it is saved.
-                        await client.async_refresh_access_token()
-                    locks = await client.async_list_locks()
+                    if (
+                        not password
+                        and credentials_unchanged
+                        and callable(validate_live)
+                    ):
+                        locks, validated_account = await validate_live()
+                        client = None
+                    else:
+                        client = TTLockApiClient.from_hass(
+                            self.hass,
+                            region=region,
+                            client_id=client_id,
+                            client_secret=client_secret,
+                            username=username,
+                            access_token=(
+                                str(existing_account.get(CONF_TTLOCK_ACCESS_TOKEN, ""))
+                                if same_identity
+                                else ""
+                            ),
+                            refresh_token=(
+                                str(existing_account.get(CONF_TTLOCK_REFRESH_TOKEN, ""))
+                                if same_identity
+                                else ""
+                            ),
+                            token_expires_at=(
+                                str(
+                                    existing_account.get(
+                                        CONF_TTLOCK_TOKEN_EXPIRES_AT, ""
+                                    )
+                                )
+                                if same_identity
+                                else ""
+                            ),
+                        )
+                        if password:
+                            await client.async_authenticate(username, password)
+                            validated_account = {
+                                CONF_TTLOCK_REGION: region,
+                                CONF_TTLOCK_CLIENT_ID: client_id,
+                                CONF_TTLOCK_CLIENT_SECRET: client_secret,
+                                CONF_TTLOCK_USERNAME: username,
+                                **client.token_snapshot(),
+                            }
+                            adopt_account = getattr(
+                                ttlock_manager,
+                                "async_adopt_reconfigure_account",
+                                None,
+                            )
+                            if credentials_unchanged and callable(adopt_account):
+                                # Password authentication may rotate the only
+                                # usable refresh token. Hand it to the live
+                                # worker before any later discovery failure.
+                                await adopt_account(validated_account)
+                        elif not same_identity:
+                            raise TTLockAuthError("TTLock password is required")
+                        elif not credentials_unchanged:
+                            # Existing access tokens can make a mistyped
+                            # replacement secret appear valid. Force a refresh
+                            # with the new secret before it is saved.
+                            await client.async_refresh_access_token()
+                        locks = await client.async_list_locks()
+                        validated_account = {
+                            CONF_TTLOCK_REGION: region,
+                            CONF_TTLOCK_CLIENT_ID: client_id,
+                            CONF_TTLOCK_CLIENT_SECRET: client_secret,
+                            CONF_TTLOCK_USERNAME: username,
+                            **client.token_snapshot(),
+                        }
+                    if not isinstance(validated_account, dict):
+                        raise TTLockApiError(
+                            "TTLock validation did not return an account snapshot"
+                        )
                 except TTLockAuthError:
                     errors["base"] = "ttlock_invalid_auth"
                 except (TTLockApiError, ValueError, KeyError):
@@ -1418,7 +1464,14 @@ class GuestyOptionsFlow(OptionsFlow):
                                 CONF_TTLOCK_CLIENT_ID: client_id,
                                 CONF_TTLOCK_CLIENT_SECRET: client_secret,
                                 CONF_TTLOCK_USERNAME: username,
-                                **client.token_snapshot(),
+                                **{
+                                    key: str(validated_account.get(key, ""))
+                                    for key in (
+                                        CONF_TTLOCK_ACCESS_TOKEN,
+                                        CONF_TTLOCK_REFRESH_TOKEN,
+                                        CONF_TTLOCK_TOKEN_EXPIRES_AT,
+                                    )
+                                },
                             }
                             self._pending_ttlock_locks = compatible
                             self._pending_ttlock_mappings = {}
