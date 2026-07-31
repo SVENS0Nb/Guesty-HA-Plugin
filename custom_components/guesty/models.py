@@ -238,10 +238,10 @@ class GuestyReservation:
             listing_default_check_out=listing.get("defaultCheckOutTime"),
             guest_name=guest.get("fullName"),
             last_updated_at=data.get("lastUpdatedAt"),
-            # Guesty's native reservation Keycode is the authoritative source
-            # for both Loxone and TTLock. Only a returned notes object proves
-            # that this optional projection was observed; an omitted object
-            # must not look like a manual deletion on a later poll.
+            # Native Keycode and the configured reservation custom field are
+            # reconciled as two mirrors. Only returned containers prove that a
+            # source was observed; omitted projections must never look like a
+            # manual deletion on a later sparse poll.
             key_code=(
                 str(notes["keyCode"]).strip()
                 if notes.get("keyCode") is not None

@@ -37,6 +37,10 @@ from custom_components.guesty.const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_PIN_CUSTOM_FIELD,
+    CONF_PIN_CUSTOM_ENABLED,
+    CONF_PIN_NATIVE_ENABLED,
+    CONF_PIN_OFFLINE_PROVISIONING,
     CONF_SCAN_INTERVAL,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
@@ -55,6 +59,7 @@ from custom_components.guesty.loxone_api import (
 from custom_components.guesty.models import GuestyListing, GuestyReservation
 
 NOW = datetime.fromisoformat("2026-07-14T12:00:00+00:00")
+PIN_FIELD_ID = "65fab102a5284d73c6206db0"
 
 
 def _listing() -> GuestyListing:
@@ -87,6 +92,9 @@ def _reservation(
             "guest": {"fullName": "Max Mustermann"},
             "lastUpdatedAt": "2026-07-14T11:59:00+00:00",
             "notes": {"keyCode": key_code} if key_code else {},
+            "customFields": (
+                [{"fieldId": PIN_FIELD_ID, "value": key_code}] if key_code else []
+            ),
         }
     )
     assert result is not None
@@ -140,6 +148,18 @@ def _manager(
         )
     )
     guesty_client = SimpleNamespace(
+        async_resolve_custom_field=AsyncMock(return_value=PIN_FIELD_ID),
+        async_get_reservation_custom_field=AsyncMock(
+            side_effect=lambda reservation_id, field_id: next(
+                (
+                    item.custom_fields.get(field_id)
+                    for item in coordinator.data.reservations
+                    if item.id == reservation_id
+                ),
+                None,
+            )
+        ),
+        async_update_reservation_custom_field=AsyncMock(),
         async_update_reservation_key_code=AsyncMock(),
     )
     manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
@@ -631,7 +651,7 @@ async def test_setup_preserves_current_persisted_native_backoff(
     assert "guesty_keycode_endpoint_unavailable:1" in caplog.text
     assert reservation.id not in caplog.text
     assert "712345" not in caplog.text
-    manager._storage.async_save.assert_not_awaited()
+    manager._storage.async_save.assert_awaited_once()
     manager.async_schedule_reconcile.assert_called_once_with()
 
 
@@ -833,10 +853,10 @@ async def test_exhausted_guesty_headroom_queues_without_a_put(
 
 
 @pytest.mark.asyncio
-async def test_native_keycode_not_found_is_reported_without_fallback(
+async def test_native_keycode_not_found_uses_custom_field_fallback(
     hass, monkeypatch, caplog
 ) -> None:
-    """A missing reservation logs safe context without a custom-field fallback."""
+    """A native 404 is visible while the custom mirror keeps the PIN usable."""
     reservation = _reservation(
         check_in=NOW + timedelta(days=10),
         check_out=NOW + timedelta(days=12),
@@ -855,9 +875,12 @@ async def test_native_keycode_not_found_is_reported_without_fallback(
     await manager.async_reconcile()
 
     record = manager._records[reservation.id]
-    assert record["field_synced"] is False
+    assert record["field_synced"] is True
+    assert record["native_synced"] is False
+    assert record["custom_synced"] is True
     assert record["last_error"] == "guesty_reservation_not_found"
     guesty_client.async_update_reservation_key_code.assert_awaited_once()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once()
     assert "operation=native_keycode_write" in caplog.text
     assert "reason=guesty_reservation_not_found" in caplog.text
     assert "endpoint=reservations-v3" in caplog.text
@@ -892,7 +915,9 @@ async def test_native_keycode_not_found_retries_same_pin_after_sparse_response(
 
     record = manager._records[reservation.id]
     generated = record["code"]
-    assert record["field_synced"] is False
+    assert record["field_synced"] is True
+    assert record["native_synced"] is False
+    assert record["custom_synced"] is True
     assert record["last_error"] == "guesty_reservation_not_found"
 
     # A coordinator update before the bounded retry time must not create a
@@ -913,17 +938,17 @@ async def test_native_keycode_not_found_retries_same_pin_after_sparse_response(
         reservation.id,
         generated,
     )
-    assert "Guesty reservation Keycode synchronized" in caplog.text
+    assert "Guesty reservation PIN mirror synchronized" in caplog.text
     assert "retry_count=1" in caplog.text
     assert generated not in caplog.text
     assert reservation.id not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_keycode_endpoint_failure_does_not_stop_unrelated_write(
+async def test_keycode_endpoint_failure_prioritizes_custom_fallback(
     hass, monkeypatch
 ) -> None:
-    """A reservation-specific v3 route failure does not starve another booking."""
+    """A native route failure uses the second slot for the safe custom mirror."""
     missing = _reservation(
         check_in=NOW + timedelta(days=1),
         check_out=NOW + timedelta(days=2),
@@ -943,13 +968,14 @@ async def test_keycode_endpoint_failure_does_not_stop_unrelated_write(
 
     await manager.async_reconcile()
 
-    assert guesty_client.async_update_reservation_key_code.await_count == 2
-    assert manager._records[missing.id]["field_synced"] is False
+    assert guesty_client.async_update_reservation_key_code.await_count == 1
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once()
+    assert manager._records[missing.id]["field_synced"] is True
     assert manager._records[missing.id]["last_error"] == (
         "guesty_keycode_endpoint_unavailable"
     )
-    assert manager._records[writable.id]["field_synced"] is True
-    assert manager._records[writable.id].get("last_error") is None
+    assert manager._records[writable.id]["field_synced"] is False
+    assert manager._records[writable.id]["last_error"] == "guesty_sync_queued"
     assert manager.diagnostics()["native_keycode_failures"] == 1
 
 
@@ -1165,6 +1191,506 @@ async def test_existing_guesty_keycode_is_adopted_without_rewrite(
         "access_end": (NOW + timedelta(days=12)).isoformat(),
     }
     guesty_client.async_update_reservation_key_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_custom_field_pin_is_adopted_and_fills_native(
+    hass, monkeypatch
+) -> None:
+    """A populated custom field is adopted without rotation and fills Keycode."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+    )
+    reservation.custom_fields[PIN_FIELD_ID] = "712345#"
+    options = _options()
+    options[CONF_GUESTY_CODE_SUFFIXES] = {"listing-1": "#"}
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["native_synced"] is True
+    assert record["custom_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id, "712345#"
+    )
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_native_pin_fills_custom_field_without_rotation(
+    hass, monkeypatch
+) -> None:
+    """An existing Keycode fills the empty configurable mirror exactly once."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345",
+    )
+    reservation.custom_fields.clear()
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["field_synced"] is True
+    assert record["native_synced"] is True
+    assert record["custom_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "712345",
+    )
+
+
+@pytest.mark.asyncio
+async def test_matching_dual_sources_need_no_guesty_write(hass, monkeypatch) -> None:
+    """Two matching populated sources are adopted without API write traffic."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    assert manager._records[reservation.id]["field_synced"] is True
+
+
+@pytest.mark.asyncio
+async def test_custom_only_mode_ignores_native_keycode_completely(
+    hass, monkeypatch
+) -> None:
+    """A disabled Keycode cannot cause reads, writes, or mirror conflicts."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    reservation.custom_fields[PIN_FIELD_ID] = "734567"
+    options = _options()
+    options[CONF_PIN_NATIVE_ENABLED] = False
+    options[CONF_PIN_CUSTOM_ENABLED] = True
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "734567"
+    assert record["field_synced"] is True
+    assert record["custom_synced"] is True
+    assert "conflict" not in record
+    snapshot = manager.listing_status_snapshot("listing-1")
+    assert snapshot["native_keycode_enabled"] is False
+    assert snapshot["native_keycode_synced"] is False
+    assert snapshot["custom_field_enabled"] is True
+    assert snapshot["custom_field_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_set_access_code.assert_awaited_once_with("user-uuid", "734567")
+
+
+@pytest.mark.asyncio
+async def test_native_only_mode_ignores_custom_field_completely(
+    hass, monkeypatch
+) -> None:
+    """A disabled custom field is neither resolved, read, written, nor compared."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    reservation.custom_fields[PIN_FIELD_ID] = "734567"
+    options = _options()
+    options[CONF_PIN_NATIVE_ENABLED] = True
+    options[CONF_PIN_CUSTOM_ENABLED] = False
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["field_synced"] is True
+    assert record["native_synced"] is True
+    assert "conflict" not in record
+    snapshot = manager.listing_status_snapshot("listing-1")
+    assert snapshot["native_keycode_enabled"] is True
+    assert snapshot["native_keycode_synced"] is True
+    assert snapshot["custom_field_enabled"] is False
+    assert snapshot["custom_field_synced"] is False
+    guesty_client.async_resolve_custom_field.assert_not_awaited()
+    guesty_client.async_get_reservation_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_set_access_code.assert_awaited_once_with("user-uuid", "712345")
+
+
+@pytest.mark.asyncio
+async def test_no_pin_source_fails_closed_at_runtime(hass, monkeypatch) -> None:
+    """Malformed legacy options cannot provision when every source is disabled."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    options = _options()
+    options[CONF_PIN_NATIVE_ENABLED] = False
+    options[CONF_PIN_CUSTOM_ENABLED] = False
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["field_synced"] is False
+    assert record["last_error"] == "pin_source_not_configured"
+    guesty_client.async_resolve_custom_field.assert_not_awaited()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_add_or_update_user.assert_not_awaited()
+
+
+def test_disabling_native_source_removes_its_readiness_but_keeps_baseline(
+    hass, monkeypatch
+) -> None:
+    """Offline delivery cannot rely on an excluded source during switchover."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    options = _options()
+    options[CONF_PIN_NATIVE_ENABLED] = False
+    options[CONF_PIN_CUSTOM_ENABLED] = True
+    manager, _coordinator, _guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+    manager._records[reservation.id] = {
+        "code": "712345",
+        "field_synced": True,
+        "native_synced": True,
+        "native_baseline_value": "712345",
+        "native_last_error": "guesty_keycode_endpoint_unavailable",
+        "guesty_native_retry_at": (NOW + timedelta(hours=1)).isoformat(),
+        "guesty_native_retry_count": 2,
+    }
+
+    assert manager._clear_disabled_pin_source_state() is True
+
+    record = manager._records[reservation.id]
+    assert record["field_synced"] is False
+    assert record["native_synced"] is True
+    assert record["native_baseline_value"] == "712345"
+    assert "native_last_error" not in record
+    assert "guesty_native_retry_at" not in record
+    assert "guesty_native_retry_count" not in record
+
+
+@pytest.mark.asyncio
+async def test_manual_custom_field_edit_updates_native_and_loxone(
+    hass, monkeypatch
+) -> None:
+    """A user edit in the configurable mirror becomes authoritative everywhere."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.custom_fields[PIN_FIELD_ID] = "734567"
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "734567"
+    assert record["native_baseline_value"] == "734567"
+    assert record["custom_baseline_value"] == "734567"
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id, "734567"
+    )
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    assert remote.async_set_access_code.await_args_list == [
+        call("user-uuid", "712345"),
+        call("user-uuid", "734567"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_native_edit_updates_custom_field_and_loxone(
+    hass, monkeypatch
+) -> None:
+    """A user edit in Keycode is propagated to the configurable mirror."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.key_code = "734567"
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "734567"
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "734567",
+    )
+    assert remote.async_set_access_code.await_args_list == [
+        call("user-uuid", "712345"),
+        call("user-uuid", "734567"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_secondary_propagation_cannot_revert_canonical_pin(
+    hass, monkeypatch
+) -> None:
+    """A stale mirror remains stale on retry instead of becoming authoritative."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    guesty_client.async_update_reservation_custom_field.side_effect = GuestyApiError(
+        "offline"
+    )
+
+    reservation.key_code = "734567"
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "734567"
+    assert record["native_synced"] is True
+    assert record["custom_synced"] is False
+
+    guesty_client.async_update_reservation_custom_field.side_effect = None
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(minutes=6),
+    )
+    await manager.async_reconcile()
+
+    assert record["code"] == "734567"
+    assert record["native_baseline_value"] == "734567"
+    assert record["custom_baseline_value"] == "734567"
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "734567",
+    )
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_different_manual_edits_fail_closed(
+    hass, monkeypatch
+) -> None:
+    """Conflicting simultaneous source edits never trigger a blind overwrite."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.key_code = "723456"
+    reservation.custom_fields[PIN_FIELD_ID] = "734567"
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["conflict"] is True
+    assert record["last_error"] == "guesty_pin_sources_changed"
+    assert record["field_synced"] is False
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_delete_user.assert_awaited_once_with("user-uuid")
+
+
+@pytest.mark.asyncio
+async def test_unexplained_initial_dual_source_mismatch_fails_closed(
+    hass, monkeypatch
+) -> None:
+    """Two different initial values are retained in Guesty for manual review."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    reservation.custom_fields[PIN_FIELD_ID] = "734567"
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["conflict"] is True
+    assert record["last_error"] == "guesty_pin_sources_mismatch"
+    assert record["field_synced"] is False
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_add_or_update_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_custom_field_reference_is_resolved_and_seeded(
+    hass, monkeypatch
+) -> None:
+    """Changing the configured field does not rotate the established PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345",
+    )
+    options = _options()
+    options[CONF_PIN_CUSTOM_FIELD] = "{{replacement_pin}}"
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+    manager._data["resolved_pin_field"] = {
+        "reference": "{{door_code}}",
+        "id": "65fab102a5284d73c6206db1",
+    }
+    replacement_field_id = "65fab102a5284d73c6206db2"
+    guesty_client.async_resolve_custom_field.return_value = replacement_field_id
+
+    await manager.async_reconcile()
+
+    guesty_client.async_resolve_custom_field.assert_awaited_once_with(
+        "{{replacement_pin}}"
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        replacement_field_id,
+        "712345",
+    )
+    assert manager._records[reservation.id]["code"] == "712345"
+
+
+@pytest.mark.asyncio
+async def test_missing_custom_field_resolution_uses_persistent_backoff(
+    hass, monkeypatch
+) -> None:
+    """A missing field cannot create a repeated account-definition read loop."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+    )
+    manager, _coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    guesty_client.async_resolve_custom_field.side_effect = GuestyNotFoundError(
+        "missing"
+    )
+
+    await manager.async_reconcile()
+    await manager.async_reconcile()
+
+    guesty_client.async_resolve_custom_field.assert_awaited_once()
+    guesty_client.async_update_reservation_key_code.assert_awaited_once()
+    record = manager._records[reservation.id]
+    assert record["native_synced"] is True
+    assert record["custom_synced"] is False
+    assert record["field_synced"] is True
+    assert manager._data["pin_field_resolve_retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_snapshot_provisions_exact_window_during_guesty_outage(
+    hass, monkeypatch
+) -> None:
+    """Offline mode uses only the last confirmed PIN and validity window."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=10),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, coordinator, _guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    remote.async_add_or_update_user.assert_not_awaited()
+    confirmed_end = manager._records[reservation.id]["access_end"]
+
+    reservation.check_out_utc = (NOW + timedelta(days=30)).isoformat()
+    coordinator.data.data_stale = True
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(hours=5),
+    )
+    await manager.async_reconcile()
+
+    remote.async_add_or_update_user.assert_awaited_once()
+    assert remote.async_add_or_update_user.await_args.kwargs["valid_until"] == (
+        datetime.fromisoformat(confirmed_end)
+    )
+    assert manager._records[reservation.id]["offline_snapshot_in_use"] is True
+
+
+@pytest.mark.asyncio
+async def test_offline_provisioning_can_be_disabled(hass, monkeypatch) -> None:
+    """Administrators can retain strict fail-closed behavior during outages."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=10),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    options = _options()
+    options[CONF_PIN_OFFLINE_PROVISIONING] = False
+    manager, coordinator, _guesty_client, remote = _manager(
+        hass, monkeypatch, reservation, options=options
+    )
+    await manager.async_reconcile()
+
+    coordinator.data.data_stale = True
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(hours=5),
+    )
+    await manager.async_reconcile()
+
+    remote.async_add_or_update_user.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1768,11 +2294,10 @@ async def test_loxone_collision_never_attempts_a_guesty_replacement_write(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("edited_value", ["", "not-six-digits"])
-async def test_empty_or_invalid_guesty_edit_revokes_without_replacement(
-    hass, monkeypatch, edited_value
+async def test_empty_guesty_mirror_is_restored_from_other_source(
+    hass, monkeypatch
 ) -> None:
-    """An invalid Guesty edit revokes access but cannot rotate a confirmed PIN."""
+    """Clearing one mirror restores it without revoking the confirmed PIN."""
     reservation = _reservation(
         check_in=NOW + timedelta(hours=5),
         check_out=NOW + timedelta(days=2),
@@ -1783,21 +2308,45 @@ async def test_empty_or_invalid_guesty_edit_revokes_without_replacement(
     await manager.async_reconcile()
     old_code = manager._records[reservation.id]["code"]
 
-    reservation.key_code = edited_value
+    reservation.key_code = ""
     reservation.key_code_observed = True
     await manager.async_reconcile()
 
     record = manager._records[reservation.id]
     assert record["code"] == old_code
     assert record["guesty_confirmed_code"] == old_code
+    remote.async_delete_user.assert_not_awaited()
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert record["field_synced"] is True
+    assert record.get("conflict") is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_guesty_edit_revokes_without_replacement(
+    hass, monkeypatch
+) -> None:
+    """An invalid manual value revokes access but cannot rotate the PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    old_code = manager._records[reservation.id]["code"]
+
+    reservation.key_code = "not-six-digits"
+    reservation.key_code_observed = True
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == old_code
     remote.async_delete_user.assert_awaited_once_with("user-uuid")
     assert guesty_client.async_update_reservation_key_code.await_count == 1
     assert record["field_synced"] is False
     assert record["conflict"] is True
-    assert record["last_error"] in {
-        "guesty_keycode_removed",
-        "invalid_existing_keycode",
-    }
+    assert record["last_error"] == "invalid_existing_keycode"
 
 
 @pytest.mark.asyncio

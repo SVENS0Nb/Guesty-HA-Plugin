@@ -23,11 +23,13 @@ from .const import (
     CONF_GUESTY_WEBHOOK_ID,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_NATIVE_ENABLED,
     CONF_TTLOCK_ACCOUNT,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
     CONF_TOKEN_EXPIRES_AT,
     CONF_WEBHOOK_ID,
+    DEFAULT_PIN_NATIVE_ENABLED,
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry, GuestyRuntimeData
@@ -78,6 +80,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
                 mapped_listing_ids.update(ttlock_mappings)
         if (
             mapped_listing_ids
+            and entry.options.get(
+                CONF_PIN_NATIVE_ENABLED,
+                DEFAULT_PIN_NATIVE_ENABLED,
+            )
             and coordinator.data is not None
             and any(
                 reservation.is_active_status()

@@ -43,6 +43,7 @@ from custom_components.guesty.ttlock import (
 from custom_components.guesty.ttlock_api import TTLockApiError, TTLockGatewayError
 
 NOW = datetime.fromisoformat("2026-07-20T12:00:00+00:00")
+PIN_FIELD_ID = "65fab102a5284d73c6206db0"
 
 
 def _listing() -> GuestyListing:
@@ -236,6 +237,57 @@ async def test_future_reservation_defers_ttlock_without_extra_guesty_poll(
 
 
 @pytest.mark.asyncio
+async def test_confirmed_ttlock_schedule_survives_guesty_outage_without_extension(
+    hass, monkeypatch
+) -> None:
+    """TTLock uses the private confirmed window, never changed stale API data."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=10),
+        check_out=NOW + timedelta(days=2),
+    )
+    confirmed_start = reservation.check_in_datetime(_listing())
+    confirmed_end = reservation.check_out_datetime(_listing())
+    pin_manager = SimpleNamespace(
+        reservation_access_window=lambda _item, _listing: (
+            confirmed_start,
+            confirmed_end,
+        ),
+        reservation_pin_snapshot=lambda _reservation_id: {
+            "code": "712345",
+            "field_synced": True,
+            "access_start": confirmed_start.isoformat(),
+            "access_end": confirmed_end.isoformat(),
+        },
+        offline_reservation_snapshots=lambda: [(reservation, _listing())],
+        async_rotate_external_conflict=AsyncMock(return_value=False),
+    )
+    manager, coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        pin_manager=pin_manager,
+    )
+    await manager.async_reconcile()
+    remote.async_add_passcode.assert_not_awaited()
+
+    reservation.check_out_utc = (NOW + timedelta(days=30)).isoformat()
+    coordinator.data.data_stale = True
+    monkeypatch.setattr(
+        ttlock.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(hours=5),
+    )
+    await manager.async_reconcile()
+
+    remote.async_add_passcode.assert_awaited()
+    assert all(
+        item.kwargs["valid_from"] == confirmed_start
+        and item.kwargs["valid_until"] == confirmed_end
+        for item in remote.async_add_passcode.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_malformed_reservation_does_not_block_valid_ttlock_delivery(
     hass, monkeypatch
 ) -> None:
@@ -314,6 +366,9 @@ async def test_guesty_confirmation_suffix_is_never_sent_to_ttlock(
         )
     )
     guesty_client = SimpleNamespace(
+        async_resolve_custom_field=AsyncMock(return_value=PIN_FIELD_ID),
+        async_get_reservation_custom_field=AsyncMock(return_value=None),
+        async_update_reservation_custom_field=AsyncMock(),
         async_update_reservation_key_code=AsyncMock(),
     )
     pin_manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)
@@ -369,6 +424,9 @@ async def test_existing_guesty_keycode_without_private_record_reaches_ttlock(
         )
     )
     guesty_client = SimpleNamespace(
+        async_resolve_custom_field=AsyncMock(return_value=PIN_FIELD_ID),
+        async_get_reservation_custom_field=AsyncMock(return_value=None),
+        async_update_reservation_custom_field=AsyncMock(),
         async_update_reservation_key_code=AsyncMock(),
     )
     pin_manager = GuestyLoxoneManager(hass, entry, guesty_client, coordinator)

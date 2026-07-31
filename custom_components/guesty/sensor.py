@@ -555,6 +555,18 @@ class _GuestyLoxoneStatusSensor(
             "field_synced": snapshot.get("field_synced", False),
             "loxone_user_created": snapshot.get("loxone_user_created", False),
         }
+        for key in (
+            "native_keycode_enabled",
+            "custom_field_enabled",
+            "native_keycode_synced",
+            "custom_field_synced",
+            "custom_field_configured",
+            "custom_field_resolved",
+            "offline_snapshot_available",
+        ):
+            value = snapshot.get(key)
+            if isinstance(value, bool):
+                attributes[key] = value
         for key in ("mapped_locks", "provisioned_locks"):
             value = snapshot.get(key)
             if isinstance(value, int):

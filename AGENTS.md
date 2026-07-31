@@ -83,9 +83,10 @@ primary responsibilities are:
 3. Optionally expose current guest details after an explicit privacy opt-in.
 4. Optionally publish a secure per-reservation web page that operates one to six
    Home Assistant `lock.*` entities.
-5. Optionally create one stable six-digit reservation PIN in Guesty's native
-   `notes.keyCode` field and deliver it shortly before the stay to Loxone,
-   TTLock, or both.
+5. Optionally create one stable six-digit reservation PIN, synchronize it with
+   one or both independently enabled Guesty sources—native `notes.keyCode` and
+   a configurable reservation custom field (default `{{door_code}}`)—and
+   deliver it shortly before the stay to Loxone, TTLock, or both.
 
 All optional access systems are configured through the Home Assistant UI and
 can be enabled only for selected listings. A listing without a mapping must not
@@ -167,6 +168,13 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   cached data immediately as degraded when available, and make every poll or
   restart before the deadline fail locally without another token request. With
   no cache, persist the cooldown before the fast setup retry is raised.
+- Reauthentication with unchanged Guesty credentials must reuse the private
+  cached Bearer token, expiration, and OAuth cooldown. A changed secret for the
+  same Client ID keeps that Client ID's cooldown but never reuses its old Bearer
+  token. Credential validation must prove access to account identity, listings,
+  and reservations before accepting the entry. A successful live coordinator
+  sync aborts a stale Home Assistant reauthentication flow; cached/degraded data
+  alone must never clear it.
 - All OAuth clients used for this Guesty account have the same configured API
   rights. Do not diagnose a Client-ID permission difference or recommend a
   credential change as the root-cause fix unless the same internal reservation
@@ -177,10 +185,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - A failed remote Guesty webhook registration must recover automatically through
   one owned, unload-cancellable task with bounded exponential backoff. Reuse the
   idempotent ensure/migration flow; never add blind subscription creation.
-- Preserve API headroom for normal synchronization. Guesty Keycode and door-link
+- Preserve API headroom for normal synchronization. Guesty PIN-mirror and door-link
   migrations are deliberately write-budgeted rather than bulk-written at once.
   Keep the reported second/minute/hour/day remainders separate. The persistent
-  two-Keycode-writes-per-30-seconds limit already protects the second window;
+  two-PIN-writes-per-30-seconds limit already protects the second window;
   scheduling headroom is therefore derived from the longer windows so a
   momentarily low second bucket cannot pause work until the next normal poll.
 
@@ -236,13 +244,34 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Keep the local transition scheduler so sensor occupancy changes exactly at
   check-in/check-out without waiting for the next API poll.
 
-## Guesty native Keycode: authoritative PIN lifecycle
+## Guesty dual-source PIN lifecycle
 
-- The only source and destination for reservation PINs is Guesty's native
-  Reservations v3 `notes.keyCode`. Old releases used a reservation custom field;
-  that behavior is obsolete and must not be reintroduced as a fallback.
-- The door-access URL is still stored in a separate configurable Guesty
-  reservation custom field. Never confuse the two data paths.
+- Every reservation PIN has two equal Guesty mirrors: native Reservations-v3
+  `notes.keyCode` and the configurable reservation custom field (default
+  `{{door_code}}`). Resolve the latter by safe ID, name, or `{{variable}}`.
+  The separate door-access URL custom field remains a different data path.
+  Operators may enable either mirror independently, but a configured PIN
+  provider requires at least one. A disabled mirror is excluded from reads,
+  writes, conflict selection, retries, and aggregate readiness; preserve its
+  private baseline so re-enabling can reconcile without rotating the PIN.
+  Preserve a legacy `loxone_custom_field` selection until the next successful
+  options save migrates it to `pin_custom_field`; never silently replace a
+  user's prior non-default field during an upgrade.
+- Persist a confirmed baseline independently for both PIN mirrors. If both are
+  empty, generate once. If exactly one is populated, adopt it and fill only the
+  empty mirror. If both match, do not write. If exactly one changes from its
+  confirmed baseline, that user edit becomes canonical and propagates to the
+  other mirror and providers. Emptying only one mirror restores it; it does not
+  delete a confirmed PIN.
+- If both mirrors change simultaneously to different values, or two populated
+  mirrors disagree without a private baseline that safely orders them, fail
+  closed and do not overwrite either field. Invalid and duplicate values are
+  also fail-closed. A confirmed PIN never rotates automatically.
+- Provider delivery may proceed when either Guesty mirror has confirmed the
+  canonical PIN. Track errors, retry timestamps, and synchronization state per
+  mirror so a failing native endpoint cannot block a healthy custom field (or
+  vice versa). A stale failed mirror must never become authoritative merely
+  because its propagation retry is pending.
 - Write the native field with
   `PUT /v1/reservations-v3/{reservationId}/notes` and the minimal payload
   `{"notes":{"keyCode":"..."}}`. Treat the write as successful only after exact
@@ -259,10 +288,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   PIN provider: changed reservations on incremental polls, one targeted batch
   after a single webhook, and all applicable reservations during the
   daily/startup full sync. Do not add a second poller.
-- Guesty's returned `notes.keyCode` is authoritative. A valid, unique manual
-  change must propagate to existing Loxone and TTLock objects. Once Guesty has
-  confirmed a PIN, the integration must never change its six digits
-  automatically; only a subsequently observed Guesty edit may replace it.
+  When native Keycode synchronization is disabled, skip this enrichment
+  entirely, including startup and webhook-triggered v3 Keycode reads.
+- Guesty's returned Keycode and configured custom field are reconciled through
+  their per-source baselines. A valid, unique manual change in either field
+  must propagate to the other field and existing Loxone/TTLock objects.
 - An omitted `notes` projection means “not observed,” not “the user deleted the
   Keycode.” Never rotate or overwrite a privately cached PIN solely because a
   sparse response omitted `notes`.
@@ -270,10 +300,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   Keycode publication. After bounded backoff, retry the exact stable private PIN
   for a failed initial write, source migration, or configured suffix change;
   never rotate merely because the projection is absent.
-- An explicitly empty, invalid, or duplicate observed Keycode is fail-closed.
-  Revoke existing remote delivery and expose a conflict, but never manufacture
-  a replacement after any PIN was confirmed. A new reservation whose observed
-  Keycode is initially empty may receive its first generated PIN.
+- An explicitly invalid or duplicate value is fail-closed. Two explicitly empty
+  mirrors after confirmation are also ambiguous and fail closed. One empty
+  mirror is repaired from the other confirmed source. A new reservation whose
+  two observed sources are initially empty may receive its first generated PIN.
 - Duplicate ownership is deterministic. The first healthy established
   reservation keeps remote delivery; later duplicates stay blocked until a
   user supplies a unique code in Guesty.
@@ -284,14 +314,16 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   as `#`, `*`, or `☑️`. Guesty receives, for example, `723456#`; Loxone and
   TTLock always receive only `723456`. Changing the suffix rewrites the Guesty
   display without rotating the numeric PIN.
-- Use one persistent global limit of at most two Guesty Keycode write attempts
+- Use one persistent global limit of at most two Guesty PIN-mirror write attempts
   in any 30-second window. Normal queue passes, reservation-specific retries,
   webhook-triggered passes, and restarts share this limit. Failed and ambiguous
-  PUTs consume a slot. Every attempted Keycode consumes exactly one slot.
+  PUTs consume a slot. Native and custom-field PUTs consume the same slots.
+  Prioritize giving new reservations one confirmed mirror before spending
+  capacity on redundancy backfill.
   Prioritize current and nearest stays. An application-wide failure of the
   dedicated notes route may stop the current batch so identical failures do not
   waste the second slot or Guesty's normal synchronization headroom.
-- Every native-Keycode path must consume that same write budget, including
+- Every PIN-mirror path must consume that same write budget, including
   sparse cached snapshots and one-time migrations from private stored PINs.
   Never bypass the queue merely because Guesty omitted the `notes` projection.
 - Deferring a due reservation-specific failure because the global limit is full
@@ -322,11 +354,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   Reuse one OAuth token for the whole test and never mint tokens in a retry
   loop. This stricter diagnostic rule supplements, but does not change, the
   integration runtime's own persistent write budget.
-- The privacy-filtered general cache never persists Keycodes. The private PIN
+- The privacy-filtered general cache never persists PIN fields. The private PIN
   store owns plaintext only while needed. Remove plaintext locally at
-  cancellation/access end before attempting remote cleanup. Guesty's native
-  Keycode remains as booking documentation.
-- Guesty Keycode, Loxone, and TTLock status sensors report delivery state,
+  cancellation/access end before attempting remote cleanup. Both Guesty fields
+  remain as booking documentation.
+- Guesty PIN, Loxone, and TTLock status sensors report delivery state,
   counts, times, and safe error reasons only. They never expose the PIN.
 
 ## Guest door-access web page
@@ -392,8 +424,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Persist a private connection snapshot only while required to clean a remote
   user after configuration changes. On cancellation, remove plaintext first
   and retain only a code-free cleanup tombstone if deletion fails.
-- Stale Guesty data must block creation and access extension, while the locally
-  stored end time must still trigger cleanup.
+- Stale Guesty data never permits code generation or access extension. With the
+  default offline option enabled, a provider may create/update access only from
+  a previously Guesty-confirmed private PIN snapshot and exactly its stored
+  start/end window. Strict offline mode disables even that grant. The stored
+  end time must trigger cleanup in both modes.
 
 ## TTLock invariants
 
@@ -423,8 +458,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   ownership checks. Before change/delete, verify that the remote passcode ID
   still has the expected marker. Never alter foreign or manually renamed codes.
 - Reconcile drift no more often than every 30 minutes and coalesce passcode
-  reads per lock. Stale Guesty data blocks creation/extension but not cleanup at
-  the stored end time.
+  reads per lock. During a Guesty outage, use only an enabled confirmed private
+  snapshot and its exact stored window; never derive a TTLock extension from a
+  stale reservation projection. Cleanup still runs at the stored end time.
 - Disabling, remapping, cancellation, or integration removal deletes only
   confirmed managed passcodes. After best-effort removal, do not orphan
   unreachable OAuth credentials in a store with no future retry owner.
@@ -468,6 +504,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   stored value. A changed identity requires fresh validation. Guesty credential
   reconfiguration must verify that the replacement credentials belong to the
   same Guesty account and preserve all options/mappings/private state.
+- A config-entry credential update has exactly one reload owner. For a loaded
+  entry the registered update listener performs the reload; for an entry that
+  is not loaded the config flow schedules it explicitly. Never combine the
+  listener with `async_update_reload_and_abort`, which can reload twice.
 - Keep setup/unload cancellation-safe. Managers own their tasks, timers, and
   listeners and must cancel them on unload. No background task should survive a
   failed setup or reload. The exact occupancy transition callback is an owned
@@ -482,15 +522,18 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Network and API outages are expected. Continue automatically after recovery
   with bounded backoff and the last safe snapshot; never require a manual reload
   for a normal transient outage.
-- New access must fail closed when source data is too stale, while previously
-  stored end times continue to revoke/clean up access.
+- Stale source data must never generate a PIN, infer a booking, or extend a
+  confirmed window. The optional offline path may use only a previously
+  confirmed PIN and exact stored interval; previously stored end times always
+  continue to revoke/clean up access.
 - Supported backup design is active/passive only. Run exactly one Home Assistant
   instance as the active writer. On deliberate failover, the new instance
-  adopts the stable native Guesty Keycode; it may overwrite the old door-link
-  custom field with its own link. Door-link continuity is less important than
-  PIN continuity.
-- Do not promise active/active behavior or use a new shared custom field to
-  coordinate writers. Parallel writers can create competing URLs, remote
+  adopts the stable value from the matching Guesty PIN mirrors and repairs an
+  empty mirror; it may overwrite the old door-link custom field with its own
+  link. Door-link continuity is less important than PIN continuity.
+- Do not promise active/active behavior or use a third shared custom field to
+  coordinate writers. The PIN mirrors are business data, not a writer lease.
+  Parallel writers can create competing URLs, remote
   objects, PIN conflicts, and unnecessary API traffic.
 
 ## Change and regression discipline

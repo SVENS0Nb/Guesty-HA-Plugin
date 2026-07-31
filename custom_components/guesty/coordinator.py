@@ -8,8 +8,8 @@ from datetime import timedelta
 import logging
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -27,6 +27,7 @@ from .const import (
     CONF_LISTING_SYNC_INTERVAL,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_NATIVE_ENABLED,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
     CONF_SCAN_INTERVAL,
@@ -35,6 +36,7 @@ from .const import (
     CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LISTING_SYNC_INTERVAL,
+    DEFAULT_PIN_NATIVE_ENABLED,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
     DEFAULT_SCAN_INTERVAL,
@@ -147,6 +149,27 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 "token_retry_at": getattr(self._client, "token_retry_at", None),
             }
         )
+
+    @callback
+    def _async_clear_recovered_reauthentication(self) -> None:
+        """Abort stale reauth flows only after a successful live API sync."""
+        try:
+            active_flows = list(
+                self.config_entry.async_get_active_flows(
+                    self.hass,
+                    {SOURCE_REAUTH},
+                )
+            )
+            for flow in active_flows:
+                flow_id = flow.get("flow_id")
+                if isinstance(flow_id, str):
+                    self.hass.config_entries.flow.async_abort(flow_id)
+            if active_flows:
+                _LOGGER.info(
+                    "Guesty API recovered; cleared stale reauthentication repair"
+                )
+        except Exception:  # Defensive cleanup must never break a healthy sync.
+            _LOGGER.exception("Could not clear recovered Guesty reauthentication")
 
     def _update_data_webhook_flag(self) -> None:
         """Update webhook flag on current data."""
@@ -352,6 +375,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             self._update_cached_auth_state(cache)
             await self._storage.async_save(cache)
             api_success = True
+            self._async_clear_recovered_reauthentication()
 
         except (GuestyAuthError, GuestyPermissionError) as err:
             last_error = str(err)
@@ -720,6 +744,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         """Return listings whose enabled PIN provider needs native Keycodes."""
         listing_ids: set[str] = set()
         options = self.config_entry.options
+        if not options.get(CONF_PIN_NATIVE_ENABLED, DEFAULT_PIN_NATIVE_ENABLED):
+            return listing_ids
         if options.get(CONF_LOXONE_ENABLED, False):
             mappings = options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
             if isinstance(mappings, dict):

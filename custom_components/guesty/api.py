@@ -242,6 +242,14 @@ class GuestyApiClient:
                 "limit": "1",
             },
         )
+        await self._async_request(
+            "GET",
+            "/reservations",
+            params={
+                "fields": "_id",
+                "limit": "1",
+            },
+        )
         return hashlib.sha256(str(account_id).encode()).hexdigest()
 
     async def async_get_listings(self) -> list[GuestyListing]:
@@ -565,7 +573,7 @@ class GuestyApiClient:
 
         # Guesty's update response can acknowledge a request before the value is
         # visible on the reservation. Confirm it through the dedicated read
-        # endpoint before treating a guest access link as synchronized.
+        # endpoint before treating the reservation field as synchronized.
         await self._async_verify_reservation_custom_field(
             reservation_id,
             field_id,

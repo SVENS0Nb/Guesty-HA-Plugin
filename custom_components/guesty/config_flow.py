@@ -7,7 +7,12 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigEntryState,
+    ConfigFlow,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
@@ -35,6 +40,7 @@ from .loxone_api import (
     normalize_loxone_url,
 )
 from .ttlock_api import TTLockApiClient, TTLockApiError, TTLockAuthError
+from .storage import GuestyStorage
 from .const import (
     ACCESS_MAX_LOCKS,
     CONF_ACCESS_TOKEN,
@@ -52,6 +58,10 @@ from .const import (
     CONF_GUESTY_CODE_SUFFIX,
     CONF_GUESTY_CODE_SUFFIXES,
     CONF_LISTING_SYNC_INTERVAL,
+    CONF_PIN_CUSTOM_FIELD,
+    CONF_PIN_CUSTOM_ENABLED,
+    CONF_PIN_NATIVE_ENABLED,
+    CONF_PIN_OFFLINE_PROVISIONING,
     CONF_LOXONE_CODE_PREFIX,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_GROUP_UUIDS,
@@ -94,6 +104,10 @@ from .const import (
     DEFAULT_ACCESS_LATE_MINUTES,
     DEFAULT_ACCESS_LOGO_URL,
     DEFAULT_LISTING_SYNC_INTERVAL,
+    DEFAULT_PIN_CUSTOM_FIELD,
+    DEFAULT_PIN_CUSTOM_ENABLED,
+    DEFAULT_PIN_NATIVE_ENABLED,
+    DEFAULT_PIN_OFFLINE_PROVISIONING,
     DEFAULT_LOXONE_CODE_PREFIX,
     DEFAULT_LOXONE_ENABLED,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
@@ -106,6 +120,7 @@ from .const import (
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
     GUESTY_CODE_SUFFIX_MAX_LENGTH,
+    LEGACY_CONF_LOXONE_CUSTOM_FIELD,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
     TTLOCK_API_BASE_URLS,
@@ -133,6 +148,14 @@ def _guesty_code_suffix(value: Any) -> str:
             "Guesty code suffix cannot contain digits or invisible controls"
         )
     return suffix
+
+
+def _pin_custom_field_reference(value: Any) -> str:
+    """Validate and normalize the configurable reservation PIN field."""
+    reference = str(value or "").strip()
+    if not reference or len(reference) > 128:
+        raise vol.Invalid("Guesty PIN custom field must contain 1 to 128 characters")
+    return reference
 
 
 def _lock_entity_field(position: int) -> str:
@@ -206,6 +229,21 @@ OPTIONS_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_EXPOSE_GUEST_DETAILS, default=DEFAULT_EXPOSE_GUEST_DETAILS
         ): bool,
+        vol.Optional(
+            CONF_PIN_NATIVE_ENABLED,
+            default=DEFAULT_PIN_NATIVE_ENABLED,
+        ): bool,
+        vol.Optional(
+            CONF_PIN_CUSTOM_ENABLED,
+            default=DEFAULT_PIN_CUSTOM_ENABLED,
+        ): bool,
+        vol.Optional(
+            CONF_PIN_CUSTOM_FIELD, default=DEFAULT_PIN_CUSTOM_FIELD
+        ): _pin_custom_field_reference,
+        vol.Optional(
+            CONF_PIN_OFFLINE_PROVISIONING,
+            default=DEFAULT_PIN_OFFLINE_PROVISIONING,
+        ): bool,
         vol.Optional(CONF_ACCESS_ENABLED, default=DEFAULT_ACCESS_ENABLED): bool,
         vol.Optional(CONF_LOXONE_ENABLED, default=DEFAULT_LOXONE_ENABLED): bool,
         vol.Optional(CONF_TTLOCK_ENABLED, default=DEFAULT_TTLOCK_ENABLED): bool,
@@ -228,15 +266,65 @@ def _replacement_credentials_schema(client_id: str | None = None) -> vol.Schema:
     )
 
 
-async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
+async def validate_input(
+    hass: HomeAssistant,
+    data: dict[str, Any],
+    *,
+    existing_entry: ConfigEntry | None = None,
+) -> dict[str, Any]:
     """Validate the user input and return info for the config entry."""
     client_id = data[CONF_CLIENT_ID].strip()
     client_secret = data[CONF_CLIENT_SECRET].strip()
     if not client_id or not client_secret:
         raise GuestyAuthError("Client ID and Client Secret are required")
 
-    client = GuestyApiClient.from_hass(hass, client_id, client_secret)
-    account_id = await client.async_validate_credentials()
+    storage: GuestyStorage | None = None
+    cache: dict[str, Any] | None = None
+    same_client = False
+    same_credentials = False
+    if existing_entry is not None:
+        stored_client_id = str(existing_entry.data.get(CONF_CLIENT_ID, "")).strip()
+        stored_client_secret = str(
+            existing_entry.data.get(CONF_CLIENT_SECRET, "")
+        ).strip()
+        same_client = client_id == stored_client_id
+        same_credentials = same_client and client_secret == stored_client_secret
+
+    if same_client and existing_entry is not None:
+        storage = GuestyStorage(hass, existing_entry.entry_id)
+        cache = await storage.async_load()
+        if same_credentials:
+            access_token = existing_entry.data.get(CONF_ACCESS_TOKEN) or cache.get(
+                "access_token"
+            )
+            token_expires_at = existing_entry.data.get(
+                CONF_TOKEN_EXPIRES_AT
+            ) or cache.get("token_expires_at")
+        else:
+            access_token = None
+            token_expires_at = None
+        client = GuestyApiClient.from_hass(
+            hass,
+            client_id,
+            client_secret,
+            access_token,
+            token_expires_at,
+            cache.get("token_retry_at"),
+        )
+    else:
+        client = GuestyApiClient.from_hass(hass, client_id, client_secret)
+
+    validated = False
+    try:
+        account_id = await client.async_validate_credentials()
+        validated = True
+    finally:
+        if storage is not None and cache is not None:
+            cache["token_retry_at"] = client.token_retry_at
+            if same_credentials or validated:
+                cache["access_token"] = client.access_token
+                cache["token_expires_at"] = client.token_expires_at
+            await storage.async_save(cache)
     return {
         "title": "Guesty",
         "unique_id": account_id,
@@ -265,6 +353,28 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         if entry.unique_id not in {None, legacy_unique_id}:
             self._abort_if_unique_id_mismatch(reason="account_mismatch")
+
+    def _async_update_credentials_and_abort(
+        self,
+        entry: ConfigEntry,
+        info: dict[str, Any],
+        user_input: dict[str, Any],
+    ) -> FlowResult:
+        """Store validated credentials with exactly one reload owner."""
+        entry_was_loaded = entry.state is ConfigEntryState.LOADED
+        result = self.async_update_and_abort(
+            entry,
+            unique_id=info["unique_id"],
+            data_updates={
+                CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
+                CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
+                CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
+                CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
+            },
+        )
+        if not entry_was_loaded:
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
+        return result
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -310,6 +420,12 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_RESERVATION_DAYS_FUTURE: DEFAULT_RESERVATION_DAYS_FUTURE,
                         CONF_STALE_THRESHOLD_HOURS: DEFAULT_STALE_THRESHOLD_HOURS,
                         CONF_EXPOSE_GUEST_DETAILS: DEFAULT_EXPOSE_GUEST_DETAILS,
+                        CONF_PIN_CUSTOM_FIELD: DEFAULT_PIN_CUSTOM_FIELD,
+                        CONF_PIN_NATIVE_ENABLED: DEFAULT_PIN_NATIVE_ENABLED,
+                        CONF_PIN_CUSTOM_ENABLED: DEFAULT_PIN_CUSTOM_ENABLED,
+                        CONF_PIN_OFFLINE_PROVISIONING: (
+                            DEFAULT_PIN_OFFLINE_PROVISIONING
+                        ),
                         CONF_ACCESS_ENABLED: DEFAULT_ACCESS_ENABLED,
                         CONF_LOXONE_ENABLED: DEFAULT_LOXONE_ENABLED,
                         CONF_TTLOCK_ENABLED: DEFAULT_TTLOCK_ENABLED,
@@ -334,7 +450,11 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                info = await validate_input(self.hass, user_input)
+                info = await validate_input(
+                    self.hass,
+                    user_input,
+                    existing_entry=entry,
+                )
             except GuestyAuthError:
                 errors["base"] = "invalid_auth"
             except GuestyPermissionError:
@@ -349,15 +469,10 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                     entry,
                     info["unique_id"],
                 )
-                return self.async_update_reload_and_abort(
+                return self._async_update_credentials_and_abort(
                     entry,
-                    unique_id=info["unique_id"],
-                    data_updates={
-                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
-                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
-                        CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
-                        CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
-                    },
+                    info,
+                    user_input,
                 )
 
         return self.async_show_form(
@@ -374,7 +489,11 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                info = await validate_input(self.hass, user_input)
+                info = await validate_input(
+                    self.hass,
+                    user_input,
+                    existing_entry=entry,
+                )
             except GuestyAuthError:
                 errors["base"] = "invalid_auth"
             except GuestyPermissionError:
@@ -389,15 +508,10 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                     entry,
                     info["unique_id"],
                 )
-                return self.async_update_reload_and_abort(
+                return self._async_update_credentials_and_abort(
                     entry,
-                    unique_id=info["unique_id"],
-                    data_updates={
-                        CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
-                        CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
-                        CONF_ACCESS_TOKEN: info[CONF_ACCESS_TOKEN],
-                        CONF_TOKEN_EXPIRES_AT: info[CONF_TOKEN_EXPIRES_AT],
-                    },
+                    info,
+                    user_input,
                 )
 
         return self.async_show_form(
@@ -433,11 +547,33 @@ class GuestyOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage Guesty options."""
+        errors: dict[str, str] = {}
         if user_input is not None:
+            provider_enabled = bool(
+                user_input.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED)
+                or user_input.get(CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED)
+            )
+            pin_source_enabled = bool(
+                user_input.get(
+                    CONF_PIN_NATIVE_ENABLED,
+                    DEFAULT_PIN_NATIVE_ENABLED,
+                )
+                or user_input.get(
+                    CONF_PIN_CUSTOM_ENABLED,
+                    DEFAULT_PIN_CUSTOM_ENABLED,
+                )
+            )
+            if provider_enabled and not pin_source_enabled:
+                errors["base"] = "pin_source_required"
+
+        if user_input is not None and not errors:
             self._pending_options = {**self.config_entry.options, **user_input}
+            self._pending_options[CONF_PIN_CUSTOM_FIELD] = str(
+                user_input.get(CONF_PIN_CUSTOM_FIELD, DEFAULT_PIN_CUSTOM_FIELD)
+            ).strip()
             # v2.1 and older stored the door-code custom-field reference here.
-            # Native notes.keyCode is now the only PIN source and destination.
-            self._pending_options.pop("loxone_custom_field", None)
+            # The new shared PIN option supersedes that provider-specific key.
+            self._pending_options.pop(LEGACY_CONF_LOXONE_CUSTOM_FIELD, None)
             self._pending_code_suffixes = {}
             self._pending_options[CONF_GUESTY_CODE_SUFFIXES] = (
                 self._pending_code_suffixes
@@ -450,7 +586,10 @@ class GuestyOptionsFlow(OptionsFlow):
                 return await self.async_step_ttlock()
             return self.async_create_entry(title="", data=self._pending_options)
 
-        options = self.config_entry.options
+        options = {
+            **self.config_entry.options,
+            **(user_input or {}),
+        }
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
@@ -475,6 +614,25 @@ class GuestyOptionsFlow(OptionsFlow):
                     CONF_EXPOSE_GUEST_DETAILS: options.get(
                         CONF_EXPOSE_GUEST_DETAILS, DEFAULT_EXPOSE_GUEST_DETAILS
                     ),
+                    CONF_PIN_CUSTOM_FIELD: options.get(
+                        CONF_PIN_CUSTOM_FIELD,
+                        options.get(
+                            LEGACY_CONF_LOXONE_CUSTOM_FIELD,
+                            DEFAULT_PIN_CUSTOM_FIELD,
+                        ),
+                    ),
+                    CONF_PIN_NATIVE_ENABLED: options.get(
+                        CONF_PIN_NATIVE_ENABLED,
+                        DEFAULT_PIN_NATIVE_ENABLED,
+                    ),
+                    CONF_PIN_CUSTOM_ENABLED: options.get(
+                        CONF_PIN_CUSTOM_ENABLED,
+                        DEFAULT_PIN_CUSTOM_ENABLED,
+                    ),
+                    CONF_PIN_OFFLINE_PROVISIONING: options.get(
+                        CONF_PIN_OFFLINE_PROVISIONING,
+                        DEFAULT_PIN_OFFLINE_PROVISIONING,
+                    ),
                     CONF_ACCESS_ENABLED: options.get(
                         CONF_ACCESS_ENABLED, DEFAULT_ACCESS_ENABLED
                     ),
@@ -486,6 +644,7 @@ class GuestyOptionsFlow(OptionsFlow):
                     ),
                 },
             ),
+            errors=errors,
         )
 
     async def async_step_access(

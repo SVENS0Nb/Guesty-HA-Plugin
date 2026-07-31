@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from unittest.mock import AsyncMock
+import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigEntryState,
+)
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
 import pytest
@@ -14,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from voluptuous_serialize import convert
 
 from custom_components.guesty import config_flow
+from custom_components.guesty.api import GuestyApiClient
 from custom_components.guesty.const import (
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_CUSTOM_FIELD,
@@ -55,6 +61,10 @@ from custom_components.guesty.const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_PIN_CUSTOM_FIELD,
+    CONF_PIN_CUSTOM_ENABLED,
+    CONF_PIN_NATIVE_ENABLED,
+    CONF_PIN_OFFLINE_PROVISIONING,
     CONF_SCAN_INTERVAL,
     CONF_TOKEN_EXPIRES_AT,
     CONF_TTLOCK_ACCOUNT,
@@ -102,6 +112,13 @@ def test_guesty_code_suffix_rejects_digits_controls_and_long_values(suffix) -> N
         config_flow._guesty_code_suffix(suffix)
 
 
+@pytest.mark.parametrize("reference", ["", "   ", "x" * 129])
+def test_pin_custom_field_reference_rejects_blank_or_long_values(reference) -> None:
+    """The shared field reference is always usable after options validation."""
+    with pytest.raises(config_flow.vol.Invalid):
+        config_flow._pin_custom_field_reference(reference)
+
+
 @pytest.mark.asyncio
 async def test_user_flow_stores_first_token_for_setup(hass, monkeypatch) -> None:
     """Setup reuses the validation token instead of spending another token."""
@@ -126,6 +143,10 @@ async def test_user_flow_stores_first_token_for_setup(hass, monkeypatch) -> None
     assert result["data"][CONF_CLIENT_SECRET] == "secret"
     assert result["data"][CONF_ACCESS_TOKEN] == "validated-token"
     assert result["options"][CONF_EXPOSE_GUEST_DETAILS] is False
+    assert result["options"][CONF_PIN_CUSTOM_FIELD] == "{{door_code}}"
+    assert result["options"][CONF_PIN_NATIVE_ENABLED] is True
+    assert result["options"][CONF_PIN_CUSTOM_ENABLED] is True
+    assert result["options"][CONF_PIN_OFFLINE_PROVISIONING] is True
 
 
 @pytest.mark.asyncio
@@ -142,6 +163,12 @@ async def test_reauth_updates_credentials_and_token(hass, monkeypatch) -> None:
         config_flow,
         "validate_input",
         AsyncMock(return_value=VALIDATED),
+    )
+    schedule_reload = MagicMock()
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        schedule_reload,
     )
 
     form = await hass.config_entries.flow.async_init(
@@ -162,6 +189,277 @@ async def test_reauth_updates_credentials_and_token(hass, monkeypatch) -> None:
     assert entry.data[CONF_CLIENT_ID] == "new-client"
     assert entry.data[CONF_ACCESS_TOKEN] == "validated-token"
     assert entry.options == {"preserved": True}
+    schedule_reload.assert_called_once_with(entry.entry_id)
+
+
+@pytest.mark.asyncio
+async def test_loaded_reauth_uses_update_listener_without_second_reload(
+    hass, monkeypatch
+) -> None:
+    """A loaded entry has exactly one reload owner during reauthentication."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={CONF_CLIENT_ID: "old", CONF_CLIENT_SECRET: "old-secret"},
+        state=ConfigEntryState.LOADED,
+    )
+    entry.add_to_hass(hass)
+    listener = AsyncMock()
+    entry.add_update_listener(listener)
+    monkeypatch.setattr(
+        config_flow,
+        "validate_input",
+        AsyncMock(return_value=VALIDATED),
+    )
+    schedule_reload = MagicMock()
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        schedule_reload,
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {
+            CONF_CLIENT_ID: "old",
+            CONF_CLIENT_SECRET: "old-secret",
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    listener.assert_awaited_once()
+    schedule_reload.assert_not_called()
+    entry.mock_state(hass, ConfigEntryState.NOT_LOADED)
+
+
+@pytest.mark.asyncio
+async def test_reauth_reuses_private_token_for_unchanged_credentials(
+    hass, monkeypatch
+) -> None:
+    """A stale repair flow does not mint another token for unchanged credentials."""
+    expires_at = time.time() + 3600
+    retry_at = time.time() + 900
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        MagicMock(),
+    )
+    cache = {
+        "listings": {"preserved": {}},
+        "access_token": "cached-token",
+        "token_expires_at": expires_at,
+        "token_retry_at": retry_at,
+    }
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache.copy()),
+        async_save=AsyncMock(),
+    )
+    client = SimpleNamespace(
+        access_token="cached-token",
+        token_expires_at=expires_at,
+        token_retry_at=retry_at,
+        async_validate_credentials=AsyncMock(return_value=VALIDATED["unique_id"]),
+    )
+    from_hass = MagicMock(return_value=client)
+    monkeypatch.setattr(config_flow, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(config_flow.GuestyApiClient, "from_hass", from_hass)
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    from_hass.assert_called_once_with(
+        hass,
+        "client",
+        "secret",
+        "cached-token",
+        expires_at,
+        retry_at,
+    )
+    saved = storage.async_save.await_args.args[0]
+    assert saved["listings"] == {"preserved": {}}
+    assert saved["access_token"] == "cached-token"
+    assert saved["token_retry_at"] == retry_at
+
+
+@pytest.mark.asyncio
+async def test_reauth_honors_private_oauth_cooldown_without_network(
+    hass, monkeypatch
+) -> None:
+    """Submitting unchanged credentials cannot bypass Guesty's Retry-After."""
+    retry_at = time.time() + 900
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+    entry.add_to_hass(hass)
+    cache = {
+        "access_token": None,
+        "token_expires_at": None,
+        "token_retry_at": retry_at,
+    }
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache.copy()),
+        async_save=AsyncMock(),
+    )
+    client = GuestyApiClient(
+        object(),
+        "client",
+        "secret",
+        token_retry_at=retry_at,
+    )
+    refresh_once = AsyncMock()
+    monkeypatch.setattr(client, "_async_refresh_token_once", refresh_once)
+    monkeypatch.setattr(config_flow, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(
+        config_flow.GuestyApiClient,
+        "from_hass",
+        MagicMock(return_value=client),
+    )
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}
+    refresh_once.assert_not_awaited()
+    assert storage.async_save.await_args.args[0]["token_retry_at"] == pytest.approx(
+        retry_at
+    )
+
+
+@pytest.mark.asyncio
+async def test_changed_client_id_does_not_reuse_previous_private_auth(
+    hass, monkeypatch
+) -> None:
+    """Credentials for a different client are validated without the old token."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={CONF_CLIENT_ID: "old-client", CONF_CLIENT_SECRET: "old-secret"},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        MagicMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value={"access_token": "old-token"}),
+        async_save=AsyncMock(),
+    )
+    client = SimpleNamespace(
+        access_token="new-token",
+        token_expires_at=time.time() + 3600,
+        token_retry_at=None,
+        async_validate_credentials=AsyncMock(return_value=VALIDATED["unique_id"]),
+    )
+    from_hass = MagicMock(return_value=client)
+    monkeypatch.setattr(config_flow, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(config_flow.GuestyApiClient, "from_hass", from_hass)
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {CONF_CLIENT_ID: "new-client", CONF_CLIENT_SECRET: "new-secret"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    from_hass.assert_called_once_with(hass, "new-client", "new-secret")
+    storage.async_load.assert_not_awaited()
+    storage.async_save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_secret_keeps_client_cooldown_but_not_previous_token(
+    hass, monkeypatch
+) -> None:
+    """A rotated secret cannot evade its client ID cooldown or reuse its token."""
+    retry_at = time.time() + 900
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=VALIDATED["unique_id"],
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "old-secret"},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        MagicMock(),
+    )
+    cache = {
+        "access_token": "old-token",
+        "token_expires_at": time.time() + 3600,
+        "token_retry_at": retry_at,
+    }
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache.copy()),
+        async_save=AsyncMock(),
+    )
+    client = SimpleNamespace(
+        access_token="new-token",
+        token_expires_at=time.time() + 7200,
+        token_retry_at=None,
+        async_validate_credentials=AsyncMock(return_value=VALIDATED["unique_id"]),
+    )
+    from_hass = MagicMock(return_value=client)
+    monkeypatch.setattr(config_flow, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(config_flow.GuestyApiClient, "from_hass", from_hass)
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "new-secret"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    from_hass.assert_called_once_with(
+        hass,
+        "client",
+        "new-secret",
+        None,
+        None,
+        retry_at,
+    )
+    saved = storage.async_save.await_args.args[0]
+    assert saved["access_token"] == "new-token"
+    assert saved["token_retry_at"] is None
 
 
 @pytest.mark.asyncio
@@ -360,13 +658,65 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
             "reservation_days_future": 365,
             "stale_threshold_hours": 6,
             CONF_EXPOSE_GUEST_DETAILS: True,
+            CONF_PIN_NATIVE_ENABLED: False,
+            CONF_PIN_CUSTOM_ENABLED: True,
+            CONF_PIN_CUSTOM_FIELD: "  {{my_door_pin}}  ",
+            CONF_PIN_OFFLINE_PROVISIONING: False,
         },
     )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_SCAN_INTERVAL] == 600
     assert result["data"][CONF_EXPOSE_GUEST_DETAILS] is True
+    assert result["data"][CONF_PIN_CUSTOM_FIELD] == "{{my_door_pin}}"
+    assert result["data"][CONF_PIN_NATIVE_ENABLED] is False
+    assert result["data"][CONF_PIN_CUSTOM_ENABLED] is True
+    assert result["data"][CONF_PIN_OFFLINE_PROVISIONING] is False
     assert "loxone_custom_field" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_options_flow_requires_one_pin_source_for_enabled_provider(hass) -> None:
+    """Loxone or TTLock can never run with both Guesty PIN sources disabled."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={},
+    )
+    entry.add_to_hass(hass)
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            CONF_LOXONE_ENABLED: True,
+            CONF_PIN_NATIVE_ENABLED: False,
+            CONF_PIN_CUSTOM_ENABLED: False,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    assert result["errors"] == {"base": "pin_source_required"}
+
+
+@pytest.mark.asyncio
+async def test_options_flow_preserves_legacy_pin_custom_field_suggestion(hass) -> None:
+    """An older custom-field choice is migrated instead of silently replaced."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={"loxone_custom_field": "{{existing_pin_field}}"},
+    )
+    entry.add_to_hass(hass)
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+
+    suggestions = {
+        marker.schema: marker.description.get("suggested_value")
+        for marker in form["data_schema"].schema
+    }
+    assert suggestions[CONF_PIN_CUSTOM_FIELD] == "{{existing_pin_field}}"
 
 
 @pytest.mark.asyncio

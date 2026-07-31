@@ -26,6 +26,7 @@ from .api import (
     GuestyPermissionError,
     GuestyRetryableError,
     KEYCODE_WRITE_ROUTE_V3,
+    is_safe_resource_id,
 )
 from .const import (
     CONF_ACCESS_EARLY_MINUTES,
@@ -44,6 +45,10 @@ from .const import (
     CONF_LOXONE_SERVER_PASSWORD,
     CONF_LOXONE_SERVER_URL,
     CONF_LOXONE_SERVER_USERNAME,
+    CONF_PIN_CUSTOM_FIELD,
+    CONF_PIN_CUSTOM_ENABLED,
+    CONF_PIN_NATIVE_ENABLED,
+    CONF_PIN_OFFLINE_PROVISIONING,
     CONF_SCAN_INTERVAL,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
@@ -53,8 +58,13 @@ from .const import (
     DEFAULT_GUESTY_CODE_SUFFIX,
     DEFAULT_LOXONE_CODE_PREFIX,
     DEFAULT_LOXONE_PROVISION_LEAD_MINUTES,
+    DEFAULT_PIN_CUSTOM_FIELD,
+    DEFAULT_PIN_CUSTOM_ENABLED,
+    DEFAULT_PIN_NATIVE_ENABLED,
+    DEFAULT_PIN_OFFLINE_PROVISIONING,
     DEFAULT_SCAN_INTERVAL,
     GUESTY_CODE_SUFFIX_MAX_LENGTH,
+    LEGACY_CONF_LOXONE_CUSTOM_FIELD,
     LOXONE_ACCESS_CODE_LENGTH,
     LOXONE_RETRY_BASE_SECONDS,
     LOXONE_RETRY_MAX_SECONDS,
@@ -74,11 +84,18 @@ _LOGGER = logging.getLogger(__name__)
 LOXONE_STORAGE_KEY = "guesty_loxone"
 _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
+_GUESTY_MIN_WRITE_SPACING_SECONDS = 0
 _GUESTY_RATE_LIMIT_RESERVE = 4
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
+_GUESTY_NATIVE_OPERATION = "guesty_native"
+_GUESTY_CUSTOM_OPERATION = "guesty_custom"
+_PIN_FIELD_RESOLVE_OPERATION = "pin_field_resolve"
+_PIN_STATE_SCHEMA_VERSION_KEY = "pin_state_schema_version"
+_PIN_STATE_SCHEMA_VERSION = 2
+_RESOLVED_PIN_FIELD_KEY = "resolved_pin_field"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
 _GUESTY_RETRY_STATE_VERSION = 3
 _GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
@@ -173,7 +190,7 @@ class GuestyLoxoneStorage:
 
 
 class GuestyLoxoneManager:
-    """Synchronize Guesty's native Keycode with short-lived lock credentials."""
+    """Synchronize Guesty's PIN mirrors with short-lived lock credentials."""
 
     def __init__(
         self,
@@ -255,10 +272,32 @@ class GuestyLoxoneManager:
             and listing_id in self._mappings
         )
 
+    @property
+    def _native_pin_enabled(self) -> bool:
+        """Return whether native Guesty Keycode participates in PIN sync."""
+        return bool(
+            self.entry.options.get(
+                CONF_PIN_NATIVE_ENABLED,
+                DEFAULT_PIN_NATIVE_ENABLED,
+            )
+        )
+
+    @property
+    def _custom_pin_enabled(self) -> bool:
+        """Return whether the configurable Guesty PIN field participates."""
+        return bool(
+            self.entry.options.get(
+                CONF_PIN_CUSTOM_ENABLED,
+                DEFAULT_PIN_CUSTOM_ENABLED,
+            )
+        )
+
     async def async_setup(self) -> None:
         """Load private state and start one reconciliation pass."""
         self._data = await self._storage.async_load()
         recovered_retries, state_changed = self._migrate_guesty_retry_state()
+        state_changed = self._migrate_dual_source_state() or state_changed
+        state_changed = self._clear_disabled_pin_source_state() or state_changed
         if state_changed:
             await self._storage.async_save(self._data)
         if recovered_retries:
@@ -270,6 +309,76 @@ class GuestyLoxoneManager:
         else:
             self._log_persisted_guesty_retry_summary()
         self.async_schedule_reconcile()
+
+    def _migrate_dual_source_state(self) -> bool:
+        """Upgrade one-source PIN records without rotating confirmed codes."""
+        raw_version = self._data.get(_PIN_STATE_SCHEMA_VERSION_KEY, 0)
+        version = (
+            raw_version
+            if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+            else 0
+        )
+        if version >= _PIN_STATE_SCHEMA_VERSION:
+            return False
+
+        for record in self._records.values():
+            old_last_error = record.get("last_error")
+            code = record.get("code")
+            if not isinstance(code, str) or not _CODE_PATTERN.fullmatch(code):
+                continue
+            suffix = record.get("guesty_suffix")
+            display = f"{code}{suffix}" if isinstance(suffix, str) else code
+            if self._parse_guesty_code(display) != code:
+                display = code
+            record.setdefault("guesty_display_value", display)
+
+            if record.get("field_synced") is True:
+                field_id = record.get("field_id")
+                if field_id == _GUESTY_KEYCODE_SOURCE:
+                    record.setdefault("native_baseline_value", display)
+                    record.setdefault("native_synced", True)
+                elif is_safe_resource_id(field_id):
+                    record.setdefault("custom_baseline_value", display)
+                    record.setdefault("custom_synced", True)
+                    record.setdefault("custom_field_id", field_id)
+
+            # Current releases used the aggregate Guesty retry exclusively for
+            # notes.keyCode. Preserve that backoff under the native source.
+            for suffix_key in ("retry_at", "retry_count"):
+                old_key = f"guesty_{suffix_key}"
+                new_key = f"{_GUESTY_NATIVE_OPERATION}_{suffix_key}"
+                if old_key in record and new_key not in record:
+                    record[new_key] = record[old_key]
+            if (
+                isinstance(record.get("last_error"), str)
+                and record.get("last_error") != _GUESTY_SYNC_QUEUED
+            ):
+                record.setdefault("native_last_error", record["last_error"])
+            self._refresh_guesty_aggregate_state(record)
+            if old_last_error == _GUESTY_SYNC_QUEUED and not record.get("field_synced"):
+                record["last_error"] = _GUESTY_SYNC_QUEUED
+
+        self._data[_PIN_STATE_SCHEMA_VERSION_KEY] = _PIN_STATE_SCHEMA_VERSION
+        return True
+
+    def _clear_disabled_pin_source_state(self) -> bool:
+        """Stop disabled source retries without discarding confirmed baselines."""
+        if self._native_pin_enabled and self._custom_pin_enabled:
+            return False
+        changed = False
+        for record in self._records.values():
+            before = dict(record)
+            for enabled, source, operation in (
+                (self._native_pin_enabled, "native", _GUESTY_NATIVE_OPERATION),
+                (self._custom_pin_enabled, "custom", _GUESTY_CUSTOM_OPERATION),
+            ):
+                if enabled:
+                    continue
+                self._clear_retry(record, operation)
+                record.pop(f"{source}_last_error", None)
+            self._refresh_guesty_aggregate_state(record)
+            changed = record != before or changed
+        return changed
 
     def _guesty_client_fingerprint(self) -> str | None:
         """Return a private stable marker for credential-change recovery."""
@@ -298,20 +407,36 @@ class GuestyLoxoneManager:
             self._data.pop(_LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY, None) is not None
         )
         for record in self._records.values():
-            if record.get("field_synced") or self._retry_at(record, "guesty") is None:
-                continue
-            last_error = record.get("last_error")
-            legacy_reasonless_retry = not last_error
-            stale_native_404 = version < _GUESTY_RETRY_STATE_VERSION and last_error in {
-                "guesty_reservation_not_found",
-                "guesty_keycode_rejected",
-            }
-            if not (legacy_reasonless_retry or stale_native_404 or credentials_changed):
-                continue
-            self._clear_retry(record, "guesty")
-            record["last_error"] = _GUESTY_SYNC_QUEUED
-            recovered += 1
-            state_changed = True
+            source_operations = (
+                ("guesty", "last_error"),
+                (_GUESTY_NATIVE_OPERATION, "native_last_error"),
+                (_GUESTY_CUSTOM_OPERATION, "custom_last_error"),
+            )
+            for operation, error_key in source_operations:
+                if self._retry_at(record, operation) is None:
+                    continue
+                last_error = record.get(error_key)
+                if operation == "guesty" and not isinstance(last_error, str):
+                    last_error = record.get("last_error")
+                legacy_reasonless_retry = not last_error
+                stale_native_404 = (
+                    operation in {"guesty", _GUESTY_NATIVE_OPERATION}
+                    and version < _GUESTY_RETRY_STATE_VERSION
+                    and last_error
+                    in {
+                        "guesty_reservation_not_found",
+                        "guesty_keycode_rejected",
+                    }
+                )
+                if not (
+                    legacy_reasonless_retry or stale_native_404 or credentials_changed
+                ):
+                    continue
+                self._clear_retry(record, operation)
+                record[error_key] = _GUESTY_SYNC_QUEUED
+                record["last_error"] = _GUESTY_SYNC_QUEUED
+                recovered += 1
+                state_changed = True
 
         if version != _GUESTY_RETRY_STATE_VERSION:
             self._data[_GUESTY_RETRY_STATE_VERSION_KEY] = _GUESTY_RETRY_STATE_VERSION
@@ -328,11 +453,35 @@ class GuestyLoxoneManager:
         """Return bounded safe retry counts and the next retry time."""
         counts: dict[str, int] = {}
         next_retry: datetime | None = None
+        enabled_operations = []
+        if self._native_pin_enabled:
+            enabled_operations.append((_GUESTY_NATIVE_OPERATION, "native_last_error"))
+        if self._custom_pin_enabled:
+            enabled_operations.append((_GUESTY_CUSTOM_OPERATION, "custom_last_error"))
         for record in self._records.values():
-            retry_at = self._retry_at(record, "guesty")
-            if retry_at is None or record.get("last_error") == _GUESTY_SYNC_QUEUED:
+            source_retry_seen = False
+            for operation, error_key in enabled_operations:
+                retry_at = self._retry_at(record, operation)
+                if retry_at is None:
+                    continue
+                source_retry_seen = True
+                raw_reason = record.get(error_key)
+                if raw_reason == _GUESTY_SYNC_QUEUED:
+                    continue
+                reason = (
+                    raw_reason
+                    if isinstance(raw_reason, str)
+                    and re.fullmatch(r"[a-z0-9_]{1,64}", raw_reason)
+                    else "unknown"
+                )
+                counts[reason] = counts.get(reason, 0) + 1
+                next_retry = self._earlier(next_retry, retry_at)
+            if source_retry_seen:
                 continue
+            retry_at = self._retry_at(record, "guesty")
             raw_reason = record.get("last_error")
+            if retry_at is None or raw_reason == _GUESTY_SYNC_QUEUED:
+                continue
             reason = (
                 raw_reason
                 if isinstance(raw_reason, str)
@@ -423,10 +572,13 @@ class GuestyLoxoneManager:
             errors: list[str] = []
             data = self._coordinator.data
             data_stale = data is None or bool(getattr(data, "data_stale", False))
+            self._clear_disabled_pin_source_state()
 
             eligible: dict[str, GuestyReservation] = {}
+            listings: dict[str, GuestyListing] = {}
             pin_listing_ids = self._pin_listing_ids
             if pin_listing_ids and data is not None:
+                listings = dict(data.listings)
                 eligible = {
                     reservation.id: reservation
                     for reservation in data.reservations
@@ -435,10 +587,89 @@ class GuestyLoxoneManager:
                     and reservation.listing_id in data.listings
                 }
 
-            # The shared Guesty reservation fetch already contains
-            # notes.keyCode. No per-account custom-field lookup or additional
-            # per-reservation read is needed.
-            field_id = _GUESTY_KEYCODE_SOURCE
+            offline_provisioning = bool(
+                self.entry.options.get(
+                    CONF_PIN_OFFLINE_PROVISIONING,
+                    DEFAULT_PIN_OFFLINE_PROVISIONING,
+                )
+            )
+            if data_stale and offline_provisioning:
+                for reservation_id, stored_record in self._records.items():
+                    if reservation_id in eligible or stored_record.get("retired"):
+                        continue
+                    listing_id = stored_record.get("listing_id")
+                    if listing_id not in pin_listing_ids:
+                        continue
+                    raw_reservation = stored_record.get("reservation_snapshot")
+                    raw_listing = stored_record.get("listing_snapshot")
+                    if not isinstance(raw_reservation, dict) or not isinstance(
+                        raw_listing, dict
+                    ):
+                        continue
+                    try:
+                        restored_reservation = GuestyReservation.from_dict(
+                            raw_reservation
+                        )
+                        restored_listing = GuestyListing.from_dict(raw_listing)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    stored_end = dt_util.parse_datetime(
+                        str(stored_record.get("access_end", ""))
+                    )
+                    if stored_end is None or stored_end <= now:
+                        continue
+                    eligible[reservation_id] = restored_reservation
+                    listings[listing_id] = restored_listing
+
+            custom_field_id: str | None = None
+            custom_field_error: str | None = None
+            if eligible and not data_stale and self._custom_pin_enabled:
+                reference = self._pin_custom_field_reference()
+                if self._data.get("pin_field_retry_reference") != reference:
+                    self._clear_retry(self._data, _PIN_FIELD_RESOLVE_OPERATION)
+                    self._data["pin_field_retry_reference"] = reference
+                    self._data.pop("pin_field_last_error", None)
+                resolve_retry_at = self._retry_at(
+                    self._data,
+                    _PIN_FIELD_RESOLVE_OPERATION,
+                )
+                if resolve_retry_at is not None and resolve_retry_at > now:
+                    custom_field_error = str(
+                        self._data.get(
+                            "pin_field_last_error",
+                            "guesty_custom_field_unavailable",
+                        )
+                    )
+                    next_run = self._earlier(next_run, resolve_retry_at)
+                    errors.append(custom_field_error)
+                else:
+                    try:
+                        custom_field_id = await self._async_pin_custom_field_id()
+                    except (GuestyApiError, GuestyAuthError) as err:
+                        custom_field_error = (
+                            "guesty_custom_field_unavailable"
+                            if isinstance(err, GuestyNotFoundError)
+                            else self._guesty_error_reason(err)
+                        )
+                        self._data["pin_field_last_error"] = custom_field_error
+                        self._record_retry_failure(
+                            self._data,
+                            _PIN_FIELD_RESOLVE_OPERATION,
+                            now,
+                        )
+                        resolve_retry_at = self._retry_at(
+                            self._data,
+                            _PIN_FIELD_RESOLVE_OPERATION,
+                        )
+                        if resolve_retry_at is not None:
+                            next_run = self._earlier(next_run, resolve_retry_at)
+                        errors.append(custom_field_error)
+                    else:
+                        self._clear_retry(self._data, _PIN_FIELD_RESOLVE_OPERATION)
+                        self._data.pop("pin_field_last_error", None)
+            elif not self._custom_pin_enabled:
+                self._clear_retry(self._data, _PIN_FIELD_RESOLVE_OPERATION)
+                self._data.pop("pin_field_last_error", None)
 
             for reservation_id in list(self._records):
                 if reservation_id in eligible:
@@ -481,11 +712,11 @@ class GuestyLoxoneManager:
                 eligible.values(),
                 key=lambda item: self._reservation_sync_order(
                     item,
-                    data.listings[item.listing_id],
+                    listings[item.listing_id],
                     now,
                 ),
             ):
-                listing = data.listings[reservation.listing_id]
+                listing = listings[reservation.listing_id]
                 record = self._records.get(reservation.id, {})
                 try:
                     start, end = self._access_window(reservation, listing)
@@ -509,71 +740,71 @@ class GuestyLoxoneManager:
                         errors.append(type(err).__name__)
                     continue
 
-                if data_stale:
-                    next_run = self._earlier(next_run, end)
-                    continue
-
                 record = self._records.setdefault(reservation.id, {})
-                record["listing_id"] = reservation.listing_id
-                record["access_start"] = start.isoformat()
-                record["access_end"] = end.isoformat()
-                guesty_queued = False
-                try:
-                    field_changed = await self._async_observe_keycode(
-                        reservation,
-                        record,
+                if data_stale:
+                    stored_start = dt_util.parse_datetime(
+                        str(record.get("access_start", ""))
                     )
-                    write_required = self._keycode_write_required(
-                        reservation,
-                        record,
+                    stored_end = dt_util.parse_datetime(
+                        str(record.get("access_end", ""))
                     )
-                    if write_required and self._retry_is_deferred(
-                        record,
-                        "guesty",
-                        now,
-                    ):
-                        retry_at = self._retry_at(record, "guesty")
-                        if retry_at is not None:
-                            next_run = self._earlier(next_run, retry_at)
-                        guesty_queued = True
-                    elif write_required and self._guesty_writes_remaining <= 0:
-                        retry_at = self._queue_keycode_write(record, now)
-                        next_run = self._earlier(next_run, retry_at)
-                        guesty_queued = True
-                    else:
-                        await self._async_ensure_key_code(
+                    offline_ready = bool(
+                        offline_provisioning
+                        and stored_start is not None
+                        and stored_end is not None
+                        and stored_end > now
+                        and record.get("field_synced")
+                        and isinstance(record.get("code"), str)
+                        and record.get("offline_snapshot_confirmed_at")
+                    )
+                    if not offline_ready:
+                        next_run = self._earlier(next_run, end)
+                        continue
+                    start, end = stored_start, stored_end
+                    record["offline_snapshot_in_use"] = True
+                else:
+                    record["listing_id"] = reservation.listing_id
+                    record["access_start"] = start.isoformat()
+                    record["access_end"] = end.isoformat()
+                    record["offline_snapshot_confirmed_at"] = now.isoformat()
+                    record["reservation_snapshot"] = reservation.to_dict(
+                        include_guest_details=bool(
+                            self.entry.options.get(
+                                CONF_EXPOSE_GUEST_DETAILS,
+                                DEFAULT_EXPOSE_GUEST_DETAILS,
+                            )
+                        )
+                    )
+                    record["listing_snapshot"] = listing.to_dict()
+                    record.pop("offline_snapshot_in_use", None)
+                    try:
+                        (
+                            sync_errors,
+                            sync_next_run,
+                        ) = await self._async_sync_guesty_fields(
                             reservation,
                             record,
                             now,
-                            field_id,
-                            field_changed=field_changed,
+                            custom_field_id,
+                            custom_field_error=custom_field_error,
+                            defer_custom_mirror=any(
+                                other_id != reservation.id
+                                and not self._records.get(other_id, {}).get(
+                                    "field_synced"
+                                )
+                                for other_id in eligible
+                            ),
                         )
-                    if guesty_queued:
-                        continue
-                except _GuestyWriteDeferred as err:
-                    next_run = self._earlier(next_run, err.retry_at)
-                    continue
-                except (GuestyApiError, GuestyAuthError) as err:
-                    reason = self._guesty_error_reason(err)
-                    record["last_error"] = reason
-                    if self._guesty_error_stops_write_batch(err):
-                        self._guesty_writes_remaining = 0
-                    self._record_retry_failure(record, "guesty", now)
-                    retry_at = self._retry_at(record, "guesty")
-                    if retry_at:
-                        next_run = self._earlier(next_run, retry_at)
-                    errors.append(reason)
-                    self._log_guesty_keycode_failure(
-                        reservation,
-                        record,
-                        err,
-                        now,
-                    )
-                except (RuntimeError, ValueError) as err:
-                    record["last_error"] = "code_generation_failed"
-                    errors.append(type(err).__name__)
-                except (LoxoneApiError, LoxoneAuthError) as err:
-                    errors.append(type(err).__name__)
+                        errors.extend(sync_errors)
+                        if sync_next_run is not None:
+                            next_run = self._earlier(next_run, sync_next_run)
+                    except _GuestyWriteDeferred as err:
+                        next_run = self._earlier(next_run, err.retry_at)
+                    except (RuntimeError, ValueError) as err:
+                        record["last_error"] = "code_generation_failed"
+                        errors.append(type(err).__name__)
+                    except (LoxoneApiError, LoxoneAuthError) as err:
+                        errors.append(type(err).__name__)
                 if record.get("conflict"):
                     errors.append(str(record.get("last_error") or "keycode_conflict"))
 
@@ -696,19 +927,6 @@ class GuestyLoxoneManager:
                                 record["last_error"] = "code_conflict"
                                 self._record_retry_failure(record, "loxone", now)
                                 errors.append("code_conflict")
-                            except (GuestyApiError, GuestyAuthError) as err:
-                                reason = self._guesty_error_reason(err)
-                                self._record_retry_failure(record, "guesty", now)
-                                record["last_error"] = reason
-                                if self._guesty_error_stops_write_batch(err):
-                                    self._guesty_writes_remaining = 0
-                                errors.append(reason)
-                                self._log_guesty_keycode_failure(
-                                    reservation,
-                                    record,
-                                    err,
-                                    now,
-                                )
                             except (LoxoneApiError, LoxoneAuthError) as err:
                                 self._record_retry_failure(record, "loxone", now)
                                 record["last_error"] = type(err).__name__
@@ -771,6 +989,13 @@ class GuestyLoxoneManager:
     def _guesty_write_budget(self, now: datetime) -> int:
         """Return the global write allowance while reserving API capacity."""
         recent_attempts = self._recent_guesty_write_attempts(now)
+        if (
+            recent_attempts
+            and recent_attempts[-1]
+            + timedelta(seconds=_GUESTY_MIN_WRITE_SPACING_SECONDS)
+            > now
+        ):
+            return 0
         global_capacity = max(
             0,
             _GUESTY_KEYCODE_WRITE_BATCH_SIZE - len(recent_attempts),
@@ -790,6 +1015,11 @@ class GuestyLoxoneManager:
         if len(attempts) >= _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
             retry_at = attempts[-_GUESTY_KEYCODE_WRITE_BATCH_SIZE] + timedelta(
                 seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS
+            )
+        if attempts:
+            retry_at = max(
+                retry_at,
+                attempts[-1] + timedelta(seconds=_GUESTY_MIN_WRITE_SPACING_SECONDS),
             )
 
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
@@ -815,7 +1045,15 @@ class GuestyLoxoneManager:
     ) -> bool:
         """Persist Guesty write attempts before making network requests."""
         attempts = self._recent_guesty_write_attempts(now)
-        if count < 1 or len(attempts) + count > _GUESTY_KEYCODE_WRITE_BATCH_SIZE:
+        if (
+            count < 1
+            or len(attempts) + count > _GUESTY_KEYCODE_WRITE_BATCH_SIZE
+            or (
+                attempts
+                and attempts[-1] + timedelta(seconds=_GUESTY_MIN_WRITE_SPACING_SECONDS)
+                > now
+            )
+        ):
             return False
         attempts.extend([now] * count)
         self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
@@ -839,62 +1077,731 @@ class GuestyLoxoneManager:
             start = datetime.max.replace(tzinfo=dt_util.UTC)
         return (0 if start <= now else 1, start, reservation.id)
 
-    def _keycode_write_required(
+    def _pin_custom_field_reference(self) -> str:
+        """Return the configured shared reservation PIN field reference."""
+        configured = self.entry.options.get(CONF_PIN_CUSTOM_FIELD)
+        if configured is None:
+            configured = self.entry.options.get(
+                LEGACY_CONF_LOXONE_CUSTOM_FIELD,
+                DEFAULT_PIN_CUSTOM_FIELD,
+            )
+        reference = str(configured).strip()
+        if not reference:
+            reference = DEFAULT_PIN_CUSTOM_FIELD
+        return reference
+
+    async def _async_pin_custom_field_id(self) -> str:
+        """Resolve and privately cache the configured PIN custom field."""
+        reference = self._pin_custom_field_reference()
+        cached = self._data.get(_RESOLVED_PIN_FIELD_KEY)
+        if (
+            isinstance(cached, dict)
+            and cached.get("reference") == reference
+            and is_safe_resource_id(cached.get("id"))
+        ):
+            return cached["id"]
+        field_id = await self._client.async_resolve_custom_field(reference)
+        self._data[_RESOLVED_PIN_FIELD_KEY] = {
+            "reference": reference,
+            "id": field_id,
+        }
+        await self._storage.async_save(self._data)
+        return field_id
+
+    @staticmethod
+    def _clean_guesty_value(value: Any) -> str | None:
+        """Normalize one optional Guesty display value."""
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    async def _async_custom_field_observation(
         self,
         reservation: GuestyReservation,
-        record: Mapping[str, Any],
-    ) -> bool:
-        """Return whether reconciliation is expected to write Guesty."""
-        if not reservation.key_code_observed:
-            # A new reservation with no private record still needs its initial
-            # Keycode. For an existing record, an omitted notes projection is
-            # non-authoritative and must never cause a rotation or rewrite.
-            return not isinstance(record.get("code"), str)
-        remote_value = (
-            reservation.key_code.strip()
-            if isinstance(reservation.key_code, str)
-            else None
-        )
-        remote_code = self._parse_guesty_code(remote_value)
-        local_code = record.get("code")
-        if record.get("replacement_pending"):
-            if self._confirmed_guesty_code(record) is not None:
-                return False
-            return remote_code != local_code or remote_value != self._guesty_code_value(
-                local_code, reservation.listing_id
+        record: dict[str, Any],
+        field_id: str,
+    ) -> tuple[bool, str | None]:
+        """Observe the configured field without duplicating normal API reads."""
+        field_changed = record.get("custom_field_id") != field_id
+        if reservation.custom_fields_observed:
+            return True, self._clean_guesty_value(
+                reservation.custom_fields.get(field_id)
             )
-        if remote_value:
-            if remote_code is None or self._code_is_used_elsewhere(
-                remote_code, reservation.id
-            ):
-                return False
-            return remote_value != self._guesty_code_value(
-                remote_code, reservation.listing_id
-            )
-        return self._confirmed_guesty_code(record) is None
 
-    def _queue_keycode_write(
+        source_version = reservation.last_updated_at
+        if (
+            not field_changed
+            and "custom_baseline_value" in record
+            and isinstance(source_version, str)
+            and record.get("custom_source_last_updated_at") == source_version
+        ):
+            # The disk cache intentionally strips sensitive values. An
+            # unchanged reservation version lets the private baseline stand
+            # until the next fresh shared poll.
+            return False, None
+
+        value = await self._client.async_get_reservation_custom_field(
+            reservation.id,
+            field_id,
+        )
+        reservation.custom_fields[field_id] = value
+        reservation.custom_fields_observed = True
+        return True, self._clean_guesty_value(value)
+
+    def _canonical_display_value(
+        self,
+        record: Mapping[str, Any],
+        listing_id: str,
+    ) -> str | None:
+        """Return the stable Guesty-facing value retained in private state."""
+        if record.get("replacement_pending"):
+            confirmed = record.get("guesty_confirmed_code")
+            if isinstance(confirmed, str) and _CODE_PATTERN.fullmatch(confirmed):
+                return self._guesty_code_value(confirmed, listing_id)
+        code = record.get("code")
+        if not isinstance(code, str) or not _CODE_PATTERN.fullmatch(code):
+            return None
+        display = record.get("guesty_display_value")
+        if isinstance(display, str) and self._parse_guesty_code(display) == code:
+            return display
+        return self._guesty_code_value(code, listing_id)
+
+    async def _async_mark_dual_source_conflict(
         self,
         record: dict[str, Any],
         now: datetime,
+        reason: str,
+    ) -> None:
+        """Revoke provider delivery without changing either Guesty field."""
+        if self._retry_is_deferred(record, "cleanup", now):
+            record["conflict"] = True
+            record["field_synced"] = False
+            record["last_error"] = "source_change_cleanup_failed"
+            return
+        try:
+            await self._async_delete_remote_user(record)
+        except (LoxoneApiError, LoxoneAuthError):
+            record["conflict"] = True
+            record["field_synced"] = False
+            record["last_error"] = "source_change_cleanup_failed"
+            self._record_retry_failure(record, "cleanup", now)
+            await self._storage.async_save(self._data)
+            raise
+        self._clear_retry(record, "cleanup")
+        record["field_synced"] = False
+        record["code_set"] = False
+        record["conflict"] = True
+        record["last_error"] = reason
+        self._clear_retry(record, "loxone")
+        await self._storage.async_save(self._data)
+
+    def _select_dual_source_value(
+        self,
+        reservation: GuestyReservation,
+        record: Mapping[str, Any],
+        *,
+        native_observed: bool,
+        native_value: str | None,
+        custom_observed: bool,
+        custom_value: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Choose one deterministic display value or return a conflict reason."""
+        canonical = self._canonical_display_value(record, reservation.listing_id)
+        native_has_baseline = "native_baseline_value" in record
+        custom_has_baseline = "custom_baseline_value" in record
+        native_changed = bool(
+            native_observed
+            and native_has_baseline
+            and native_value != record.get("native_baseline_value")
+        )
+        custom_changed = bool(
+            custom_observed
+            and custom_has_baseline
+            and custom_value != record.get("custom_baseline_value")
+        )
+
+        if native_changed and custom_changed:
+            if native_value and native_value == custom_value:
+                return native_value, None
+            # Emptying one mirror never deletes a confirmed access code, but a
+            # simultaneous different edit cannot be ordered safely.
+            if native_value is None and custom_value == canonical:
+                return canonical, None
+            if custom_value is None and native_value == canonical:
+                return canonical, None
+            return None, "guesty_pin_sources_changed"
+        if native_changed:
+            return native_value or custom_value or canonical, None
+        if custom_changed:
+            return custom_value or native_value or canonical, None
+
+        populated = [
+            value
+            for observed, value in (
+                (native_observed, native_value),
+                (custom_observed, custom_value),
+            )
+            if observed and value is not None
+        ]
+        if populated and all(value == populated[0] for value in populated):
+            return populated[0], None
+        if len(populated) == 1:
+            return populated[0], None
+        if len(populated) > 1:
+            # A pre-upgrade private value is a safe baseline. If exactly one
+            # Guesty source still matches it, the other value is the edit.
+            matching = [value == canonical for value in populated]
+            if canonical is not None and matching.count(True) == 1:
+                mismatching_index = matching.index(False)
+                mismatching_source = "native" if mismatching_index == 0 else "custom"
+                if record.get(f"{mismatching_source}_synced") is False or record.get(
+                    f"{mismatching_source}_last_error"
+                ):
+                    # A previously failed or queued mirror still contains its
+                    # old confirmed baseline; it cannot become a new manual
+                    # edit merely because its propagation retry is pending.
+                    return canonical, None
+                return populated[mismatching_index], None
+            return None, "guesty_pin_sources_mismatch"
+        if canonical is not None:
+            return canonical, None
+        code = self._generate_code()
+        return self._guesty_code_value(code, reservation.listing_id), None
+
+    async def _async_adopt_canonical_value(
+        self,
+        record: dict[str, Any],
+        value: str,
+        listing_id: str,
+    ) -> None:
+        """Persist one valid unique Guesty value and invalidate provider caches."""
+        code = self._parse_guesty_code(value)
+        if code is None:
+            raise ValueError("Invalid Guesty PIN display value")
+        changed = record.get("code") != code
+        display_changed = record.get("guesty_display_value") != value
+        record["code"] = code
+        record["guesty_display_value"] = value
+        record["guesty_confirmed_code"] = code
+        record["guesty_suffix"] = self._guesty_code_suffix(listing_id)
+        if changed:
+            record["code_set"] = False
+            record.pop("provisioned_at", None)
+            self._clear_retry(record, "loxone")
+        if changed or display_changed:
+            for key in (
+                "replacement_pending",
+                "replacement_rejected_code",
+            ):
+                record.pop(key, None)
+        record.pop("conflict", None)
+        if record.get("last_error") in {
+            "guesty_pin_sources_changed",
+            "guesty_pin_sources_mismatch",
+            "guesty_duplicate_keycode",
+            "invalid_existing_keycode",
+            "guesty_keycode_removed",
+        }:
+            record.pop("last_error", None)
+        await self._storage.async_save(self._data)
+
+    def _retain_conflicting_value(
+        self,
+        record: dict[str, Any],
+        value: str,
+        listing_id: str,
+    ) -> None:
+        """Retain an observed but unsafe value for diagnosis without provisioning it."""
+        code = self._parse_guesty_code(value)
+        if code is None:
+            return
+        record["code"] = code
+        record["guesty_display_value"] = value
+        record["guesty_confirmed_code"] = code
+        record["guesty_suffix"] = self._guesty_code_suffix(listing_id)
+
+    def _refresh_guesty_aggregate_state(self, record: dict[str, Any]) -> None:
+        """Maintain backward-compatible aggregate status from both mirrors."""
+        enabled_sources = []
+        if self._native_pin_enabled:
+            enabled_sources.append(("native", _GUESTY_NATIVE_OPERATION))
+        if self._custom_pin_enabled:
+            enabled_sources.append(("custom", _GUESTY_CUSTOM_OPERATION))
+        retry_times = [
+            retry
+            for _source, operation in enabled_sources
+            if (retry := self._retry_at(record, operation)) is not None
+        ]
+        if retry_times:
+            record["guesty_retry_at"] = min(retry_times).isoformat()
+            record["guesty_retry_count"] = max(
+                int(record.get(f"{operation}_retry_count", 0) or 0)
+                for _source, operation in enabled_sources
+            )
+        else:
+            self._clear_retry(record, "guesty")
+
+        record["field_synced"] = bool(
+            not record.get("conflict")
+            and any(record.get(f"{source}_synced") for source, _op in enabled_sources)
+            and isinstance(record.get("code"), str)
+        )
+        if record.get("conflict"):
+            return
+        source_errors = [
+            record.get(f"{source}_last_error") for source, _op in enabled_sources
+        ]
+        real_error = next(
+            (
+                value
+                for value in source_errors
+                if isinstance(value, str) and value != _GUESTY_SYNC_QUEUED
+            ),
+            None,
+        )
+        if real_error is not None:
+            record["last_error"] = real_error
+        elif retry_times and not record.get("field_synced"):
+            record["last_error"] = _GUESTY_SYNC_QUEUED
+        elif record.get("last_error") == _GUESTY_SYNC_QUEUED or str(
+            record.get("last_error", "")
+        ).startswith("guesty_"):
+            record.pop("last_error", None)
+
+    def _queue_source_write(
+        self,
+        record: dict[str, Any],
+        now: datetime,
+        operation: str,
+        source: str,
     ) -> datetime:
-        """Queue a write globally without erasing reservation failure state."""
+        """Queue one mirror write under the shared persistent traffic limit."""
         retry_at = self._next_guesty_write_at(now)
         if retry_at <= now:
-            retry_at = now + timedelta(seconds=_GUESTY_KEYCODE_QUEUE_DELAY_SECONDS)
-        failure_count = record.get("guesty_retry_count")
-        has_failure_backoff = (
+            retry_at = now + timedelta(seconds=_GUESTY_MIN_WRITE_SPACING_SECONDS)
+        current = self._retry_at(record, operation)
+        failure_count = record.get(f"{operation}_retry_count")
+        has_failure_backoff = bool(
             isinstance(failure_count, int)
             and not isinstance(failure_count, bool)
             and failure_count > 0
-            and record.get("last_error") != _GUESTY_SYNC_QUEUED
+            and record.get(f"{source}_last_error") != _GUESTY_SYNC_QUEUED
         )
-        if not has_failure_backoff:
-            self._clear_retry(record, "guesty")
-            record["last_error"] = _GUESTY_SYNC_QUEUED
-        record["guesty_retry_at"] = retry_at.isoformat()
-        self._last_queued += 1
+        if has_failure_backoff:
+            record[f"{operation}_retry_at"] = max(
+                retry_at,
+                current or retry_at,
+            ).isoformat()
+        elif current is None or current <= now:
+            self._clear_retry(record, operation)
+            record[f"{source}_last_error"] = _GUESTY_SYNC_QUEUED
+            record[f"{operation}_retry_at"] = retry_at.isoformat()
+            self._last_queued += 1
+        else:
+            retry_at = current
+        self._refresh_guesty_aggregate_state(record)
         return retry_at
+
+    async def _async_write_native_mirror(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        value: str,
+        now: datetime,
+    ) -> None:
+        """Write and confirm the native Guesty Keycode mirror."""
+        if not await self._async_reserve_guesty_write_slots(now, 1):
+            self._guesty_writes_remaining = 0
+            raise _GuestyWriteDeferred(
+                self._queue_source_write(
+                    record,
+                    now,
+                    _GUESTY_NATIVE_OPERATION,
+                    "native",
+                )
+            )
+        self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
+        try:
+            await self._client.async_update_reservation_key_code(
+                reservation.id,
+                value,
+            )
+        finally:
+            self._last_guesty_writes += 1
+        reservation.key_code = value
+        reservation.key_code_observed = True
+        record["native_baseline_value"] = value
+        record["native_synced"] = True
+        record.pop("native_last_error", None)
+        self._clear_retry(record, _GUESTY_NATIVE_OPERATION)
+        _LOGGER.info(
+            "Guesty reservation PIN mirror synchronized marker=%s source=native",
+            self._reservation_marker(reservation.id),
+        )
+
+    async def _async_write_custom_mirror(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        field_id: str,
+        value: str,
+        now: datetime,
+    ) -> None:
+        """Write and confirm the configurable Guesty custom-field mirror."""
+        if not await self._async_reserve_guesty_write_slots(now, 1):
+            self._guesty_writes_remaining = 0
+            raise _GuestyWriteDeferred(
+                self._queue_source_write(
+                    record,
+                    now,
+                    _GUESTY_CUSTOM_OPERATION,
+                    "custom",
+                )
+            )
+        self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
+        try:
+            await self._client.async_update_reservation_custom_field(
+                reservation.id,
+                field_id,
+                value,
+            )
+        finally:
+            self._last_guesty_writes += 1
+        reservation.custom_fields[field_id] = value
+        reservation.custom_fields_observed = True
+        record["custom_field_id"] = field_id
+        record["custom_baseline_value"] = value
+        record["custom_synced"] = True
+        record.pop("custom_last_error", None)
+        self._clear_retry(record, _GUESTY_CUSTOM_OPERATION)
+        _LOGGER.info(
+            "Guesty reservation PIN mirror synchronized marker=%s source=custom",
+            self._reservation_marker(reservation.id),
+        )
+
+    async def _async_sync_one_mirror(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        *,
+        source: str,
+        operation: str,
+        observed: bool,
+        current_value: str | None,
+        desired_value: str,
+        field_id: str | None,
+        now: datetime,
+    ) -> tuple[str | None, datetime | None]:
+        """Synchronize one Guesty mirror and return an error and retry time."""
+        if source == "native" and self._retry_at(record, operation) is None:
+            legacy_retry = self._retry_at(record, "guesty")
+            if legacy_retry is not None:
+                record[f"{operation}_retry_at"] = legacy_retry.isoformat()
+                legacy_count = record.get("guesty_retry_count")
+                if isinstance(legacy_count, int) and not isinstance(legacy_count, bool):
+                    record[f"{operation}_retry_count"] = legacy_count
+                legacy_error = record.get("last_error")
+                if isinstance(legacy_error, str):
+                    record["native_last_error"] = legacy_error
+        if (
+            source == "native"
+            and not observed
+            and (
+                (
+                    record.get("field_synced") is True
+                    and record.get("field_id") == _GUESTY_KEYCODE_SOURCE
+                )
+                or record.get("replacement_pending") is True
+            )
+            and self._confirmed_guesty_code(record)
+            == self._parse_guesty_code(desired_value)
+        ):
+            record["native_baseline_value"] = desired_value
+            record["native_synced"] = True
+            return None, None
+        if (
+            not observed
+            and record.get(f"{source}_synced") is True
+            and record.get(f"{source}_baseline_value") == desired_value
+        ):
+            # Sparse cached reservation projections intentionally omit secrets.
+            # A confirmed private baseline is authoritative until a later fresh
+            # response explicitly observes that source.
+            return None, self._retry_at(record, operation)
+        if current_value == desired_value:
+            record[f"{source}_baseline_value"] = desired_value
+            record[f"{source}_synced"] = True
+            record.pop(f"{source}_last_error", None)
+            self._clear_retry(record, operation)
+            return None, None
+        record[f"{source}_synced"] = False
+        if source == "custom" and field_id is None:
+            record["custom_synced"] = False
+            return "guesty_custom_field_unavailable", None
+        retry_at = self._retry_at(record, operation)
+        if retry_at is not None and retry_at > now:
+            return None, retry_at
+        if self._guesty_writes_remaining <= 0:
+            return None, self._queue_source_write(
+                record,
+                now,
+                operation,
+                source,
+            )
+        try:
+            if source == "native":
+                await self._async_write_native_mirror(
+                    reservation,
+                    record,
+                    desired_value,
+                    now,
+                )
+            else:
+                assert field_id is not None
+                await self._async_write_custom_mirror(
+                    reservation,
+                    record,
+                    field_id,
+                    desired_value,
+                    now,
+                )
+        except _GuestyWriteDeferred as err:
+            return None, err.retry_at
+        except (GuestyApiError, GuestyAuthError) as err:
+            reason = self._guesty_error_reason(err)
+            if source == "custom" and isinstance(err, GuestyNotFoundError):
+                self._data.pop(_RESOLVED_PIN_FIELD_KEY, None)
+            record[f"{source}_last_error"] = reason
+            record[f"{source}_synced"] = False
+            self._record_retry_failure(record, operation, now)
+            retry_at = self._retry_at(record, operation)
+            if self._guesty_error_stops_write_batch(err):
+                self._guesty_writes_remaining = 0
+            self._log_guesty_mirror_failure(
+                reservation,
+                source,
+                operation,
+                record,
+                err,
+                now,
+            )
+            return reason, retry_at
+        return None, None
+
+    async def _async_sync_guesty_fields(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        now: datetime,
+        custom_field_id: str | None,
+        *,
+        custom_field_error: str | None,
+        defer_custom_mirror: bool = False,
+    ) -> tuple[list[str], datetime | None]:
+        """Reconcile native and custom Guesty PIN mirrors without ping-pong."""
+        native_enabled = self._native_pin_enabled
+        custom_enabled = self._custom_pin_enabled
+        for enabled, source, operation in (
+            (native_enabled, "native", _GUESTY_NATIVE_OPERATION),
+            (custom_enabled, "custom", _GUESTY_CUSTOM_OPERATION),
+        ):
+            if enabled:
+                continue
+            self._clear_retry(record, operation)
+            record.pop(f"{source}_last_error", None)
+        if not native_enabled and not custom_enabled:
+            record["field_synced"] = False
+            record["last_error"] = "pin_source_not_configured"
+            await self._storage.async_save(self._data)
+            return ["pin_source_not_configured"], None
+
+        native_observed = bool(native_enabled and reservation.key_code_observed)
+        native_value = (
+            self._clean_guesty_value(reservation.key_code) if native_enabled else None
+        )
+        custom_observed = False
+        custom_value: str | None = None
+        errors: list[str] = []
+        next_run: datetime | None = None
+
+        if custom_enabled and custom_field_id is not None:
+            retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
+            if retry_at is not None and retry_at > now:
+                custom_field_error = str(
+                    record.get("custom_last_error") or "guesty_custom_field_unavailable"
+                )
+                next_run = self._earlier(next_run, retry_at)
+            else:
+                try:
+                    (
+                        custom_observed,
+                        custom_value,
+                    ) = await self._async_custom_field_observation(
+                        reservation,
+                        record,
+                        custom_field_id,
+                    )
+                except (GuestyApiError, GuestyAuthError) as err:
+                    custom_field_error = self._guesty_error_reason(err)
+                    if isinstance(err, GuestyNotFoundError):
+                        self._data.pop(_RESOLVED_PIN_FIELD_KEY, None)
+                    record["custom_synced"] = False
+                    record["custom_last_error"] = custom_field_error
+                    self._record_retry_failure(record, _GUESTY_CUSTOM_OPERATION, now)
+                    retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
+                    if retry_at is not None:
+                        next_run = self._earlier(next_run, retry_at)
+                    errors.append(custom_field_error)
+
+        desired, conflict = self._select_dual_source_value(
+            reservation,
+            record,
+            native_observed=native_observed,
+            native_value=native_value,
+            custom_observed=custom_observed,
+            custom_value=custom_value,
+        )
+        if conflict is not None or desired is None:
+            await self._async_mark_dual_source_conflict(
+                record,
+                now,
+                conflict or "guesty_pin_sources_mismatch",
+            )
+            return [conflict or "guesty_pin_sources_mismatch"], next_run
+        configured_suffix = self._guesty_code_suffix(reservation.listing_id)
+        code = self._parse_guesty_code(desired)
+        if code is None:
+            await self._async_mark_dual_source_conflict(
+                record,
+                now,
+                "invalid_existing_keycode",
+            )
+            return ["invalid_existing_keycode"], next_run
+        # The configurable suffix is presentation metadata for the guest, not
+        # part of the six-digit provider PIN. Normalize both mirrors without
+        # ever rotating that PIN.
+        desired = f"{code}{configured_suffix}"
+        if self._code_is_used_elsewhere(
+            code,
+            reservation.id,
+            custom_field_id=custom_field_id,
+        ):
+            self._retain_conflicting_value(
+                record,
+                desired,
+                reservation.listing_id,
+            )
+            await self._async_mark_dual_source_conflict(
+                record,
+                now,
+                "guesty_duplicate_keycode",
+            )
+            return ["guesty_duplicate_keycode"], next_run
+
+        if (
+            record.get("replacement_pending") is True
+            and not native_observed
+            and self._confirmed_guesty_code(record) == code
+        ):
+            record["native_baseline_value"] = desired
+            record["native_synced"] = True
+
+        await self._async_adopt_canonical_value(
+            record,
+            desired,
+            reservation.listing_id,
+        )
+        record["source_last_updated_at"] = reservation.last_updated_at
+        if custom_field_id is not None:
+            record["custom_field_id"] = custom_field_id
+            record["custom_source_last_updated_at"] = reservation.last_updated_at
+        if custom_field_error is not None:
+            record["custom_synced"] = False
+            record["custom_last_error"] = custom_field_error
+
+        # Keep the established native route first. A failed native write does
+        # not prevent the custom mirror from succeeding on a later write slot.
+        generated_new_value = bool(
+            not native_value
+            and not custom_value
+            and not any(
+                f"{source}_baseline_value" in record
+                for source, enabled in (
+                    ("native", native_enabled),
+                    ("custom", custom_enabled),
+                )
+                if enabled
+            )
+        )
+        mirrors: list[tuple[str, str, bool, str | None, str | None]] = []
+        if native_enabled:
+            mirrors.append(
+                (
+                    "native",
+                    _GUESTY_NATIVE_OPERATION,
+                    native_observed,
+                    native_value if native_observed else None,
+                    None,
+                )
+            )
+        if custom_enabled:
+            mirrors.append(
+                (
+                    "custom",
+                    _GUESTY_CUSTOM_OPERATION,
+                    custom_observed,
+                    custom_value if custom_observed else None,
+                    custom_field_id,
+                )
+            )
+        for source, operation, observed, current, field_id in mirrors:
+            if (
+                source == "custom"
+                and custom_field_id is not None
+                and custom_field_error is None
+                and native_enabled
+                and record.get("native_synced") is True
+                and (
+                    generated_new_value
+                    or (
+                        defer_custom_mirror
+                        and record.get("native_last_error")
+                        in {None, _GUESTY_SYNC_QUEUED}
+                    )
+                )
+            ):
+                # Keep the established throughput of two newly booked
+                # reservations per 30-second window. A redundancy write never
+                # starves a booking that has not reached either Guesty source.
+                record["custom_synced"] = False
+                retry_at = self._queue_source_write(
+                    record,
+                    now,
+                    operation,
+                    source,
+                )
+                next_run = self._earlier(next_run, retry_at)
+                continue
+            error, retry_at = await self._async_sync_one_mirror(
+                reservation,
+                record,
+                source=source,
+                operation=operation,
+                observed=observed,
+                current_value=current,
+                desired_value=desired,
+                field_id=field_id,
+                now=now,
+            )
+            if error is not None:
+                errors.append(error)
+            if retry_at is not None:
+                next_run = self._earlier(next_run, retry_at)
+
+        self._refresh_guesty_aggregate_state(record)
+        await self._storage.async_save(self._data)
+        return errors, next_run
 
     @staticmethod
     def _guesty_error_reason(error: Exception) -> str:
@@ -938,32 +1845,39 @@ class GuestyLoxoneManager:
         )
         return status, endpoint, request_id
 
-    def _log_guesty_keycode_failure(
+    def _log_guesty_mirror_failure(
         self,
         reservation: GuestyReservation,
+        source: str,
+        operation: str,
         record: Mapping[str, Any],
         error: Exception,
         now: datetime,
     ) -> None:
-        """Log actionable Guesty context without PINs or reservation IDs."""
+        """Log one privacy-safe mirror failure without exposing the PIN."""
         status, endpoint, request_id = self._guesty_error_log_context(error)
-        retry_at = self._retry_at(record, "guesty")
-        retry_count = record.get("guesty_retry_count", 0)
+        retry_at = self._retry_at(record, operation)
         retry_in_seconds = (
             max(0, int((retry_at - now).total_seconds())) if retry_at is not None else 0
         )
+        retry_count = record.get(f"{operation}_retry_count", 0)
         rate_limit_remaining = getattr(
             self._client,
             "last_rate_limit_remaining",
             None,
         )
         _LOGGER.warning(
-            "Guesty reservation Keycode synchronization failed "
-            "marker=%s operation=native_keycode_write reason=%s "
-            "endpoint=%s http_status=%s request_id=%s "
-            "retry_count=%s retry_in_seconds=%s "
+            "Guesty reservation PIN mirror synchronization failed "
+            "marker=%s source=%s operation=%s reason=%s endpoint=%s http_status=%s "
+            "request_id=%s retry_count=%s retry_in_seconds=%s "
             "rate_limit_remaining=%s",
             self._reservation_marker(reservation.id),
+            source,
+            (
+                "native_keycode_write"
+                if source == "native"
+                else "reservation_custom_field_write"
+            ),
             self._guesty_error_reason(error),
             endpoint,
             status,
@@ -993,370 +1907,6 @@ class GuestyLoxoneManager:
     def _reservation_marker(reservation_id: str) -> str:
         """Return a non-reversible marker for safe operational logging."""
         return reservation_log_marker(reservation_id)
-
-    async def _async_observe_keycode(
-        self,
-        reservation: GuestyReservation,
-        record: dict[str, Any],
-    ) -> bool:
-        """Observe native notes.keyCode from the shared reservation fetch."""
-        source_changed = record.get("field_id") != _GUESTY_KEYCODE_SOURCE
-        suffix = self._guesty_code_suffix(reservation.listing_id)
-        suffix_changed = (
-            record.get("guesty_suffix", DEFAULT_GUESTY_CODE_SUFFIX) != suffix
-        )
-        if not reservation.key_code_observed:
-            source_version = reservation.last_updated_at
-            if (
-                not source_changed
-                and not suffix_changed
-                and record.get("field_synced")
-                and isinstance(source_version, str)
-                and record.get("source_last_updated_at") == source_version
-                and not record.get("replacement_pending")
-            ):
-                # The disk cache intentionally strips codes. Preserve the
-                # private record until the next successful shared Guesty poll.
-                return False
-            # A sparse response still cannot prove a manual deletion. It must,
-            # however, not suppress an explicit migration or display-suffix
-            # change that already requires publishing the stable private PIN.
-            return source_changed or suffix_changed
-
-        record["source_last_updated_at"] = reservation.last_updated_at
-        return source_changed
-
-    async def _async_ensure_key_code(
-        self,
-        reservation: GuestyReservation,
-        record: dict[str, Any],
-        now: datetime,
-        field_id: str,
-        *,
-        field_changed: bool,
-    ) -> None:
-        """Keep Guesty's confirmed PIN stable and adopt only Guesty edits."""
-        local_code = record.get("code")
-        confirmed_code = self._confirmed_guesty_code(record)
-        remote_observed = bool(reservation.key_code_observed)
-        remote_value = (
-            reservation.key_code.strip()
-            if isinstance(reservation.key_code, str)
-            else None
-        )
-        remote_code = self._parse_guesty_code(remote_value)
-
-        # Cached reservations deliberately do not contain native Keycodes.
-        # Absence is authoritative only when notes.keyCode was observed;
-        # otherwise preserving the private record prevents unnecessary churn.
-        if (
-            not remote_observed
-            and local_code is not None
-            and not record.get("replacement_pending")
-        ):
-            publication_pending = field_changed or record.get("field_synced") is False
-            if not publication_pending:
-                return
-            # Resume only the exact PIN publication already recorded in private
-            # state. This never treats an omitted notes projection as a manual
-            # deletion and therefore cannot rotate a stable cached PIN.
-            if self._retry_is_deferred(record, "guesty", now):
-                return
-            if self._guesty_writes_remaining <= 0:
-                self._queue_keycode_write(record, now)
-                return
-            if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(
-                local_code
-            ):
-                local_code = self._generate_code()
-                record["code"] = local_code
-                self._last_rotated += 1
-            record["field_synced"] = False
-            await self._async_write_keycode(
-                reservation,
-                record,
-                field_id,
-                local_code,
-            )
-            return
-
-        if record.get("replacement_pending") and confirmed_code is not None:
-            # Older versions could leave an automatic collision replacement in
-            # flight after Guesty had already confirmed another PIN. Cancel
-            # that pending change before doing anything else; only a value
-            # subsequently observed from Guesty may replace the confirmed PIN.
-            record["code"] = confirmed_code
-            local_code = confirmed_code
-            record.pop("replacement_pending", None)
-            record.pop("replacement_rejected_code", None)
-            if not remote_observed:
-                record["field_synced"] = True
-                record["field_id"] = field_id
-                self._clear_retry(record, "guesty")
-                await self._storage.async_save(self._data)
-                return
-            await self._storage.async_save(self._data)
-
-        if remote_value:
-            if remote_code is None:
-                await self._async_mark_guesty_keycode_conflict(
-                    record,
-                    now,
-                    field_id,
-                    reason="invalid_existing_keycode",
-                )
-                return
-            if self._code_is_used_elsewhere(remote_code, reservation.id):
-                await self._async_mark_guesty_keycode_conflict(
-                    record,
-                    now,
-                    field_id,
-                    reason="guesty_duplicate_keycode",
-                    remote_code=remote_code,
-                )
-                return
-            if local_code != remote_code:
-                await self._async_adopt_guesty_code(
-                    record,
-                    remote_code,
-                    field_id,
-                    reservation.listing_id,
-                    display_synced=remote_value
-                    == self._guesty_code_value(remote_code, reservation.listing_id),
-                )
-                if remote_value != self._guesty_code_value(
-                    remote_code, reservation.listing_id
-                ):
-                    await self._async_write_keycode(
-                        reservation, record, field_id, remote_code
-                    )
-                return
-            if remote_value != self._guesty_code_value(
-                remote_code, reservation.listing_id
-            ):
-                await self._async_write_keycode(
-                    reservation, record, field_id, remote_code
-                )
-                return
-            record["field_synced"] = True
-            record["field_id"] = field_id
-            record["guesty_confirmed_code"] = remote_code
-            record["guesty_suffix"] = self._guesty_code_suffix(reservation.listing_id)
-            self._clear_retry(record, "guesty")
-            last_error = record.get("last_error")
-            if isinstance(last_error, str) and (
-                last_error.startswith("guesty_")
-                or last_error == "invalid_existing_keycode"
-            ):
-                record.pop("conflict", None)
-                record.pop("last_error", None)
-            return
-
-        if confirmed_code is not None:
-            await self._async_mark_guesty_keycode_conflict(
-                record,
-                now,
-                field_id,
-                reason="guesty_keycode_removed",
-            )
-            return
-
-        if local_code is not None and field_changed:
-            if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(
-                local_code
-            ):
-                local_code = self._generate_code()
-                record["code"] = local_code
-                self._last_rotated += 1
-            record["field_synced"] = False
-            await self._async_write_keycode(
-                reservation,
-                record,
-                field_id,
-                local_code,
-            )
-            return
-
-        if local_code is not None:
-            if self._retry_is_deferred(record, "guesty", now):
-                return
-            if self._guesty_writes_remaining <= 0:
-                self._queue_keycode_write(record, now)
-                return
-            record["field_synced"] = False
-            await self._async_write_keycode(
-                reservation,
-                record,
-                field_id,
-                local_code,
-            )
-            return
-
-        if local_code is None:
-            local_code = self._generate_code()
-            self._last_generated += 1
-            record["code"] = local_code
-            record["field_synced"] = False
-            record["created_at"] = now.isoformat()
-            record.pop("conflict", None)
-            record.pop("last_error", None)
-            await self._storage.async_save(self._data)
-
-        if not isinstance(local_code, str) or not _CODE_PATTERN.fullmatch(local_code):
-            record["conflict"] = True
-            record["last_error"] = "invalid_local_keycode"
-            return
-        if record.get("field_synced"):
-            return
-        if self._retry_is_deferred(record, "guesty", now):
-            return
-
-        await self._async_write_keycode(
-            reservation,
-            record,
-            field_id,
-            local_code,
-        )
-        record.pop("last_error", None)
-        self._clear_retry(record, "guesty")
-        await self._storage.async_save(self._data)
-
-    async def _async_write_keycode(
-        self,
-        reservation: GuestyReservation,
-        record: dict[str, Any],
-        field_id: str,
-        code: str,
-    ) -> None:
-        """Write and locally confirm Guesty's native reservation Keycode."""
-        if not _CODE_PATTERN.fullmatch(code):
-            raise ValueError("Guesty reservation access code must contain six digits")
-        raw_retry_count = record.get("guesty_retry_count", 0)
-        retry_count = (
-            raw_retry_count
-            if isinstance(raw_retry_count, int)
-            and not isinstance(raw_retry_count, bool)
-            and raw_retry_count >= 0
-            else 0
-        )
-        attempted_at = dt_util.utcnow()
-        reserved_slots = 1
-        if not await self._async_reserve_guesty_write_slots(
-            attempted_at,
-            reserved_slots,
-        ):
-            self._guesty_writes_remaining = 0
-            raise _GuestyWriteDeferred(self._queue_keycode_write(record, attempted_at))
-        self._guesty_writes_remaining = max(
-            0,
-            self._guesty_writes_remaining - reserved_slots,
-        )
-        guesty_value = self._guesty_code_value(code, reservation.listing_id)
-        try:
-            await self._client.async_update_reservation_key_code(
-                reservation.id,
-                guesty_value,
-            )
-        except Exception:
-            # Unknown outcomes stay conservatively charged. This prevents a
-            # timeout or restart after an accepted write from exceeding the
-            # persistent two-writes-per-30-seconds ceiling.
-            self._last_guesty_writes += reserved_slots
-            raise
-
-        self._last_guesty_writes += 1
-        reservation.key_code = guesty_value
-        reservation.key_code_observed = True
-        record["field_id"] = field_id
-        record["field_synced"] = True
-        record["guesty_confirmed_code"] = code
-        record["guesty_suffix"] = self._guesty_code_suffix(reservation.listing_id)
-        record["source_last_updated_at"] = reservation.last_updated_at
-        self._clear_retry(record, "guesty")
-        last_error = record.get("last_error")
-        if isinstance(last_error, str) and last_error.startswith("guesty_"):
-            record.pop("last_error", None)
-        await self._storage.async_save(self._data)
-        _LOGGER.info(
-            "Guesty reservation Keycode synchronized "
-            "marker=%s operation=native_keycode_write retry_count=%s",
-            self._reservation_marker(reservation.id),
-            retry_count,
-        )
-
-    async def _async_mark_guesty_keycode_conflict(
-        self,
-        record: dict[str, Any],
-        now: datetime,
-        field_id: str,
-        *,
-        reason: str,
-        remote_code: str | None = None,
-    ) -> None:
-        """Fail closed without changing an authoritative Guesty Keycode."""
-        if self._retry_is_deferred(record, "cleanup", now):
-            record["conflict"] = True
-            record["last_error"] = "source_change_cleanup_failed"
-            return
-        try:
-            await self._async_delete_remote_user(record)
-        except (LoxoneApiError, LoxoneAuthError):
-            record["conflict"] = True
-            record["last_error"] = "source_change_cleanup_failed"
-            self._record_retry_failure(record, "cleanup", now)
-            await self._storage.async_save(self._data)
-            raise
-        self._clear_retry(record, "cleanup")
-        if remote_code is not None:
-            record["code"] = remote_code
-            record["field_synced"] = True
-            record["guesty_confirmed_code"] = remote_code
-        else:
-            record["field_synced"] = False
-        record["field_id"] = field_id
-        record["code_set"] = False
-        for key in (
-            "provisioned_at",
-            "replacement_pending",
-            "replacement_rejected_code",
-        ):
-            record.pop(key, None)
-        record["conflict"] = True
-        record["last_error"] = reason
-        self._clear_retry(record, "guesty")
-        self._clear_retry(record, "loxone")
-        await self._storage.async_save(self._data)
-
-    async def _async_adopt_guesty_code(
-        self,
-        record: dict[str, Any],
-        remote_code: str,
-        field_id: str,
-        listing_id: str,
-        *,
-        display_synced: bool,
-    ) -> None:
-        """Adopt one valid, unique Guesty code and mark Loxone for update."""
-        record["code"] = remote_code
-        record["field_synced"] = display_synced
-        record["field_id"] = field_id
-        record["guesty_confirmed_code"] = remote_code
-        if display_synced:
-            record["guesty_suffix"] = self._guesty_code_suffix(listing_id)
-        else:
-            record.pop("guesty_suffix", None)
-        record["code_set"] = False
-        for key in (
-            "provisioned_at",
-            "conflict",
-            "last_error",
-            "replacement_pending",
-            "replacement_rejected_code",
-        ):
-            record.pop(key, None)
-        self._clear_retry(record, "guesty")
-        self._clear_retry(record, "loxone")
-        await self._storage.async_save(self._data)
 
     async def _async_provision(
         self,
@@ -1570,7 +2120,13 @@ class GuestyLoxoneManager:
                 return code
         raise RuntimeError("Could not allocate an unused Loxone access code")
 
-    def _code_is_used_elsewhere(self, code: str, reservation_id: str) -> bool:
+    def _code_is_used_elsewhere(
+        self,
+        code: str,
+        reservation_id: str,
+        *,
+        custom_field_id: str | None = None,
+    ) -> bool:
         """Resolve duplicate ownership without rotating the established owner."""
         local_owners = sorted(
             other_id
@@ -1590,8 +2146,16 @@ class GuestyLoxoneManager:
                 reservation.id
                 for reservation in data.reservations
                 if reservation.is_active_status()
-                and isinstance(reservation.key_code, str)
-                and self._parse_guesty_code(reservation.key_code) == code
+                and (
+                    self._parse_guesty_code(reservation.key_code) == code
+                    or (
+                        custom_field_id is not None
+                        and self._parse_guesty_code(
+                            reservation.custom_fields.get(custom_field_id)
+                        )
+                        == code
+                    )
+                )
             )
             if data is not None
             else []
@@ -1717,6 +2281,8 @@ class GuestyLoxoneManager:
             "guesty_duplicate_keycode",
             "invalid_existing_keycode",
             "invalid_local_keycode",
+            "guesty_pin_sources_changed",
+            "guesty_pin_sources_mismatch",
             "source_change_cleanup_failed",
         }
         return {
@@ -1733,6 +2299,38 @@ class GuestyLoxoneManager:
     ) -> tuple[datetime, datetime]:
         """Share the exact existing access-offset calculation with providers."""
         return self._access_window(reservation, listing)
+
+    def offline_reservation_snapshots(
+        self,
+    ) -> list[tuple[GuestyReservation, GuestyListing]]:
+        """Return validated, previously confirmed schedules to PIN providers."""
+        if not self.entry.options.get(
+            CONF_PIN_OFFLINE_PROVISIONING,
+            DEFAULT_PIN_OFFLINE_PROVISIONING,
+        ):
+            return []
+        snapshots: list[tuple[GuestyReservation, GuestyListing]] = []
+        for record in self._records.values():
+            if (
+                record.get("retired")
+                or not record.get("offline_snapshot_confirmed_at")
+                or not record.get("field_synced")
+                or not isinstance(record.get("code"), str)
+            ):
+                continue
+            raw_reservation = record.get("reservation_snapshot")
+            raw_listing = record.get("listing_snapshot")
+            if not isinstance(raw_reservation, dict) or not isinstance(
+                raw_listing, dict
+            ):
+                continue
+            try:
+                reservation = GuestyReservation.from_dict(raw_reservation)
+                listing = GuestyListing.from_dict(raw_listing)
+            except (KeyError, TypeError, ValueError):
+                continue
+            snapshots.append((reservation, listing))
+        return snapshots
 
     async def async_rotate_external_conflict(
         self,
@@ -1865,6 +2463,10 @@ class GuestyLoxoneManager:
             "data_stale": bool(getattr(data, "data_stale", False)),
             "field_synced": False,
             "loxone_user_created": False,
+            "native_keycode_enabled": self._native_pin_enabled,
+            "custom_field_enabled": self._custom_pin_enabled,
+            "custom_field_configured": bool(self._pin_custom_field_reference()),
+            "custom_field_resolved": False,
         }
         if not isinstance(record, dict) or record.get("retired"):
             return snapshot
@@ -1876,6 +2478,8 @@ class GuestyLoxoneManager:
             "guesty_duplicate_keycode",
             "invalid_existing_keycode",
             "invalid_local_keycode",
+            "guesty_pin_sources_changed",
+            "guesty_pin_sources_mismatch",
         }
         field_synced = bool(record.get("field_synced"))
         snapshot["field_synced"] = field_synced
@@ -1886,6 +2490,8 @@ class GuestyLoxoneManager:
             snapshot["error_reason"] = last_error
         if guesty_conflict:
             snapshot["guesty_status"] = "conflict"
+        elif field_synced:
+            snapshot["guesty_status"] = "synced"
         elif (
             guesty_retry_at is not None and last_error != _GUESTY_SYNC_QUEUED
         ) or last_error in {
@@ -1893,8 +2499,20 @@ class GuestyLoxoneManager:
             "source_change_cleanup_failed",
         }:
             snapshot["guesty_status"] = "error"
-        elif field_synced:
-            snapshot["guesty_status"] = "synced"
+        elif last_error == "pin_source_not_configured":
+            snapshot["guesty_status"] = "error"
+        snapshot["native_keycode_synced"] = bool(
+            self._native_pin_enabled and record.get("native_synced")
+        )
+        snapshot["custom_field_synced"] = bool(
+            self._custom_pin_enabled and record.get("custom_synced")
+        )
+        snapshot["custom_field_resolved"] = bool(
+            self._custom_pin_enabled and record.get("custom_field_id")
+        )
+        snapshot["offline_snapshot_available"] = bool(
+            record.get("offline_snapshot_confirmed_at")
+        )
 
         remote_ready = bool(record.get("user_uuid") and record.get("code_set"))
         snapshot["loxone_user_created"] = remote_ready
@@ -1942,6 +2560,8 @@ class GuestyLoxoneManager:
         retry_counts, next_retry = self._guesty_retry_summary()
         return {
             "enabled": bool(self.entry.options.get(CONF_LOXONE_ENABLED, False)),
+            "native_keycode_enabled": self._native_pin_enabled,
+            "custom_field_enabled": self._custom_pin_enabled,
             "configured_miniservers": len(self._servers),
             "mapped_listings": len(self._mappings),
             "last_reconcile_at": self._last_reconcile_at,
@@ -1959,27 +2579,66 @@ class GuestyLoxoneManager:
             "native_keycodes_synced": sum(
                 1
                 for record in records.values()
-                if isinstance(record, dict) and record.get("field_synced")
+                if self._native_pin_enabled
+                and isinstance(record, dict)
+                and (
+                    record.get("native_synced")
+                    or (
+                        record.get("field_synced")
+                        and record.get("field_id") == _GUESTY_KEYCODE_SOURCE
+                    )
+                )
             ),
             "native_keycodes_pending": sum(
                 1
                 for record in records.values()
-                if isinstance(record, dict)
+                if self._native_pin_enabled
+                and isinstance(record, dict)
                 and not record.get("retired")
-                and not record.get("field_synced")
+                and not record.get("native_synced")
             ),
             "native_keycodes_queued": sum(
                 1
                 for record in records.values()
-                if isinstance(record, dict)
-                and record.get("last_error") == _GUESTY_SYNC_QUEUED
+                if self._native_pin_enabled
+                and isinstance(record, dict)
+                and (
+                    record.get("native_last_error") == _GUESTY_SYNC_QUEUED
+                    or (
+                        "native_last_error" not in record
+                        and record.get("last_error") == _GUESTY_SYNC_QUEUED
+                    )
+                )
             ),
             "native_keycode_failures": sum(
                 1
                 for record in records.values()
+                if self._native_pin_enabled
+                and isinstance(record, dict)
+                and self._retry_at(record, _GUESTY_NATIVE_OPERATION) is not None
+                and record.get("native_last_error") != _GUESTY_SYNC_QUEUED
+            ),
+            "custom_fields_synced": sum(
+                1
+                for record in records.values()
+                if self._custom_pin_enabled
+                and isinstance(record, dict)
+                and record.get("custom_synced")
+            ),
+            "custom_fields_pending": sum(
+                1
+                for record in records.values()
+                if self._custom_pin_enabled
+                and isinstance(record, dict)
+                and not record.get("retired")
+                and not record.get("custom_synced")
+            ),
+            "offline_snapshots_available": sum(
+                1
+                for record in records.values()
                 if isinstance(record, dict)
-                and self._retry_at(record, "guesty") is not None
-                and record.get("last_error") != _GUESTY_SYNC_QUEUED
+                and bool(record.get("offline_snapshot_confirmed_at"))
+                and bool(record.get("field_synced"))
             ),
             "native_keycode_error_counts": retry_counts,
             "next_native_keycode_retry_at": (

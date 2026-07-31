@@ -169,12 +169,13 @@ async def test_retry_debug_log_omits_resource_path_and_error_detail(
 async def test_credential_validation_reuses_token_and_fetches_one_listing(
     monkeypatch,
 ) -> None:
-    """Validation identifies the account, checks listings, and exposes its token."""
+    """Validation checks every endpoint required by the normal coordinator."""
     client = _client(token=None)
     ensure_token = AsyncMock()
     request = AsyncMock(
         side_effect=[
             {"_id": "account-1"},
+            {"results": []},
             {"results": []},
         ]
     )
@@ -197,6 +198,11 @@ async def test_credential_validation_reuses_token_and_fetches_one_listing(
             "GET",
             "/listings",
             params={"fields": ANY, "limit": "1"},
+        ),
+        call(
+            "GET",
+            "/reservations",
+            params={"fields": "_id", "limit": "1"},
         ),
     ]
 

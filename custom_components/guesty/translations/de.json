@@ -12,7 +12,7 @@
       },
       "reauth_confirm": {
         "title": "Guesty erneut verbinden",
-        "description": "Guesty hat den Zugriff auch nach der automatischen Erneuerung des Zugriffstokens abgelehnt. Gib Client ID und Client Secret erneut ein oder ersetze sie, falls sie geändert wurden.",
+        "description": "Guesty hat den Zugriff nach der automatischen Erneuerung des Zugriffstokens abgelehnt. Gib Client ID und Client Secret zur erneuten Prüfung ein oder ersetze sie, falls sie geändert wurden. Unveränderte Zugangsdaten verwenden den privaten Token und eine laufende Guesty-Wartezeit weiter.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret"
@@ -29,7 +29,7 @@
     },
     "error": {
       "invalid_auth": "Ungültige API-Zugangsdaten (Client ID oder Secret falsch)",
-      "no_permissions": "Token erhalten, aber kein Zugriff auf Listings – Open API Berechtigungen in Guesty prüfen",
+      "no_permissions": "Token erhalten, aber kein Zugriff auf Listings oder Reservierungen – Open API Berechtigungen in Guesty prüfen",
       "cannot_connect": "Verbindung zur Guesty API fehlgeschlagen",
       "unknown": "Unbekannter Fehler"
     },
@@ -52,9 +52,19 @@
           "reservation_days_future": "Zukünftige Tage für Reservierungen",
           "stale_threshold_hours": "Stale-Schwellenwert (Stunden)",
           "expose_guest_details": "Gastnamen und Bestätigungscodes in Entitäten anzeigen",
+          "pin_native_enabled": "Guesty Keycode synchronisieren",
+          "pin_custom_enabled": "Reservierungs-Custom-Field für den PIN synchronisieren",
+          "pin_custom_field": "Name oder ID des Reservierungs-Custom-Fields für den PIN",
+          "pin_offline_provisioning": "Bestätigte PIN-Zeitpläne bei Guesty-Ausfall weiterverwenden",
           "access_enabled": "Sicheren Gast-Türzugang aktivieren",
           "loxone_enabled": "Reservierungs-PINs für Loxone aktivieren",
           "ttlock_enabled": "Reservierungs-PINs für TTLock aktivieren"
+        },
+        "data_description": {
+          "pin_native_enabled": "Liest und beschreibt Guestys natives Reservierungsfeld Keycode. Kann vorübergehend deaktiviert werden, solange Guestys Keycode-Endpunkt unzuverlässig ist.",
+          "pin_custom_enabled": "Liest und beschreibt das separat angelegte Reservierungs-Custom-Field für den PIN.",
+          "pin_custom_field": "Guesty-Quelle für den PIN. Der Standard {{door_code}} kann durch einen anderen Namen, eine Variable oder ID eines Reservierungs-Custom-Fields ersetzt werden.",
+          "pin_offline_provisioning": "Verwendet bei nicht erreichbarem Guesty ausschließlich den zuletzt von Guesty bestätigten PIN und Zeitraum. Neue oder verlängerte Zugänge werden offline niemals abgeleitet."
         }
       },
       "access": {
@@ -107,7 +117,7 @@
       },
       "loxone": {
         "title": "Loxone Reservierungs-PINs",
-        "description": "Pro Reservierung wird ein sechsstelliger Code erzeugt und ausschließlich in Guestys nativem Keycode-Feld gespeichert. Der native Keycode ist die maßgebliche Quelle: Gültige manuelle Änderungen werden mit Loxone und TTLock synchronisiert. Sobald Guesty einen Code bestätigt hat, wird er nie automatisch geändert; doppelte Codes oder Anbieterkonflikte bleiben gesperrt, bis der Code in Guesty manuell geändert wird. Ein Türcode-Custom-Field ist nicht erforderlich. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "description": "Pro Reservierung wird ein stabiler sechsstelliger Code erzeugt und über die in den allgemeinen Optionen aktivierten Guesty-PIN-Quellen synchronisiert. Das native Keycode und das konfigurierbare Reservierungs-Custom-Field können einzeln oder gemeinsam verwendet werden; gültige manuelle Änderungen in einer aktiven Quelle werden mit Loxone und TTLock synchronisiert. Sobald Guesty einen Code bestätigt hat, wird er nie automatisch geändert. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",
@@ -140,7 +150,7 @@
       },
       "ttlock": {
         "title": "TTLock Reservierungs-PINs",
-        "description": "Codes werden ausschließlich in Guestys nativem Keycode-Feld gespeichert; ein Türcode-Custom-Field ist nicht erforderlich. Lege zuerst eine Anwendung in der [TTLock Open Platform]({open_platform_url}) an. Bei Bedarf hilft die [TTLock-OAuth-Anleitung]({oauth_doc_url}). Verwende anschließend das TTLock-App-Konto, das die Schlösser verwaltet – nicht den Login des Entwicklerportals. Angezeigt werden nur V4-Schlösser mit Online-Gateway.",
+        "description": "Codes werden über die in den allgemeinen Optionen aktivierten Guesty-PIN-Quellen synchronisiert. Das native Keycode und das konfigurierbare Reservierungs-Custom-Field können einzeln oder gemeinsam verwendet werden. Lege zuerst eine Anwendung in der [TTLock Open Platform]({open_platform_url}) an. Bei Bedarf hilft die [TTLock-OAuth-Anleitung]({oauth_doc_url}). Verwende anschließend das TTLock-App-Konto, das die Schlösser verwaltet – nicht den Login des Entwicklerportals. Angezeigt werden nur V4-Schlösser mit Online-Gateway.",
         "data": {
           "loxone_code_prefix": "PIN-Präfix",
           "access_early_minutes": "Zugang vor Check-in (Minuten)",
@@ -185,6 +195,7 @@
       "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden",
       "invalid_code_suffix": "Der Guesty-Code-Zusatz darf höchstens 8 sichtbare Zeichen und keine Ziffern enthalten",
       "invalid_code_prefix": "Der PIN-Präfix muss aus 1 oder 2 Ziffern bestehen",
+      "pin_source_required": "Aktiviere mindestens eine Guesty-PIN-Quelle, wenn Loxone oder TTLock aktiviert ist",
       "custom_field_not_found": "Trage Name, Variable oder ID eines Guesty-Reservierungs-Custom-Fields ein",
       "loxone_invalid_auth": "Loxone lehnt das Konto ab oder das Recht Benutzerverwaltung fehlt",
       "loxone_cannot_connect": "Zu diesem Loxone-Miniserver konnte keine sichere Verbindung hergestellt werden",

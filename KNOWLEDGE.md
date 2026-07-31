@@ -43,7 +43,7 @@ assumption whose reuse would cause a meaningful regression.
 ### KB-ARCH-001 — One shared Guesty synchronization owner
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: `custom_components/guesty/coordinator.py`,
   `custom_components/guesty/__init__.py`,
   `tests/test_coordinator.py`
@@ -170,10 +170,11 @@ listing safety cursor.
 ### KB-GUESTY-002 — Native Keycodes require Reservations v3
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: redacted live API reproduction on 2026-07-28,
   `custom_components/guesty/api.py::async_get_reservation_key_codes`,
   `tests/test_api.py::test_native_keycode_reads_use_batched_v3_array_responses`,
+  `tests/test_coordinator.py::test_disabled_native_keycode_source_skips_v3_enrichment`,
   `tests/test_coordinator.py::test_full_poll_enriches_mapped_reservations_from_v3`
 
 Guesty's legacy `/reservations` endpoints do not expose `notes.keyCode`, even
@@ -191,7 +192,9 @@ Only active reservations belonging to listings mapped to an enabled Loxone or
 TTLock provider are enriched: changed reservations during incremental polls, a
 targeted reservation after a single webhook, and all applicable reservations
 during startup/daily full synchronization. This is an enrichment step inside
-the existing coordinator, not another poller.
+the existing coordinator, not another poller. If native Keycode synchronization
+is disabled, the coordinator skips all of these additional v3 Keycode reads;
+the configurable reservation custom field may remain the sole PIN authority.
 
 ### KB-GUESTY-003 — Native Keycode writes are minimal and confirmed
 
@@ -211,10 +214,12 @@ returns HTTP 404. The integration verifies the exact reservation through v3 so
 that condition is reported as an unavailable Keycode endpoint rather than a
 missing reservation, and preserves the failed PUT's `x-request-id`.
 
-A write is successful only after Guesty confirms the exact reservation ID and
-value in the response or a bounded v3 read-back. Resource IDs must be validated
-before they are interpolated into paths. Never use the legacy general
-reservation updater or a custom field as a Keycode fallback.
+A native write is successful only after Guesty confirms the exact reservation
+ID and value in the response or a bounded v3 read-back. Resource IDs must be
+validated before they are interpolated into paths. Never emulate a native
+Keycode write through the legacy general reservation updater. The independently
+verified reservation custom field described by `KB-PIN-001` is a redundant PIN
+mirror, not an undocumented compatibility route for `notes.keyCode`.
 
 ### KB-GUESTY-004 — Sparse and empty projections have different meanings
 
@@ -227,9 +232,10 @@ reservation updater or a custom field as a Keycode fallback.
 
 An omitted `notes` object means the Keycode was not observed. It is not proof
 that a user deleted the field and must not rotate or revoke an otherwise known
-PIN. An explicitly returned empty or invalid Keycode is authoritative and must
-fail closed according to the PIN lifecycle. The same general distinction
-applies to sparse reservation custom-field responses.
+PIN. The same distinction applies to a sparse reservation custom-field
+projection. An explicit invalid value fails closed. An explicitly empty value
+in only one mirror is repaired from the other confirmed mirror; two empty
+changed mirrors are ambiguous and fail closed according to `KB-PIN-001`.
 
 ### KB-GUESTY-005 — Door links use reservation custom fields, not Keycode
 
@@ -250,13 +256,27 @@ errors.
 ### KB-GUESTY-006 — Authentication and transient failures recover in place
 
 - Status: Validated
-- Last validated: 2026-07-29
+- Last validated: 2026-07-31
 - Evidence: `custom_components/guesty/api.py`,
-  `custom_components/guesty/coordinator.py`, `tests/test_api.py`,
+  `custom_components/guesty/__init__.py`,
+  `custom_components/guesty/config_flow.py`,
+  `custom_components/guesty/coordinator.py`,
+  `tests/test_init.py::test_setup_reuses_and_then_removes_transient_token`,
+  `tests/test_config_flow.py::test_user_flow_stores_first_token_for_setup`,
   `tests/test_api.py::test_oauth_rate_limit_defers_without_sleep_or_repeat`,
   `tests/test_api.py::test_persisted_oauth_cooldown_survives_restart_and_expires`,
+  `tests/test_api.py::test_concurrent_token_checks_create_only_one_token`,
+  `tests/test_api.py::test_late_unauthorized_response_reuses_newer_token`,
+  `tests/test_api.py::test_credential_validation_reuses_token_and_fetches_one_listing`,
+  `tests/test_config_flow.py::test_reauth_reuses_private_token_for_unchanged_credentials`,
+  `tests/test_config_flow.py::test_reauth_honors_private_oauth_cooldown_without_network`,
+  `tests/test_config_flow.py::test_changed_secret_keeps_client_cooldown_but_not_previous_token`,
+  `tests/test_config_flow.py::test_reauth_rejects_credentials_for_another_account`,
+  `tests/test_config_flow.py::test_loaded_reauth_uses_update_listener_without_second_reload`,
   `tests/test_coordinator.py::test_oauth_rate_limit_starts_from_cache_in_degraded_state`,
   `tests/test_coordinator.py::test_auth_failure_starts_reauthentication`,
+  `tests/test_coordinator.py::test_successful_api_sync_aborts_stale_reauthentication_flow`,
+  `tests/test_coordinator.py::test_degraded_cached_sync_keeps_reauthentication_flow`,
   [Guesty Authentication](https://open-api-docs.guesty.com/docs/authentication)
 
 OAuth refresh is shared and serialized. Guesty documents that an expired
@@ -288,6 +308,71 @@ persisting the same deadline. Coordinator polls and Home Assistant restarts
 before that deadline fail locally without another OAuth request. Once the
 deadline passes, the shared client permits exactly one serialized token request
 and normal polling clears the persisted cooldown.
+
+The reauthentication and credential-replacement dialogs participate in the
+same private token lifecycle. If Client ID and Client Secret are unchanged,
+validation reuses the cached Bearer token and expiration instead of minting a
+diagnostic token, and always honors the stored OAuth cooldown. Rotating only
+the secret preserves the cooldown for that Client ID but never reuses the old
+Bearer token. A different Client ID receives no old authentication state.
+Before Home Assistant accepts credentials, validation proves the same API
+surfaces required by the coordinator: account identity, listings, and
+reservations.
+
+A successful live coordinator synchronization is proof that a previously
+started reauthentication repair is stale and aborts that active flow, which
+also removes Home Assistant's repair issue. A degraded result assembled from
+cache is not proof of recovery and must leave the repair intact.
+
+#### Mandatory Guesty login and reauthentication state machine
+
+Future authentication work must preserve this exact sequence:
+
+1. **Initial credential validation.** Normalize Client ID and Client Secret and
+   reject empty values locally. With no existing entry, request one OAuth
+   access token, then prove access to `/accounts/me`, `/listings`, and
+   `/reservations`. Derive the config-entry identity from the Guesty account ID;
+   never expose the account ID as the public unique ID.
+2. **Token handoff without a second login.** Put the token and expiration
+   produced by validation into the new config entry only as a transient setup
+   handoff. Runtime startup must reuse that exact token for its first sync,
+   persist the current token, expiration, and cooldown in the private general
+   store, then remove token and expiration from config-entry data. Client ID and
+   Client Secret remain the stable application credentials.
+3. **Normal authenticated requests.** Reuse a cached token while it is valid
+   beyond the refresh margin. A missing or expiring token may trigger one
+   refresh guarded by the shared async token lock. Concurrent callers and a
+   late `401`/`403` for an older token must observe and reuse a newer token
+   rather than mint another one.
+4. **Rejected Bearer token.** On the first `401` or `403`, invalidate the
+   rejected token, refresh once, and retry the original request once. A fresh
+   token rejected with `401` is an authentication failure; a fresh token
+   rejected with `403` is a permission failure. Neither result may enter an
+   automatic refresh loop.
+5. **Transient failure and OAuth `429`.** Retry only retry-safe transport,
+   `408`, `429`, and server failures with bounded backoff. An OAuth `429` never
+   sleeps inside config-entry setup and never starts reauthentication. Persist
+   its bounded absolute `Retry-After` deadline privately, return cached data as
+   degraded when available, and reject every pre-deadline refresh locally
+   without network traffic. After expiry, allow exactly one serialized token
+   request and clear the cooldown only on success.
+6. **Reauthentication or proactive credential replacement.** Load private auth
+   state only when the submitted Client ID matches the configured Client ID.
+   If both Client ID and Secret are unchanged, reuse token, expiration, and
+   cooldown. If only the Secret changes, retain the Client ID cooldown but
+   never reuse the old Bearer token. If the Client ID changes, reuse none of the
+   old auth state. Accept replacement credentials only after the three endpoint
+   checks succeed and the derived Guesty account identity matches the existing
+   entry.
+7. **Reload and repair completion.** Updating credentials has exactly one
+   reload owner: the update listener for a loaded entry, or one explicitly
+   scheduled reload for an unloaded entry. A successful live coordinator sync
+   aborts any stale reauthentication flow and removes its Home Assistant repair
+   issue. Cached or degraded data must not claim authentication recovery.
+
+This sequence prevents OAuth token amplification, restart-based cooldown
+bypass, false credential-expiry repairs, account switching, duplicate reloads,
+and repair notices that survive after Guesty access has actually recovered.
 
 ### KB-GUESTY-007 — Incoming webhooks are authenticated before work
 
@@ -508,25 +593,53 @@ are available only after explicit privacy opt-in.
 
 ## Shared PIN lifecycle
 
-### KB-PIN-001 — Guesty's native Keycode is authoritative
+### KB-PIN-001 — Native Keycode and a custom field are reconciled mirrors
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: `custom_components/guesty/loxone.py`,
-  `tests/test_loxone.py`, `tests/test_models.py`
+  `tests/test_loxone.py::test_existing_custom_field_pin_is_adopted_and_fills_native`,
+  `tests/test_loxone.py::test_custom_only_mode_ignores_native_keycode_completely`,
+  `tests/test_loxone.py::test_native_only_mode_ignores_custom_field_completely`,
+  `tests/test_config_flow.py::test_options_flow_preserves_legacy_pin_custom_field_suggestion`,
+  manual-source edit, mismatch, sparse-response, and retry tests
 
-The sole source and destination for reservation PINs is Guesty's native
-Reservations-v3 `notes.keyCode`. Once Guesty has confirmed six numeric digits,
-the integration never rotates them automatically. A valid unique manual edit
-in Guesty becomes the new authority and propagates to existing Loxone and
-TTLock objects.
+Every reservation PIN has two Guesty mirrors: native Reservations-v3
+`notes.keyCode` and a configurable reservation custom field whose default is
+`{{door_code}}`. The field reference accepts a safe ID, display name, or
+`{{variable}}`. Both sources retain independent confirmed baselines, sync
+flags, error reasons, and retry state in the private store.
+Each mirror is independently configurable and both default to enabled. At least
+one must remain enabled whenever Loxone or TTLock is active. A disabled mirror
+is excluded from reads, writes, merge/conflict decisions, retry scheduling, and
+aggregate readiness. Its last confirmed private baseline is retained only so a
+later re-enable can reconcile safely without rotating the numeric PIN. Runtime
+also fails closed if malformed legacy options disable both sources.
+An older `loxone_custom_field` option remains a read-only migration fallback
+until the next options save, so a previously selected non-default field is not
+silently replaced. Saving options moves the normalized non-blank reference to
+the shared `pin_custom_field` key and removes the legacy key.
 
-If a confirmed Keycode is explicitly cleared, invalid, or duplicated, remote
-delivery is revoked and a conflict is shown. The integration does not invent a
-replacement after confirmation. A new reservation whose observed Keycode is
-initially empty may receive its first generated PIN. Duplicate ownership is
-deterministic: the first healthy established reservation keeps delivery; later
-duplicates remain blocked until manually corrected in Guesty.
+The deterministic merge rules are:
+
+1. Both empty and no confirmed private PIN: generate one PIN once.
+2. Exactly one populated: adopt it and fill only the empty mirror.
+3. Both equal: adopt without a write.
+4. Exactly one differs from its source baseline: treat that valid unique manual
+   edit as canonical and propagate it to the other mirror and providers.
+5. One explicitly emptied while the other retains the canonical value: restore
+   the empty mirror; do not delete or rotate the PIN.
+6. Both changed to different values, or an unexplained initial mismatch: fail
+   closed and write neither field.
+7. Invalid, duplicate, or both-confirmed-and-emptied values: fail closed.
+
+Once either mirror has confirmed the canonical six digits, Loxone/TTLock may
+proceed. Failure of one Guesty endpoint does not block the other successful
+mirror. The failed mirror is retried with bounded persistent backoff, and its
+old value cannot be mistaken for a later manual edit. Confirmed digits never
+rotate automatically. Duplicate ownership remains deterministic: the first
+healthy established reservation keeps delivery; later duplicates stay blocked
+until manually corrected in Guesty.
 
 ### KB-PIN-002 — Generated PINs and display suffixes are separate
 
@@ -545,24 +658,27 @@ A listing may append up to eight printable non-digit characters such as `#`,
 six digits. Changing a suffix republishes the display value without rotating
 the PIN.
 
-### KB-PIN-003 — Guesty Keycode writes share one persistent budget
+### KB-PIN-003 — Both Guesty PIN mirrors share one persistent budget
 
 - Status: Validated
 - Last validated: 2026-07-29
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_two_keycodes_are_written_per_30_second_window`,
-  `tests/test_loxone.py::test_keycode_endpoint_failure_does_not_stop_unrelated_write`,
+  `tests/test_loxone.py::test_keycode_endpoint_failure_prioritizes_custom_fallback`,
   `tests/test_loxone.py::test_guesty_write_budget_preserves_reported_api_headroom`,
   `tests/test_loxone.py::test_exhausted_guesty_headroom_queues_without_a_put`,
   `tests/test_loxone.py::test_persisted_guesty_write_limit_survives_manager_restart`
 
-All Keycode publication paths share a persistent global limit of at most two
+All native and custom-field PIN publication paths share a persistent global
+limit of at most two
 write attempts in any 30-second window. Failed and ambiguous writes consume a
 slot. Queue passes, webhook work, reservation-specific retries, source
 migration, suffix changes, and restarts must not bypass it. Current and nearest
 stays are prioritized while preserving Guesty API headroom.
 
-Every documented v3 Keycode PUT consumes exactly one slot. An application-wide
+Every documented v3 native or custom-field PUT consumes exactly one slot. New
+reservations receive one confirmed mirror before redundancy backfill is allowed
+to consume capacity. An application-wide
 notes-endpoint, authentication, permission, transport, or payload failure may
 stop the current batch so the remaining slot and normal Guesty synchronization
 headroom are not wasted on the same predictable error. A reservation-specific
@@ -592,8 +708,9 @@ indefinitely.
 The privacy-filtered general cache never stores Keycodes. The private shared
 PIN store holds plaintext only while required for delivery and cleanup.
 Cancellation or access end removes local plaintext before attempting remote
-cleanup. Guesty's native Keycode remains as booking documentation. Status
-sensors report safe states, counts, times, and reasons, never the PIN.
+cleanup. Both Guesty mirrors remain as booking documentation. Status sensors
+report safe states, per-mirror booleans, counts, times, and reasons, never the
+PIN.
 
 ### KB-PIN-005 — Persistent Guesty retries recover across API migrations
 
@@ -814,26 +931,32 @@ must not be copied into logs or diagnostics.
 External service URLs must be HTTPS and must not contain credentials. TTLock
 hosts are allowlisted rather than user-arbitrary.
 
-### KB-SAFE-004 — Stale data blocks grants but not scheduled cleanup
+### KB-SAFE-004 — Offline grants use only an exact confirmed snapshot
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: `custom_components/guesty/access.py`,
   `custom_components/guesty/loxone.py`,
-  `custom_components/guesty/ttlock.py`, provider stale-data tests
+  `custom_components/guesty/ttlock.py`, exact-window provider outage tests
 
-When Guesty data exceeds the configured stale threshold, do not create new
-access, extend access, or accept a door unlock. Previously stored end times
-still own revocation and remote cleanup so an outage cannot leave access active
-past the last confirmed checkout. Recovery uses bounded backoff and resumes
-without a manual integration reload.
+When Guesty data exceeds the configured stale threshold, never generate a PIN,
+infer a reservation, accept a door-page unlock, or extend a validity window.
+The PIN-provider offline option is enabled by default and may create/update a
+Loxone user or TTLock passcode only when the private store contains a PIN and
+reservation/listing snapshot confirmed during a fresh Guesty pass. The provider
+must use exactly the stored start and end; a modified stale projection cannot
+extend it. Strict operators may disable offline provisioning, which blocks all
+new provider grants while stale. Previously stored end times own revocation in
+both modes. Recovery uses bounded backoff and needs no manual reload.
 
 ### KB-HA-001 — Configuration is UI-driven and preserves blank secrets
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: `custom_components/guesty/config_flow.py`,
-  `tests/test_config_flow.py`
+  `custom_components/guesty/__init__.py`,
+  `tests/test_config_flow.py::test_reauth_updates_credentials_and_token`,
+  `tests/test_config_flow.py::test_loaded_reauth_uses_update_listener_without_second_reload`
 
 Setup, reauthentication, credential replacement, and all optional features are
 configured through Home Assistant flows. A blank password/client-secret field
@@ -847,31 +970,41 @@ Assistant's suggested-value helper can rebuild a Voluptuous schema with
 restore `REMOVE_EXTRA`. Failing to do so previously produced “extra keys not
 allowed” followed by “Unknown error.”
 
+Credential updates have one reload owner. A loaded entry is reloaded by its
+registered update listener; an entry that failed setup and is not loaded is
+scheduled explicitly by the config flow. Combining that listener with Home
+Assistant's update-and-reload helper creates duplicate, racing reloads and is
+forbidden.
+
 ### KB-FAILOVER-001 — Backup operation is active/passive only
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Evidence: current manager ownership design, `README.md`
 
 Exactly one Home Assistant instance may be the active writer. During deliberate
-failover, the replacement instance adopts the stable native Guesty Keycode and
-may overwrite the old door-link custom field with its own URL. Active/active is
+failover, the replacement instance adopts the stable value from the Guesty PIN
+mirrors and repairs an empty mirror. It may overwrite the old door-link custom
+field with its own URL. Active/active is
 unsupported because parallel writers can compete over URLs, remote objects,
-PIN conflicts, and API capacity. A separate shared custom field is not a safe
-coordination mechanism.
+PIN conflicts, and API capacity. A third shared custom field is not a safe
+active-writer coordination mechanism; the PIN mirrors store the stable
+business value, not a lease or leader lock.
 
 ## Retired assumptions
 
-### KB-RET-001 — Reservation custom fields are not the PIN authority
+### KB-RET-001 — Native Keycode is not the sole PIN authority
 
 - Status: Retired
-- Last validated: 2026-07-28
+- Last validated: 2026-07-31
 - Superseded by: KB-PIN-001
 - Evidence: `custom_components/guesty/loxone.py`, `README.md`
 
-Older releases stored PINs in a configurable reservation custom field. Do not
-restore that fallback. Reservation custom fields remain valid only for the
-separate door-access URL.
+Releases through v2.2 treated native `notes.keyCode` as the sole source and
+destination. That assumption is retired because Guesty can reject the native
+write route for individual channel reservations. The configured PIN custom
+field is now a fully verified redundant mirror with deterministic per-source
+baselines. It remains separate from the door-access URL custom field.
 
 ### KB-RET-002 — Legacy reservation reads cannot validate native Keycodes
 
@@ -962,3 +1095,6 @@ tag points to the same commit and manifest version.
 | 2026-07-28 | Targeted Booking.com isolation | The same OAuth client and v3 request that changed `manual` and `be-api` controls received 404 when initializing one exact readable future Booking.com reservation; read-back remained empty and no retry was issued |
 | 2026-07-29 | Full-project logic, reliability, security, and completeness audit | Preserved global stale state across targeted webhooks, added automatic remote-webhook recovery, required explicit TTLock mutation confirmation, kept reservation-specific Keycode failures from starving other writes, enforced Guesty API headroom, and removed full reservation IDs from logs |
 | 2026-07-29 | Post-audit reliability and privacy remediation | Made diagnostics allowlist-only, redacted retry paths/details, separated Guesty rate-limit windows, prevented second-bucket stalls and no-traffic loops, and made occupancy/Loxone/TTLock task teardown explicit and regression-tested |
+| 2026-07-31 | Focused Guesty reauthentication recovery review | Reused private auth state and OAuth cooldown in credential flows, validated reservation access before acceptance, removed stale repair flows only after a live API success, eliminated duplicate credential-update reload ownership, and recorded the mandatory login/reauthentication state machine |
+| 2026-07-31 | Dual Guesty PIN mirror and offline-provider review | Added deterministic per-source baselines for native Keycode and configurable `{{door_code}}`, one-field adoption/restoration, fail-closed ambiguity handling, shared persistent write limits, exact confirmed offline windows for Loxone/TTLock, migration coverage, safe diagnostics, and UI documentation |
+| 2026-07-31 | Selectable Guesty PIN-source review | Added independent Keycode/custom-field switches, removed disabled sources from reads, writes, conflicts, retries, and readiness, retained safe re-enable baselines, and enforced at least one active source for configured PIN providers |

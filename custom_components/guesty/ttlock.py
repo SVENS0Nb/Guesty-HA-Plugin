@@ -18,6 +18,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import GuestyApiError, GuestyAuthError
 from .const import (
+    CONF_PIN_OFFLINE_PROVISIONING,
     CONF_TTLOCK_ACCESS_TOKEN,
     CONF_TTLOCK_ACCOUNT,
     CONF_TTLOCK_CLIENT_ID,
@@ -32,6 +33,7 @@ from .const import (
     CONF_TTLOCK_REGION,
     CONF_TTLOCK_TOKEN_EXPIRES_AT,
     CONF_TTLOCK_USERNAME,
+    DEFAULT_PIN_OFFLINE_PROVISIONING,
     DEFAULT_TTLOCK_PROVISION_LEAD_MINUTES,
     TTLOCK_MAX_LOCKS_PER_LISTING,
     TTLOCK_RETRY_BASE_SECONDS,
@@ -40,7 +42,7 @@ from .const import (
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .loxone import GuestyLoxoneManager
-from .models import GuestyReservation
+from .models import GuestyListing, GuestyReservation
 from .ttlock_api import (
     TTLockApiClient,
     TTLockApiError,
@@ -256,7 +258,9 @@ class GuestyTTLockManager:
             enabled = bool(self.entry.options.get(CONF_TTLOCK_ENABLED, False))
             data_stale = data is None or bool(getattr(data, "data_stale", False))
             eligible: dict[str, GuestyReservation] = {}
+            listings: dict[str, GuestyListing] = {}
             if enabled and data is not None:
+                listings = dict(data.listings)
                 eligible = {
                     reservation.id: reservation
                     for reservation in data.reservations
@@ -264,6 +268,21 @@ class GuestyTTLockManager:
                     and reservation.listing_id in self._mappings
                     and reservation.listing_id in data.listings
                 }
+            offline_provisioning = bool(
+                self.entry.options.get(
+                    CONF_PIN_OFFLINE_PROVISIONING,
+                    DEFAULT_PIN_OFFLINE_PROVISIONING,
+                )
+            )
+            if data_stale and enabled and offline_provisioning:
+                for (
+                    reservation,
+                    listing,
+                ) in self._pin_manager.offline_reservation_snapshots():
+                    if reservation.listing_id not in self._mappings:
+                        continue
+                    eligible.setdefault(reservation.id, reservation)
+                    listings.setdefault(listing.id, listing)
 
             for reservation_id in list(self._records):
                 if reservation_id in eligible:
@@ -292,23 +311,32 @@ class GuestyTTLockManager:
                     if retry_at is not None:
                         next_run = self._earlier(next_run, retry_at)
 
-            if data is not None:
+            if eligible:
                 for reservation in sorted(
                     eligible.values(),
                     key=lambda item: self._reservation_sync_order(
                         item,
-                        data.listings[item.listing_id],
+                        listings[item.listing_id],
                         now,
                     ),
                 ):
-                    listing = data.listings[reservation.listing_id]
-                    try:
-                        start, end = self._pin_manager.reservation_access_window(
-                            reservation, listing
-                        )
-                    except (TypeError, ValueError):
-                        errors.append("invalid_reservation_time")
-                        continue
+                    listing = listings[reservation.listing_id]
+                    pin = self._pin_manager.reservation_pin_snapshot(reservation.id)
+                    if data_stale:
+                        start = self._parse_time(pin.get("access_start"))
+                        end = self._parse_time(pin.get("access_end"))
+                        if start is None or end is None:
+                            # Never derive or extend a remote validity window
+                            # from an unconfirmed schedule during an outage.
+                            continue
+                    else:
+                        try:
+                            start, end = self._pin_manager.reservation_access_window(
+                                reservation, listing
+                            )
+                        except (TypeError, ValueError):
+                            errors.append("invalid_reservation_time")
+                            continue
                     record = self._records.setdefault(reservation.id, {})
                     record["listing_id"] = reservation.listing_id
                     record["access_start"] = start.isoformat()
@@ -324,7 +352,7 @@ class GuestyTTLockManager:
                             errors.append(self._error_reason(err))
                         continue
                     next_run = self._earlier(next_run, end)
-                    if data_stale:
+                    if data_stale and not offline_provisioning:
                         continue
 
                     lock_ids = self._mapping_lock_ids(reservation.listing_id)
@@ -388,9 +416,14 @@ class GuestyTTLockManager:
                         next_run = self._earlier(next_run, provision_at)
                         continue
 
-                    pin = self._pin_manager.reservation_pin_snapshot(reservation.id)
                     code = pin.get("code")
                     if not pin.get("field_synced") or not isinstance(code, str):
+                        if data_stale:
+                            # An outage cannot invalidate a previously delivered
+                            # code. Keep remote state unchanged until a confirmed
+                            # private snapshot or fresh Guesty data is available.
+                            next_run = self._earlier(next_run, end)
+                            continue
                         if record.get("locks"):
                             try:
                                 await self._async_delete_all(record, marker)

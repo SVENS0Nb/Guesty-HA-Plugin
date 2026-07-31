@@ -12,7 +12,7 @@
       },
       "reauth_confirm": {
         "title": "Reconnect Guesty",
-        "description": "Guesty rejected access again after the access token was refreshed automatically. Re-enter the Client ID and Client Secret, or replace them if they changed.",
+        "description": "Guesty rejected access after the access token was refreshed automatically. Re-enter the Client ID and Client Secret to validate them again, or replace them if they changed. Unchanged credentials reuse the private token and any active Guesty wait period.",
         "data": {
           "client_id": "Client ID",
           "client_secret": "Client Secret"
@@ -29,7 +29,7 @@
     },
     "error": {
       "invalid_auth": "Invalid API credentials (wrong Client ID or Secret)",
-      "no_permissions": "Token received but no listing access – check Open API permissions in Guesty",
+      "no_permissions": "Token received but no listing or reservation access – check Open API permissions in Guesty",
       "cannot_connect": "Failed to connect to the Guesty API",
       "unknown": "Unknown error"
     },
@@ -52,9 +52,19 @@
           "reservation_days_future": "Future days for reservations",
           "stale_threshold_hours": "Stale threshold (hours)",
           "expose_guest_details": "Show guest names and confirmation codes in entities",
+          "pin_native_enabled": "Synchronize Guesty Keycode",
+          "pin_custom_enabled": "Synchronize reservation PIN custom field",
+          "pin_custom_field": "Reservation PIN custom field name or ID",
+          "pin_offline_provisioning": "Allow confirmed PIN schedules during a Guesty outage",
           "access_enabled": "Enable secure guest door access",
           "loxone_enabled": "Enable Loxone reservation PINs",
           "ttlock_enabled": "Enable TTLock reservation PINs"
+        },
+        "data_description": {
+          "pin_native_enabled": "Reads and writes Guesty's native reservation Keycode. Disable this temporarily if Guesty's Keycode endpoint is unreliable.",
+          "pin_custom_enabled": "Reads and writes the separately created reservation custom field for the PIN.",
+          "pin_custom_field": "Guesty PIN source. The default {{door_code}} may be replaced with another reservation custom-field name, variable, or ID.",
+          "pin_offline_provisioning": "Uses only the last Guesty-confirmed PIN and access window while Guesty is unreachable. New or extended access is never inferred offline."
         }
       },
       "access": {
@@ -107,7 +117,7 @@
       },
       "loxone": {
         "title": "Loxone reservation PINs",
-        "description": "Generate one six-digit code per reservation and store it only in Guesty's native Keycode field. The native Keycode is the source of truth, so valid manual changes are synchronized to Loxone and TTLock. Once Guesty confirms a code, it is never changed automatically; duplicate or provider conflicts remain blocked until the code is changed manually in Guesty. No door-code custom field is required. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
+        "description": "Generate one stable six-digit code per reservation and synchronize it through the Guesty PIN sources enabled in the general options. Native Keycode and the configurable reservation custom field can be used separately or together; valid manual changes in an enabled source are synchronized to Loxone and TTLock. Once Guesty confirms a code, it is never changed automatically. Loxone users are created only shortly before access begins and are automatically deleted after access ends. The same early/late offsets as the door links are used.",
         "data": {
           "loxone_provision_lead_minutes": "Create Loxone user before access starts (minutes)",
           "loxone_code_prefix": "Reserved PIN prefix (1–2 digits)",
@@ -140,7 +150,7 @@
       },
       "ttlock": {
         "title": "TTLock reservation PINs",
-        "description": "Codes are stored only in Guesty's native Keycode field; no door-code custom field is required. First create an application in [TTLock Open Platform]({open_platform_url}). See [TTLock OAuth help]({oauth_doc_url}) if needed. Use the TTLock App account that manages the locks—not the developer-portal login. Only V4 locks with an online gateway are shown.",
+        "description": "Codes are synchronized through the Guesty PIN sources enabled in the general options. Native Keycode and the configurable reservation custom field can be used separately or together. First create an application in [TTLock Open Platform]({open_platform_url}). See [TTLock OAuth help]({oauth_doc_url}) if needed. Use the TTLock App account that manages the locks—not the developer-portal login. Only V4 locks with an online gateway are shown.",
         "data": {
           "loxone_code_prefix": "PIN prefix",
           "access_early_minutes": "Access before check-in (minutes)",
@@ -185,6 +195,7 @@
       "same_lock": "The same lock cannot be assigned twice",
       "invalid_code_suffix": "The Guesty code suffix must contain at most 8 visible non-numeric characters",
       "invalid_code_prefix": "The PIN prefix must contain 1 or 2 digits",
+      "pin_source_required": "Enable at least one Guesty PIN source when Loxone or TTLock is enabled",
       "custom_field_not_found": "Enter a Guesty reservation custom field name, variable, or ID",
       "loxone_invalid_auth": "Loxone rejected the account or it lacks User management rights",
       "loxone_cannot_connect": "Could not connect securely to this Loxone Miniserver",

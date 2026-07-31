@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
 import pytest
@@ -22,6 +23,7 @@ from custom_components.guesty.const import (
     CONF_CLIENT_SECRET,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_NATIVE_ENABLED,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_SCAN_INTERVAL,
@@ -234,6 +236,95 @@ async def test_oauth_rate_limit_starts_from_cache_in_degraded_state(
     assert result.sync_status == SYNC_STATUS_DEGRADED
     assert result.data_stale is True
     assert storage.async_save.await_args.args[0]["token_retry_at"] == retry_at
+
+
+@pytest.mark.asyncio
+async def test_successful_api_sync_aborts_stale_reauthentication_flow(hass) -> None:
+    """A proven live recovery clears Home Assistant's stale repair issue."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=2_000_000.0,
+        token_retry_at=None,
+        async_get_listings=AsyncMock(return_value=[_listing()]),
+        async_get_reservations=AsyncMock(return_value=[]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
+    instance = GuestyDataUpdateCoordinator(hass, entry, client, storage)
+
+    await instance._async_fetch_data(full_reservation_sync=True)
+
+    assert not list(entry.async_get_active_flows(hass, {SOURCE_REAUTH}))
+    assert not any(
+        flow["flow_id"] == form["flow_id"]
+        for flow in hass.config_entries.flow.async_progress()
+    )
+
+
+@pytest.mark.asyncio
+async def test_degraded_cached_sync_keeps_reauthentication_flow(
+    hass, monkeypatch
+) -> None:
+    """Cached data alone is never proof that authentication recovered."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    entry = _entry()
+    entry.add_to_hass(hass)
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_sync": NOW.isoformat(),
+            "last_listing_sync": NOW.isoformat(),
+            "last_reservation_sync": NOW.isoformat(),
+            "last_full_reservation_sync": NOW.isoformat(),
+            "last_incremental_sync": NOW.isoformat(),
+        }
+    )
+    client = SimpleNamespace(
+        access_token=None,
+        token_expires_at=None,
+        token_retry_at=9_876_543_210.0,
+        async_get_reservations=AsyncMock(
+            side_effect=GuestyRetryableError(
+                "Guesty token request deferred by rate limit",
+                900.0,
+                status_code=429,
+                endpoint="oauth2",
+            )
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    abort = MagicMock(wraps=hass.config_entries.flow.async_abort)
+    monkeypatch.setattr(hass.config_entries.flow, "async_abort", abort)
+    instance = GuestyDataUpdateCoordinator(hass, entry, client, storage)
+
+    result = await instance._async_fetch_data(full_reservation_sync=False)
+
+    assert result.sync_status == SYNC_STATUS_DEGRADED
+    abort.assert_not_called()
+    assert any(
+        flow["flow_id"] == form["flow_id"]
+        for flow in entry.async_get_active_flows(hass, {SOURCE_REAUTH})
+    )
 
 
 @pytest.mark.asyncio
@@ -549,6 +640,28 @@ async def test_mapped_active_reservations_receive_authoritative_v3_keycodes(
     assert mapped.key_code_observed is True
     assert unmapped.key_code_observed is False
     assert inactive.key_code_observed is False
+
+
+@pytest.mark.asyncio
+async def test_disabled_native_keycode_source_skips_v3_enrichment(hass) -> None:
+    """Disabling Keycode removes its additional read traffic and observations."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={
+            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+            CONF_PIN_NATIVE_ENABLED: False,
+        },
+    )
+    reservation = _reservation("507f1f77bcf86cd799439011")
+    client = SimpleNamespace(async_get_reservation_key_codes=AsyncMock())
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([reservation])
+
+    client.async_get_reservation_key_codes.assert_not_awaited()
+    assert reservation.key_code_observed is False
 
 
 @pytest.mark.asyncio
