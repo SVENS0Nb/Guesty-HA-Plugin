@@ -452,6 +452,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   validity window. Booking time changes update existing passcodes without PIN
   rotation. Moving a stay outside the lead removes the remote passcode and adds
   it later with the same Guesty PIN.
+- When TTLock is enabled or repaired after a stay has already started, clamp a
+  previously undelivered lock's remote start to the first reconciliation time
+  and persist that per-lock value. Reuse it across retries and restarts so the
+  start never drifts forward; never extend the confirmed checkout end. Preserve
+  the original start of an already confirmed healthy passcode during upgrades.
 - Track every lock independently. Persist partial successes so one offline
   gateway causes targeted retry, not duplicate creation on successful locks.
 - Before add, check for code conflicts. A remote conflict deletes any tentative

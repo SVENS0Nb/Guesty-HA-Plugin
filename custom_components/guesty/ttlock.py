@@ -64,6 +64,10 @@ _REMOTE_PENDING_RETRY = timedelta(seconds=30)
 _REMOTE_NORMAL_STATUS = 1
 _REMOTE_INVALID_STATUSES = {2, 5, 7, 9}
 _REMOTE_PENDING_STATUSES = {3, 4, 6, 8}
+_REMOTE_VALID_FROM_KEY = "remote_valid_from"
+_REMOTE_VALID_FROM_CLAMPED_KEY = "remote_valid_from_clamped"
+_RETROACTIVE_START_STATE_VERSION_KEY = "retroactive_start_state_version"
+_RETROACTIVE_START_STATE_VERSION = 1
 
 
 class GuestyTTLockStorage:
@@ -177,6 +181,17 @@ class GuestyTTLockManager:
     async def async_setup(self) -> None:
         """Load state, subscribe to shared PIN changes, and reconcile."""
         self._data = await self._storage.async_load()
+        recovered_retries, state_changed = self._migrate_retroactive_start_state(
+            dt_util.utcnow()
+        )
+        if state_changed:
+            await self._storage.async_save(self._data)
+        if recovered_retries:
+            _LOGGER.warning(
+                "Rescheduled TTLock retries for active reservations "
+                "count=%s reason=retroactive_start_migration",
+                recovered_retries,
+            )
         if self.entry.options.get(CONF_TTLOCK_ENABLED, False):
             try:
                 self._client = self._client_from_account(
@@ -189,6 +204,53 @@ class GuestyTTLockManager:
             self.async_schedule_reconcile
         )
         self.async_schedule_reconcile()
+
+    def _migrate_retroactive_start_state(self, now: datetime) -> tuple[int, bool]:
+        """Requeue old failures that used an already elapsed TTLock start."""
+        raw_version = self._data.get(_RETROACTIVE_START_STATE_VERSION_KEY, 0)
+        version = (
+            raw_version
+            if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+            else 0
+        )
+        if version >= _RETROACTIVE_START_STATE_VERSION:
+            return 0, False
+
+        recovered = 0
+        if self.entry.options.get(CONF_TTLOCK_ENABLED, False):
+            for record in self._records.values():
+                if not isinstance(record, dict) or record.get("retired"):
+                    continue
+                listing_id = record.get("listing_id")
+                if not isinstance(listing_id, str):
+                    continue
+                lock_ids = self._mapping_lock_ids(listing_id)
+                if not lock_ids:
+                    continue
+                start = self._parse_time(record.get("access_start"))
+                end = self._parse_time(record.get("access_end"))
+                if start is None or end is None or not start < now < end:
+                    continue
+                locks = record.get("locks")
+                if not isinstance(locks, dict):
+                    locks = {}
+                needs_delivery = any(
+                    not self._state_has_confirmed_delivery(locks.get(str(lock_id)))
+                    for lock_id in lock_ids
+                )
+                if (
+                    needs_delivery
+                    and record.get("last_error") == "ttlock_api_error"
+                    and self._retry_at(record) is not None
+                ):
+                    self._clear_retry(record)
+                    record.pop("last_error", None)
+                    recovered += 1
+
+        self._data[_RETROACTIVE_START_STATE_VERSION_KEY] = (
+            _RETROACTIVE_START_STATE_VERSION
+        )
+        return recovered, True
 
     async def async_unload(self) -> None:
         """Stop timers and background work."""
@@ -515,7 +577,8 @@ class GuestyTTLockManager:
             state = locks.setdefault(str(lock_id), {})
             if not isinstance(state, dict):
                 state = locks[str(lock_id)] = {}
-            fingerprint = self._fingerprint(lock_id, code, start, end)
+            remote_start = self._remote_valid_from(state, start, end, now)
+            fingerprint = self._fingerprint(lock_id, code, remote_start, end)
             verified_at = self._parse_time(state.get("verified_at"))
             if (
                 state.get("fingerprint") == fingerprint
@@ -542,6 +605,8 @@ class GuestyTTLockManager:
                     state.pop(key, None)
                 password_id = None
                 owned = None
+                remote_start = self._remote_valid_from(state, start, end, now)
+                fingerprint = self._fingerprint(lock_id, code, remote_start, end)
 
             if not isinstance(password_id, int):
                 recovered = next(
@@ -566,7 +631,7 @@ class GuestyTTLockManager:
                     password_id=password_id,
                     code=code,
                     name=marker,
-                    start=start,
+                    start=remote_start,
                     end=end,
                 )
             ):
@@ -589,6 +654,8 @@ class GuestyTTLockManager:
                         state.pop(key, None)
                     password_id = None
                     owned = None
+                    remote_start = self._remote_valid_from(state, start, end, now)
+                    fingerprint = self._fingerprint(lock_id, code, remote_start, end)
                     passcodes = await self._async_list_passcodes(
                         client, lock_id, force=True
                     )
@@ -612,7 +679,7 @@ class GuestyTTLockManager:
                         password_id=password_id,
                         code=code,
                         name=marker,
-                        valid_from=start,
+                        valid_from=remote_start,
                         valid_until=end,
                     )
                     self._invalidate_passcode_cache(client, lock_id)
@@ -626,7 +693,7 @@ class GuestyTTLockManager:
                             password_id=password_id,
                             code=code,
                             name=marker,
-                            start=start,
+                            start=remote_start,
                             end=end,
                         )
                         for item in recovered
@@ -641,7 +708,7 @@ class GuestyTTLockManager:
                         lock_id=lock_id,
                         code=code,
                         name=marker,
-                        valid_from=start,
+                        valid_from=remote_start,
                         valid_until=end,
                     )
                     state["keyboard_pwd_id"] = password_id
@@ -660,7 +727,7 @@ class GuestyTTLockManager:
                                 password_id=None,
                                 code=code,
                                 name=marker,
-                                start=start,
+                                start=remote_start,
                                 end=end,
                             )
                         ),
@@ -687,7 +754,7 @@ class GuestyTTLockManager:
                         password_id=password_id,
                         code=code,
                         name=marker,
-                        start=start,
+                        start=remote_start,
                         end=end,
                     )
                 ),
@@ -1236,6 +1303,44 @@ class GuestyTTLockManager:
             verified_at is not None
             and verified_at <= now < verified_at + _REMOTE_VERIFY_INTERVAL
         )
+
+    @classmethod
+    def _state_has_confirmed_delivery(cls, state: Any) -> bool:
+        """Return whether state represents a previously confirmed passcode."""
+        return bool(
+            isinstance(state, Mapping)
+            and cls._as_int(state.get("keyboard_pwd_id")) is not None
+            and isinstance(state.get("fingerprint"), str)
+        )
+
+    @classmethod
+    def _remote_valid_from(
+        cls,
+        state: dict[str, Any],
+        booking_start: datetime,
+        booking_end: datetime,
+        now: datetime,
+    ) -> datetime:
+        """Return one stable per-lock start for retroactive provisioning."""
+        stored = cls._parse_time(state.get(_REMOTE_VALID_FROM_KEY))
+        clamped = state.get(_REMOTE_VALID_FROM_CLAMPED_KEY) is True
+
+        if clamped and stored is not None and booking_start <= now:
+            if stored <= now and stored < booking_end:
+                return stored
+
+        if booking_start < now and not cls._state_has_confirmed_delivery(state):
+            # A TTLock period code can become invalid when it is first delivered
+            # long after its transmitted start. The elapsed part of a current
+            # stay can no longer grant access, so clamp once and persist it.
+            effective = now.replace(microsecond=0)
+            state[_REMOTE_VALID_FROM_KEY] = effective.isoformat()
+            state[_REMOTE_VALID_FROM_CLAMPED_KEY] = True
+            return effective
+
+        state[_REMOTE_VALID_FROM_KEY] = booking_start.isoformat()
+        state[_REMOTE_VALID_FROM_CLAMPED_KEY] = False
+        return booking_start
 
     @staticmethod
     def _record_retry_failure(record: dict[str, Any], now: datetime) -> None:

@@ -540,6 +540,10 @@ ist dafür nicht erforderlich.
 - Änderungen an Check-in, Check-out oder den Zugangs-Offsets aktualisieren die
   Gültigkeitszeit auf allen zugeordneten Schlössern. Der Code bleibt dabei
   unverändert.
+- Wird TTLock erst während eines bereits laufenden Aufenthalts aktiviert oder
+  nach einem Fehler wieder erreichbar, beginnt ein noch nicht übertragener
+  Passcode einmalig zum Zeitpunkt der Nachholung. Dieser Zeitpunkt bleibt auch
+  über Neustarts stabil; das bestätigte Check-out-Ende wird nicht verlängert.
 - Stornierung, Zugangsende, entfernte Zuordnung oder deaktivierte TTLock-
   Funktion löschen ausschließlich die von dieser Integration verwalteten
   TTLock-Passcodes. Andere TTLock-Codes bleiben unangetastet.

@@ -874,8 +874,12 @@ is protocol compatibility, not a general password-hashing choice.
 ### KB-TTLOCK-002 — Passcodes are independently recoverable per lock
 
 - Status: Validated
-- Last validated: 2026-07-28
-- Evidence: `custom_components/guesty/ttlock.py`, `tests/test_ttlock.py`
+- Last validated: 2026-07-31
+- Evidence: `custom_components/guesty/ttlock.py`, `tests/test_ttlock.py`,
+  `tests/test_ttlock.py::test_current_stay_uses_one_persisted_retroactive_ttlock_start`,
+  `tests/test_ttlock.py::test_upgrade_preserves_confirmed_current_stay_start`,
+  `tests/test_ttlock.py::test_missing_confirmed_code_is_recreated_with_current_start`,
+  [TTLock period-passcode documentation](https://euopen.ttlock.com/doc/api/v3/keyboardPwd/get)
 
 Provision only inside the configured lead with the shared access window.
 Persist each lock's success independently so an offline gateway cannot cause
@@ -886,6 +890,17 @@ Before change/delete, verify that the remote passcode still carries the
 expected marker; never modify a foreign or manually renamed object. Reconcile
 drift at most every 30 minutes and coalesce reads per lock. Remote code
 collisions never rotate a confirmed Guesty PIN.
+
+If TTLock is first enabled or recovers only after an eligible stay has already
+started, transmitting the historical access start can make a newly delivered
+period code immediately invalid under TTLock's first-use timing rules. For each
+previously undelivered lock, clamp the remote start once to the current
+reconciliation time and persist it before the non-idempotent create. Every
+retry, partial multi-lock continuation, and Home Assistant restart reuses that
+exact value; the confirmed checkout end is never extended. A healthy passcode
+confirmed by an older release keeps its original booking start. The versioned
+state migration requeues only matching active-stay `ttlock_api_error` records
+once and preserves PINs, tokens, ownership IDs, and global traffic limits.
 
 ## Security, reliability, and Home Assistant behavior
 
@@ -1124,3 +1139,4 @@ tag points to the same commit and manifest version.
 | 2026-07-31 | Focused Guesty reauthentication recovery review | Reused private auth state and OAuth cooldown in credential flows, validated reservation access before acceptance, removed stale repair flows only after a live API success, eliminated duplicate credential-update reload ownership, and recorded the mandatory login/reauthentication state machine |
 | 2026-07-31 | Dual Guesty PIN mirror and offline-provider review | Added deterministic per-source baselines for native Keycode and configurable `{{door_code}}`, one-field adoption/restoration, fail-closed ambiguity handling, shared persistent write limits, exact confirmed offline windows for Loxone/TTLock, migration coverage, safe diagnostics, and UI documentation |
 | 2026-07-31 | Selectable Guesty PIN-source review | Added independent Keycode/custom-field switches, removed disabled sources from reads, writes, conflicts, retries, and readiness, retained safe re-enable baselines, and enforced at least one active source for configured PIN providers |
+| 2026-07-31 | Focused TTLock active-stay recovery review | Persisted a one-time per-lock start for retroactive delivery, preserved checkout and healthy legacy passcodes, covered partial multi-lock retry/restart stability, and requeued only matching old failures once |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -217,6 +218,56 @@ async def test_unload_clears_pending_reconcile_task(hass, monkeypatch) -> None:
     assert manager._task is None
     assert manager._pending is False
     assert manager._unloaded is True
+
+
+@pytest.mark.asyncio
+async def test_setup_requeues_old_retroactive_start_failure_once(
+    hass, monkeypatch
+) -> None:
+    """The fixed path is not stranded behind an old active-stay retry."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW + timedelta(days=1),
+    )
+    manager, _coordinator, pin_manager, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    old_data = {
+        "records": {
+            reservation.id: {
+                "listing_id": reservation.listing_id,
+                "access_start": reservation.check_in_utc,
+                "access_end": reservation.check_out_utc,
+                "locks": {"101": {"keyboard_pwd_id": 1001}},
+                "last_error": "ttlock_api_error",
+                "retry_count": 5,
+                "retry_at": (NOW + timedelta(hours=1)).isoformat(),
+            }
+        },
+        "tokens": {},
+    }
+    manager._storage.async_load = AsyncMock(return_value=deepcopy(old_data))
+    manager._storage.async_save = AsyncMock()
+    manager.async_schedule_reconcile = MagicMock()
+    pin_manager.async_add_listener = MagicMock(return_value=MagicMock())
+
+    await manager.async_setup()
+
+    record = manager._records[reservation.id]
+    assert "retry_at" not in record
+    assert "retry_count" not in record
+    assert "last_error" not in record
+    assert manager._data["retroactive_start_state_version"] == 1
+    manager._storage.async_save.assert_awaited_once()
+
+    saved = deepcopy(manager._data)
+    manager._data = old_data
+    manager._data["retroactive_start_state_version"] = 1
+    recovered, changed = manager._migrate_retroactive_start_state(NOW)
+
+    assert (recovered, changed) == (0, False)
+    assert manager._records[reservation.id]["retry_at"]
+    manager._data = saved
 
 
 @pytest.mark.asyncio
@@ -453,6 +504,194 @@ async def test_existing_guesty_keycode_without_private_record_reaches_ttlock(
 
     remote.async_add_passcode.assert_awaited_once()
     assert remote.async_add_passcode.await_args.kwargs["code"] == "734567"
+
+
+@pytest.mark.asyncio
+async def test_current_stay_uses_one_persisted_retroactive_ttlock_start(
+    hass, monkeypatch
+) -> None:
+    """A late setup starts now once and stays stable across manager reloads."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW + timedelta(days=1),
+    )
+    manager, coordinator, pin_manager, remote = _manager(hass, monkeypatch, reservation)
+
+    await manager.async_reconcile()
+
+    assert remote.async_add_passcode.await_count == 2
+    assert all(
+        call.kwargs["valid_from"] == NOW
+        and call.kwargs["valid_until"] == NOW + timedelta(days=1)
+        for call in remote.async_add_passcode.await_args_list
+    )
+    assert {
+        state["remote_valid_from"]
+        for state in manager._records[reservation.id]["locks"].values()
+    } == {NOW.isoformat()}
+    assert all(
+        state["remote_valid_from_clamped"] is True
+        for state in manager._records[reservation.id]["locks"].values()
+    )
+
+    reloaded = GuestyTTLockManager(
+        hass,
+        manager.entry,
+        coordinator,
+        pin_manager,
+    )
+    reloaded._data = deepcopy(manager._data)
+    reloaded._client = remote
+    reloaded._storage.async_save = AsyncMock()
+    reloaded._schedule_at = MagicMock()
+    monkeypatch.setattr(
+        ttlock.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(minutes=15),
+    )
+
+    await reloaded.async_reconcile()
+
+    assert remote.async_add_passcode.await_count == 2
+    remote.async_change_passcode.assert_not_awaited()
+    assert {
+        state["remote_valid_from"]
+        for state in reloaded._records[reservation.id]["locks"].values()
+    } == {NOW.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_partial_current_stay_retry_reuses_first_retroactive_start(
+    hass, monkeypatch
+) -> None:
+    """An offline second lock cannot make the late start drift on retry."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW + timedelta(days=1),
+    )
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    original_add = remote.async_add_passcode.side_effect
+    failed_once = False
+
+    async def _fail_second_lock_once(**kwargs):
+        nonlocal failed_once
+        if kwargs["lock_id"] == 102 and not failed_once:
+            failed_once = True
+            raise TTLockGatewayError("offline")
+        return await original_add(**kwargs)
+
+    remote.async_add_passcode.side_effect = _fail_second_lock_once
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["last_error"] == "gateway_unavailable"
+    assert record["locks"]["101"]["remote_valid_from"] == NOW.isoformat()
+    assert record["locks"]["102"]["remote_valid_from"] == NOW.isoformat()
+
+    monkeypatch.setattr(
+        ttlock.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(minutes=5),
+    )
+    await manager.async_reconcile()
+
+    lock_two_calls = [
+        call
+        for call in remote.async_add_passcode.await_args_list
+        if call.kwargs["lock_id"] == 102
+    ]
+    assert len(lock_two_calls) == 2
+    assert all(call.kwargs["valid_from"] == NOW for call in lock_two_calls)
+    assert (
+        manager._records[reservation.id]["locks"]["102"]["remote_valid_from"]
+        == NOW.isoformat()
+    )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_preserves_confirmed_current_stay_start(
+    hass, monkeypatch
+) -> None:
+    """A healthy passcode from an older release is never rewritten as late."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW + timedelta(days=1),
+    )
+    entry = MockConfigEntry(domain=DOMAIN, options=_options([101]))
+    entry.add_to_hass(hass)
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        entry=entry,
+    )
+    start = reservation.check_in_datetime(_listing())
+    end = reservation.check_out_datetime(_listing())
+    manager._records[reservation.id] = {
+        "listing_id": reservation.listing_id,
+        "access_start": start.isoformat(),
+        "access_end": end.isoformat(),
+        "locks": {
+            "101": {
+                "keyboard_pwd_id": 1001,
+                "fingerprint": manager._fingerprint(101, "712345", start, end),
+                "verified_at": NOW.isoformat(),
+            }
+        },
+    }
+
+    await manager.async_reconcile()
+
+    remote.async_list_passcodes.assert_not_awaited()
+    remote.async_add_passcode.assert_not_awaited()
+    remote.async_change_passcode.assert_not_awaited()
+    state = manager._records[reservation.id]["locks"]["101"]
+    assert state["remote_valid_from"] == start.isoformat()
+    assert state["remote_valid_from_clamped"] is False
+
+
+@pytest.mark.asyncio
+async def test_missing_confirmed_code_is_recreated_with_current_start(
+    hass, monkeypatch
+) -> None:
+    """A disappeared legacy passcode is recovered without a stale start."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW + timedelta(days=1),
+    )
+    entry = MockConfigEntry(domain=DOMAIN, options=_options([101]))
+    entry.add_to_hass(hass)
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        entry=entry,
+    )
+    start = reservation.check_in_datetime(_listing())
+    end = reservation.check_out_datetime(_listing())
+    manager._records[reservation.id] = {
+        "listing_id": reservation.listing_id,
+        "access_start": start.isoformat(),
+        "access_end": end.isoformat(),
+        "locks": {
+            "101": {
+                "keyboard_pwd_id": 999,
+                "fingerprint": manager._fingerprint(101, "712345", start, end),
+                "verified_at": (NOW - timedelta(minutes=31)).isoformat(),
+            }
+        },
+    }
+
+    await manager.async_reconcile()
+
+    remote.async_add_passcode.assert_awaited_once()
+    assert remote.async_add_passcode.await_args.kwargs["valid_from"] == NOW
+    state = manager._records[reservation.id]["locks"]["101"]
+    assert state["remote_valid_from"] == NOW.isoformat()
+    assert state["remote_valid_from_clamped"] is True
 
 
 @pytest.mark.asyncio
