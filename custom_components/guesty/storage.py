@@ -49,6 +49,7 @@ class GuestyStorage:
             "access_token": None,
             "token_expires_at": None,
             "token_retry_at": None,
+            "account_unique_id": None,
             "last_sync": None,
             "last_listing_sync": None,
             "last_reservation_sync": None,

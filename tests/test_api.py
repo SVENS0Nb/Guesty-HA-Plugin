@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import timedelta
+import hashlib
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call
@@ -21,6 +24,7 @@ from custom_components.guesty.api import (
     GuestyPermissionError,
     GuestyRetryableError,
     KEYCODE_WRITE_ROUTE_V3,
+    account_unique_id_from_access_token,
     is_guesty_object_id,
     is_custom_field_reference_error,
     is_safe_resource_id,
@@ -33,6 +37,24 @@ def _client(*, token: str | None = "token") -> GuestyApiClient:
     """Return a client whose network methods can be mocked."""
     expires = (dt_util.utcnow() + timedelta(hours=1)).timestamp() if token else None
     return GuestyApiClient(object(), "client", "secret", token, expires)
+
+
+def _account_token(account_id: str) -> str:
+    """Build a JWT-shaped token containing Guesty's stable account claim."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"accountId": account_id}).encode()
+    ).rstrip(b"=")
+    return f"header.{payload.decode()}.signature"
+
+
+def test_account_identity_is_read_privately_from_guesty_token() -> None:
+    """Issued token claims produce a stable, non-reversible account identity."""
+    assert account_unique_id_from_access_token(_account_token("account-1")) == (
+        hashlib.sha256(b"account-1").hexdigest()
+    )
+    assert account_unique_id_from_access_token("not-a-jwt") is None
+    assert account_unique_id_from_access_token("a.@@@.b") is None
+    assert account_unique_id_from_access_token(None) is None
 
 
 def test_custom_field_error_classification_is_narrow() -> None:
@@ -174,14 +196,14 @@ async def test_credential_validation_reuses_token_and_fetches_one_listing(
     ensure_token = AsyncMock()
     request = AsyncMock(
         side_effect=[
-            {"_id": "account-1"},
+            {"_id": "current-api-user"},
             {"results": []},
             {"results": []},
         ]
     )
 
     async def set_token() -> None:
-        client._access_token = "validated-token"
+        client._access_token = _account_token("stable-account")
         client._token_expires_at = (dt_util.utcnow() + timedelta(hours=1)).timestamp()
 
     ensure_token.side_effect = set_token
@@ -190,8 +212,8 @@ async def test_credential_validation_reuses_token_and_fetches_one_listing(
 
     account_id = await client.async_validate_credentials()
 
-    assert len(account_id) == 64
-    assert client.access_token == "validated-token"
+    assert account_id == hashlib.sha256(b"stable-account").hexdigest()
+    assert client.access_token == _account_token("stable-account")
     assert request.await_args_list == [
         call("GET", "/accounts/me"),
         call(

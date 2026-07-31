@@ -271,6 +271,7 @@ errors.
   `tests/test_config_flow.py::test_reauth_reuses_private_token_for_unchanged_credentials`,
   `tests/test_config_flow.py::test_reauth_honors_private_oauth_cooldown_without_network`,
   `tests/test_config_flow.py::test_changed_secret_keeps_client_cooldown_but_not_previous_token`,
+  `tests/test_config_flow.py::test_reconfigure_accepts_new_oauth_client_for_same_guesty_account`,
   `tests/test_config_flow.py::test_reauth_rejects_credentials_for_another_account`,
   `tests/test_config_flow.py::test_loaded_reauth_uses_update_listener_without_second_reload`,
   `tests/test_coordinator.py::test_oauth_rate_limit_starts_from_cache_in_degraded_state`,
@@ -314,7 +315,16 @@ same private token lifecycle. If Client ID and Client Secret are unchanged,
 validation reuses the cached Bearer token and expiration instead of minting a
 diagnostic token, and always honors the stored OAuth cooldown. Rotating only
 the secret preserves the cooldown for that Client ID but never reuses the old
-Bearer token. A different Client ID receives no old authentication state.
+Bearer token. A different Client ID receives no old authentication state for
+requests. Guesty's issued JWT contains the stable `accountId`;
+`/accounts/me` describes the current API user and its `_id` can change when a
+new Open API application is created. Therefore config-entry identity is the
+SHA-256 fingerprint of the token's `accountId`, never the `/accounts/me` user
+ID. During a Client-ID replacement, the previous cached token may be decoded
+locally only to compare that account claim. It is never sent, trusted for API
+access, or reused by the new client. The stable fingerprint is persisted
+privately after validation so later credential rotations do not depend on the
+old token remaining valid.
 Before Home Assistant accepts credentials, validation proves the same API
 surfaces required by the coordinator: account identity, listings, and
 reservations.
@@ -331,8 +341,9 @@ Future authentication work must preserve this exact sequence:
 1. **Initial credential validation.** Normalize Client ID and Client Secret and
    reject empty values locally. With no existing entry, request one OAuth
    access token, then prove access to `/accounts/me`, `/listings`, and
-   `/reservations`. Derive the config-entry identity from the Guesty account ID;
-   never expose the account ID as the public unique ID.
+   `/reservations`. Derive the config-entry identity from the issued token's
+   stable `accountId`, hash it before storage, and never substitute the current
+   API user's `/accounts/me` `_id` for this account identity.
 2. **Token handoff without a second login.** Put the token and expiration
    produced by validation into the new config entry only as a transient setup
    handoff. Runtime startup must reuse that exact token for its first sync,
@@ -356,14 +367,16 @@ Future authentication work must preserve this exact sequence:
    degraded when available, and reject every pre-deadline refresh locally
    without network traffic. After expiry, allow exactly one serialized token
    request and clear the cooldown only on success.
-6. **Reauthentication or proactive credential replacement.** Load private auth
+6. **Reauthentication or proactive credential replacement.** Reuse private auth
    state only when the submitted Client ID matches the configured Client ID.
    If both Client ID and Secret are unchanged, reuse token, expiration, and
    cooldown. If only the Secret changes, retain the Client ID cooldown but
    never reuse the old Bearer token. If the Client ID changes, reuse none of the
-   old auth state. Accept replacement credentials only after the three endpoint
-   checks succeed and the derived Guesty account identity matches the existing
-   entry.
+   old auth state for requests. It is permitted to decode the prior token
+   locally, without sending it, solely to compare its stable `accountId` with
+   the newly validated token. Accept replacement credentials only after the
+   three endpoint checks succeed and that account identity matches the existing
+   entry; then migrate older user-based unique IDs to the stable account hash.
 7. **Reload and repair completion.** Updating credentials has exactly one
    reload owner: the update listener for a loaded entry, or one explicitly
    scheduled reload for an unloaded entry. A successful live coordinator sync
@@ -963,6 +976,9 @@ configured through Home Assistant flows. A blank password/client-secret field
 for an unchanged identity means keep the stored secret; a changed identity
 requires fresh validation. Replacement Guesty credentials must belong to the
 same account so options, mappings, door links, and private state remain valid.
+The comparison uses the stable `accountId` claim from Guesty's issued token;
+`/accounts/me` identifies the current API user and must not be used to reject a
+new Open API application for the same Guesty account.
 
 Repeated or stale frontend submissions may contain extra keys. Home
 Assistant's suggested-value helper can rebuild a Voluptuous schema with

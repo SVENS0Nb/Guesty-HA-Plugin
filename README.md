@@ -86,7 +86,9 @@ Die neuen Daten werden vor dem Speichern geprüft und müssen zum selben
 Guesty-Konto gehören. Alle Optionen, Türlinks, Codes sowie Loxone- und
 TTLock-Zuordnungen bleiben erhalten. Ist der alte Zugang bereits ungültig,
 öffnet Home Assistant stattdessen automatisch denselben sicheren Ablauf zur
-erneuten Authentifizierung.
+erneuten Authentifizierung. Auch eine neue Open-API-Anwendung mit neuer Client
+ID wird akzeptiert, wenn Guestys Token bestätigt, dass sie zum selben Konto
+gehört; ein tatsächlicher Kontowechsel bleibt gesperrt.
 
 ### Optionen
 

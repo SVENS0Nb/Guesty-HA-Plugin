@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections.abc import Collection
 from dataclasses import dataclass
 import hashlib
@@ -57,6 +59,29 @@ class GuestyKeyCodeWriteResult:
 def legacy_client_unique_id(client_id: str) -> str:
     """Return the config-entry identity used before account IDs were available."""
     return hashlib.sha256(client_id.strip().encode()).hexdigest()
+
+
+def account_unique_id_from_access_token(token: str | None) -> str | None:
+    """Return a privacy-safe Guesty account identity from an issued JWT."""
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        return None
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(
+            base64.urlsafe_b64decode(f"{payload}{padding}").decode("utf-8")
+        )
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    account_id = claims.get("accountId") or claims.get("account_id")
+    if not is_safe_resource_id(account_id):
+        return None
+    return hashlib.sha256(account_id.encode()).hexdigest()
 
 
 def is_safe_resource_id(value: Any) -> bool:
@@ -229,6 +254,9 @@ class GuestyApiClient:
     async def async_validate_credentials(self) -> str:
         """Validate credentials and return a privacy-safe account identity."""
         await self._async_ensure_token()
+        token_account_unique_id = account_unique_id_from_access_token(
+            self._access_token
+        )
         account = await self._async_request("GET", "/accounts/me")
         if not isinstance(account, dict):
             raise GuestyApiError("Unexpected Guesty account response")
@@ -250,7 +278,10 @@ class GuestyApiClient:
                 "limit": "1",
             },
         )
-        return hashlib.sha256(str(account_id).encode()).hexdigest()
+        return (
+            token_account_unique_id
+            or hashlib.sha256(str(account_id).encode()).hexdigest()
+        )
 
     async def async_get_listings(self) -> list[GuestyListing]:
         """Fetch all listings from the Guesty account."""

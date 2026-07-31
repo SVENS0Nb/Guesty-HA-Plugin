@@ -30,7 +30,7 @@ from .api import (
     GuestyApiError,
     GuestyAuthError,
     GuestyPermissionError,
-    legacy_client_unique_id,
+    account_unique_id_from_access_token,
 )
 from .loxone_api import (
     LoxoneApiClient,
@@ -280,6 +280,7 @@ async def validate_input(
 
     storage: GuestyStorage | None = None
     cache: dict[str, Any] | None = None
+    previous_account_unique_id: str | None = None
     same_client = False
     same_credentials = False
     if existing_entry is not None:
@@ -289,10 +290,21 @@ async def validate_input(
         ).strip()
         same_client = client_id == stored_client_id
         same_credentials = same_client and client_secret == stored_client_secret
-
-    if same_client and existing_entry is not None:
         storage = GuestyStorage(hass, existing_entry.entry_id)
         cache = await storage.async_load()
+
+        cached_account_unique_id = cache.get("account_unique_id")
+        if isinstance(cached_account_unique_id, str):
+            previous_account_unique_id = cached_account_unique_id
+        if previous_account_unique_id is None:
+            previous_token = existing_entry.data.get(CONF_ACCESS_TOKEN) or cache.get(
+                "access_token"
+            )
+            previous_account_unique_id = account_unique_id_from_access_token(
+                previous_token
+            )
+
+    if same_client and existing_entry is not None and cache is not None:
         if same_credentials:
             access_token = existing_entry.data.get(CONF_ACCESS_TOKEN) or cache.get(
                 "access_token"
@@ -320,14 +332,24 @@ async def validate_input(
         validated = True
     finally:
         if storage is not None and cache is not None:
-            cache["token_retry_at"] = client.token_retry_at
+            if same_client:
+                cache["token_retry_at"] = client.token_retry_at
             if same_credentials or validated:
                 cache["access_token"] = client.access_token
                 cache["token_expires_at"] = client.token_expires_at
-            await storage.async_save(cache)
+            if validated:
+                cache["token_retry_at"] = client.token_retry_at
+                cache["account_unique_id"] = account_id
+            if same_client or validated:
+                await storage.async_save(cache)
     return {
         "title": "Guesty",
         "unique_id": account_id,
+        "same_account_confirmed": bool(
+            same_client
+            or previous_account_unique_id is not None
+            and previous_account_unique_id == account_id
+        ),
         CONF_ACCESS_TOKEN: client.access_token,
         CONF_TOKEN_EXPIRES_AT: client.token_expires_at,
     }
@@ -342,16 +364,12 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
         self,
         entry: ConfigEntry,
         new_unique_id: str,
+        *,
+        same_account_confirmed: bool = False,
     ) -> None:
-        """Verify the account, allowing one migration from the legacy client ID."""
+        """Verify the account, allowing only a proven identity migration."""
         await self.async_set_unique_id(new_unique_id)
-        old_client_id = entry.data.get(CONF_CLIENT_ID)
-        legacy_unique_id = (
-            legacy_client_unique_id(old_client_id)
-            if isinstance(old_client_id, str) and old_client_id.strip()
-            else None
-        )
-        if entry.unique_id not in {None, legacy_unique_id}:
+        if entry.unique_id not in {None, new_unique_id} and not same_account_confirmed:
             self._abort_if_unique_id_mismatch(reason="account_mismatch")
 
     def _async_update_credentials_and_abort(
@@ -468,6 +486,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._async_accept_replacement_identity(
                     entry,
                     info["unique_id"],
+                    same_account_confirmed=info.get("same_account_confirmed", False),
                 )
                 return self._async_update_credentials_and_abort(
                     entry,
@@ -507,6 +526,7 @@ class GuestyConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._async_accept_replacement_identity(
                     entry,
                     info["unique_id"],
+                    same_account_confirmed=info.get("same_account_confirmed", False),
                 )
                 return self._async_update_credentials_and_abort(
                     entry,

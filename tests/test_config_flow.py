@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -94,6 +96,14 @@ VALIDATED = {
     CONF_ACCESS_TOKEN: "validated-token",
     CONF_TOKEN_EXPIRES_AT: 123456.0,
 }
+
+
+def _account_token(account_id: str) -> str:
+    """Build a JWT-shaped Guesty token for identity migration tests."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"accountId": account_id}).encode()
+    ).rstrip(b"=")
+    return f"header.{payload.decode()}.signature"
 
 
 @pytest.mark.parametrize("suffix", ["#", "*", "☑️", "☑️ / #", ""])
@@ -398,8 +408,61 @@ async def test_changed_client_id_does_not_reuse_previous_private_auth(
 
     assert result["type"] is FlowResultType.ABORT
     from_hass.assert_called_once_with(hass, "new-client", "new-secret")
-    storage.async_load.assert_not_awaited()
-    storage.async_save.assert_not_awaited()
+    storage.async_load.assert_awaited_once()
+    saved = storage.async_save.await_args.args[0]
+    assert saved["access_token"] == "new-token"
+    assert saved["account_unique_id"] == VALIDATED["unique_id"]
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_accepts_new_oauth_client_for_same_guesty_account(
+    hass, monkeypatch
+) -> None:
+    """A new API application for the same account is not a false account switch."""
+    account_unique_id = hashlib.sha256(b"stable-account").hexdigest()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=hashlib.sha256(b"old-api-user").hexdigest(),
+        data={CONF_CLIENT_ID: "old-client", CONF_CLIENT_SECRET: "old-secret"},
+        options={"preserved": True},
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_schedule_reload",
+        MagicMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(
+            return_value={"access_token": _account_token("stable-account")}
+        ),
+        async_save=AsyncMock(),
+    )
+    client = SimpleNamespace(
+        access_token=_account_token("stable-account"),
+        token_expires_at=time.time() + 3600,
+        token_retry_at=None,
+        async_validate_credentials=AsyncMock(return_value=account_unique_id),
+    )
+    from_hass = MagicMock(return_value=client)
+    monkeypatch.setattr(config_flow, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(config_flow.GuestyApiClient, "from_hass", from_hass)
+
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        form["flow_id"],
+        {CONF_CLIENT_ID: "new-client", CONF_CLIENT_SECRET: "new-secret"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == account_unique_id
+    assert entry.data[CONF_CLIENT_ID] == "new-client"
+    assert entry.options == {"preserved": True}
+    from_hass.assert_called_once_with(hass, "new-client", "new-secret")
 
 
 @pytest.mark.asyncio
@@ -613,7 +676,7 @@ async def test_reconfigure_migrates_legacy_client_based_unique_id(
     monkeypatch.setattr(
         config_flow,
         "validate_input",
-        AsyncMock(return_value=VALIDATED),
+        AsyncMock(return_value={**VALIDATED, "same_account_confirmed": True}),
     )
 
     form = await hass.config_entries.flow.async_init(

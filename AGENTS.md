@@ -172,9 +172,12 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   cached Bearer token, expiration, and OAuth cooldown. A changed secret for the
   same Client ID keeps that Client ID's cooldown but never reuses its old Bearer
   token. Credential validation must prove access to account identity, listings,
-  and reservations before accepting the entry. A successful live coordinator
-  sync aborts a stale Home Assistant reauthentication flow; cached/degraded data
-  alone must never clear it.
+  and reservations before accepting the entry. Derive the stable config-entry
+  identity from the issued token's `accountId`, not `/accounts/me`'s current-user
+  `_id`. When the Client ID changes, an old cached token may be decoded locally
+  only to prove the same account; it must never be sent or reused for requests.
+  A successful live coordinator sync aborts a stale Home Assistant
+  reauthentication flow; cached/degraded data alone must never clear it.
 - All OAuth clients used for this Guesty account have the same configured API
   rights. Do not diagnose a Client-ID permission difference or recommend a
   credential change as the root-cause fix unless the same internal reservation
@@ -502,8 +505,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   failures in Loxone/TTLock setup.
 - Empty password/client-secret fields on an unchanged identity preserve the
   stored value. A changed identity requires fresh validation. Guesty credential
-  reconfiguration must verify that the replacement credentials belong to the
-  same Guesty account and preserve all options/mappings/private state.
+  reconfiguration must verify the issued token's stable `accountId` against the
+  previous account identity, rather than comparing API-user IDs, and preserve
+  all options/mappings/private state.
 - A config-entry credential update has exactly one reload owner. For a loaded
   entry the registered update listener performs the reload; for an entry that
   is not loaded the config flow schedules it explicitly. Never combine the
