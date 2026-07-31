@@ -712,6 +712,7 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
     entry.add_to_hass(hass)
 
     form = await hass.config_entries.options.async_init(entry.entry_id)
+    convert(form["data_schema"], custom_serializer=cv.custom_serializer)
     result = await hass.config_entries.options.async_configure(
         form["flow_id"],
         {
@@ -736,6 +737,27 @@ async def test_options_flow_uses_modern_config_entry_property(hass) -> None:
     assert result["data"][CONF_PIN_CUSTOM_ENABLED] is True
     assert result["data"][CONF_PIN_OFFLINE_PROVISIONING] is False
     assert "loxone_custom_field" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_options_flow_rejects_blank_pin_custom_field(hass) -> None:
+    """Whitespace-only field references remain invalid after schema serialization."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={},
+    )
+    entry.add_to_hass(hass)
+
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_PIN_CUSTOM_FIELD: "   "},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    assert result["errors"] == {CONF_PIN_CUSTOM_FIELD: "invalid_pin_custom_field"}
 
 
 @pytest.mark.asyncio

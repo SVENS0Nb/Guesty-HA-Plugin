@@ -195,6 +195,7 @@
       "same_lock": "Dasselbe Schloss kann nicht zweimal zugeordnet werden",
       "invalid_code_suffix": "Der Guesty-Code-Zusatz darf höchstens 8 sichtbare Zeichen und keine Ziffern enthalten",
       "invalid_code_prefix": "Der PIN-Präfix muss aus 1 oder 2 Ziffern bestehen",
+      "invalid_pin_custom_field": "Gib einen Namen, eine Variable oder eine ID eines Guesty-Reservierungs-Custom-Fields mit höchstens 128 Zeichen ein",
       "pin_source_required": "Aktiviere mindestens eine Guesty-PIN-Quelle, wenn Loxone oder TTLock aktiviert ist",
       "custom_field_not_found": "Trage Name, Variable oder ID eines Guesty-Reservierungs-Custom-Fields ein",
       "loxone_invalid_auth": "Loxone lehnt das Konto ab oder das Recht Benutzerverwaltung fehlt",

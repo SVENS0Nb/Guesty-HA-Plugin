@@ -195,6 +195,7 @@
       "same_lock": "The same lock cannot be assigned twice",
       "invalid_code_suffix": "The Guesty code suffix must contain at most 8 visible non-numeric characters",
       "invalid_code_prefix": "The PIN prefix must contain 1 or 2 digits",
+      "invalid_pin_custom_field": "Enter a Guesty reservation custom-field name, variable, or ID with no more than 128 characters",
       "pin_source_required": "Enable at least one Guesty PIN source when Loxone or TTLock is enabled",
       "custom_field_not_found": "Enter a Guesty reservation custom field name, variable, or ID",
       "loxone_invalid_auth": "Loxone rejected the account or it lacks User management rights",

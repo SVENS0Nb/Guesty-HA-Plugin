@@ -503,6 +503,12 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   schema with `PREVENT_EXTRA`; restore `REMOVE_EXTRA` where the flow relies on
   it. This previously produced “extra keys not allowed” and “Unknown error”
   failures in Loxone/TTLock setup.
+- Every schema returned to the frontend must be convertible by
+  `voluptuous_serialize` with Home Assistant's custom serializer. Do not place
+  plain custom Python validator functions directly in a UI schema; use
+  serializable Voluptuous validators/selectors and perform extra normalization
+  inside the flow step. Keep a conversion regression test for every root or
+  multi-step form.
 - Empty password/client-secret fields on an unchanged identity preserve the
   stored value. A changed identity requires fresh validation. Guesty credential
   reconfiguration must verify the issued token's stable `accountId` against the

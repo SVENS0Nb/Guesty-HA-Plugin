@@ -969,6 +969,7 @@ both modes. Recovery uses bounded backoff and needs no manual reload.
 - Evidence: `custom_components/guesty/config_flow.py`,
   `custom_components/guesty/__init__.py`,
   `tests/test_config_flow.py::test_reauth_updates_credentials_and_token`,
+  `tests/test_config_flow.py::test_options_flow_uses_modern_config_entry_property`,
   `tests/test_config_flow.py::test_loaded_reauth_uses_update_listener_without_second_reload`
 
 Setup, reauthentication, credential replacement, and all optional features are
@@ -985,6 +986,15 @@ Assistant's suggested-value helper can rebuild a Voluptuous schema with
 `PREVENT_EXTRA`; flows that intentionally tolerate stale submissions must
 restore `REMOVE_EXTRA`. Failing to do so previously produced “extra keys not
 allowed” followed by “Unknown error.”
+
+Every frontend form schema must also pass `voluptuous_serialize.convert` with
+Home Assistant's custom serializer. A plain custom Python validator used as the
+schema value for the configurable PIN field caused the entire options dialog
+to return HTTP 500 even though runtime synchronization remained healthy.
+Serializable `vol.All`/`vol.Length` validation now defines the form contract;
+whitespace normalization and the stricter semantic check run inside the flow
+step. Regression tests must serialize the root options schema, not merely
+submit it through the in-process flow manager.
 
 Credential updates have one reload owner. A loaded entry is reloaded by its
 registered update listener; an entry that failed setup and is not loaded is

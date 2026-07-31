@@ -237,9 +237,9 @@ OPTIONS_SCHEMA = vol.Schema(
             CONF_PIN_CUSTOM_ENABLED,
             default=DEFAULT_PIN_CUSTOM_ENABLED,
         ): bool,
-        vol.Optional(
-            CONF_PIN_CUSTOM_FIELD, default=DEFAULT_PIN_CUSTOM_FIELD
-        ): _pin_custom_field_reference,
+        vol.Optional(CONF_PIN_CUSTOM_FIELD, default=DEFAULT_PIN_CUSTOM_FIELD): vol.All(
+            str, vol.Length(min=1, max=128)
+        ),
         vol.Optional(
             CONF_PIN_OFFLINE_PROVISIONING,
             default=DEFAULT_PIN_OFFLINE_PROVISIONING,
@@ -568,7 +568,14 @@ class GuestyOptionsFlow(OptionsFlow):
     ) -> FlowResult:
         """Manage Guesty options."""
         errors: dict[str, str] = {}
+        normalized_pin_custom_field: str | None = None
         if user_input is not None:
+            try:
+                normalized_pin_custom_field = _pin_custom_field_reference(
+                    user_input.get(CONF_PIN_CUSTOM_FIELD, DEFAULT_PIN_CUSTOM_FIELD)
+                )
+            except vol.Invalid:
+                errors[CONF_PIN_CUSTOM_FIELD] = "invalid_pin_custom_field"
             provider_enabled = bool(
                 user_input.get(CONF_LOXONE_ENABLED, DEFAULT_LOXONE_ENABLED)
                 or user_input.get(CONF_TTLOCK_ENABLED, DEFAULT_TTLOCK_ENABLED)
@@ -588,9 +595,7 @@ class GuestyOptionsFlow(OptionsFlow):
 
         if user_input is not None and not errors:
             self._pending_options = {**self.config_entry.options, **user_input}
-            self._pending_options[CONF_PIN_CUSTOM_FIELD] = str(
-                user_input.get(CONF_PIN_CUSTOM_FIELD, DEFAULT_PIN_CUSTOM_FIELD)
-            ).strip()
+            self._pending_options[CONF_PIN_CUSTOM_FIELD] = normalized_pin_custom_field
             # v2.1 and older stored the door-code custom-field reference here.
             # The new shared PIN option supersedes that provider-specific key.
             self._pending_options.pop(LEGACY_CONF_LOXONE_CUSTOM_FIELD, None)
