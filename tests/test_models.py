@@ -108,12 +108,15 @@ def test_reservation_codes_are_parsed_but_not_written_to_general_cache() -> None
     assert reservation is not None
     assert reservation.key_code == "712345"
     assert reservation.key_code_observed is True
+    assert reservation.key_code_route == "v3"
     assert reservation.custom_fields == {"65fab102a5284d73c6206db0": "712346"}
     assert reservation.custom_fields_observed is True
     assert "key_code" not in reservation.to_dict()
     cached = models.GuestyReservation.from_dict(reservation.to_dict())
     assert cached.key_code is None
     assert cached.key_code_observed is False
+    assert cached.key_code_v2_observed is False
+    assert cached.key_code_route is None
     assert cached.custom_fields == {}
     assert cached.custom_fields_observed is False
 
@@ -133,6 +136,47 @@ def test_omitted_notes_are_not_treated_as_an_empty_native_keycode() -> None:
     assert reservation is not None
     assert reservation.key_code is None
     assert reservation.key_code_observed is False
+    assert reservation.key_code_v2_observed is False
+
+
+def test_top_level_v2_keycode_is_observed_without_notes() -> None:
+    """The normal reservation poll reads channel Keycodes without extra traffic."""
+    reservation = models.GuestyReservation.from_api(
+        {
+            "_id": "res-v2-keycode",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-20T13:00:00Z",
+            "checkOut": "2026-07-22T09:00:00Z",
+            "keyCode": "700070#️⃣",
+        }
+    )
+
+    assert reservation is not None
+    assert reservation.key_code == "700070#️⃣"
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_v2_observed is True
+    assert reservation.key_code_route == "v2"
+
+
+def test_explicit_empty_top_level_keycode_does_not_guess_backing_model() -> None:
+    """An empty projection is observed but still needs automatic route probing."""
+    reservation = models.GuestyReservation.from_api(
+        {
+            "_id": "res-empty-keycode",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-20T13:00:00Z",
+            "checkOut": "2026-07-22T09:00:00Z",
+            "keyCode": None,
+        }
+    )
+
+    assert reservation is not None
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_v2_observed is True
+    assert reservation.key_code_route is None
 
 
 def test_planned_arrival_overrides_default() -> None:

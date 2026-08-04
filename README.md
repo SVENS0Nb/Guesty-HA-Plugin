@@ -224,7 +224,8 @@ Schloss-Entity und Ergebnis, aber weder Gastnamen noch Zugriffstoken.
 Optional kann die Integration zusätzlich für jede aktive Guesty-Reservierung
 einen sechsstelligen Zahlencode verwalten. Der Code wird beim ersten Erkennen
 der Reservierung erzeugt und redundant in Guestys nativem Reservierungsfeld
-**Keycode** (`notes.keyCode` in der Open API) sowie einem konfigurierbaren
+**Keycode** (je nach Guesty-Buchungsmodell `keyCode` über Reservations V2 oder
+`notes.keyCode` über Reservations V3) sowie einem konfigurierbaren
 Reservierungs-Custom-Field gespeichert. Standard ist `{{door_code}}`; Name,
 Variable oder ID können in den allgemeinen Integrationsoptionen geändert
 werden. In der Guest App beziehungsweise in Nachrichtenvorlagen kann dadurch
@@ -255,19 +256,35 @@ wird der Code auch für eine zukünftige Reservierung unmittelbar nach Webhook
 oder spätestens beim nächsten normalen Reservierungsabgleich erzeugt. Der
 gemeinsame Guesty-Client,
 OAuth-Token, Webhook, Reservierungs-Cache und 5-Minuten-Abgleich werden
-wiederverwendet; es gibt keinen zweiten Poller. Da Guestys älterer
-Reservierungs-Endpunkt das native `notes.keyCode` nicht ausliefert, ergänzt der
-Coordinator nur bei **aktivierter Keycode-Synchronisierung** aktive
-Reservierungen von Listings mit eingeschaltetem Loxone oder TTLock über
-Reservations v3. Bei deaktiviertem Keycode entfallen diese Zusatzabfragen
-vollständig. Geänderte Reservierungen werden
-inkrementell, ein einzelner Webhook gezielt und der tägliche Vollabgleich in
-von Guesty erlaubten Zehner-Batches gelesen. Bereits in der normalen
-Reservierungsantwort enthaltene Custom Fields werden ohne zusätzliche Abfrage
-verwendet; nur bei einer ausgelassenen oder geänderten Projektion liest die
-Integration das konfigurierte Feld gezielt nach. Guesty-Schreibversuche beider
+wiederverwendet; es gibt keinen zweiten Poller. Der normale
+Reservations-V2-Abruf enthält bewusst keine PIN-Felder. Nur für Listings, die
+Loxone oder TTLock zugeordnet sind, liest derselbe Abgleich einmal zusätzlich
+eine minimale Projektion mit den jeweils aktivierten Quellen `keyCode` und/oder
+`customFields`. Bei **aktivierter Keycode-Synchronisierung** ergänzt der
+Coordinator aktive Reservierungen dieser Listings über Reservations V3, damit
+auch V3-Buchungen mit `notes.keyCode` korrekt erfasst werden. Deaktivierte
+Quellen und nicht zugeordnete Listings verursachen keine PIN-Abfragen. Eine von
+Guesty leer zurückgegebene V2-Keycode-Projektion wird zusammen mit der exakten,
+aber notizlosen V3-Antwort als V2-/Channel-Buchung erkannt, sodass auch deren
+erster Code nicht hängen bleibt. Fehlt dagegen eine angeforderte Reservierung
+oder ihr `customFields`-Container vollständig, bleibt diese Quelle bis zum
+nächsten gemeinsamen Abgleich gesperrt; das Plugin startet dafür keine
+Einzelabfrage pro Reservierung. Geänderte
+Reservierungen werden inkrementell, ein einzelner Webhook gezielt und der
+tägliche Vollabgleich in von Guesty erlaubten Zehner-Batches gelesen. Schlägt
+nur eine optionale PIN-Abfrage fehl, bleiben Buchungszeiten, Status, Kalender
+und notwendige Zugangslöschungen aktuell. Das Plugin erzeugt oder überschreibt
+dann keinen möglicherweise bereits vorhandenen Code blind, sondern versucht
+die PIN-Abfrage beim nächsten gemeinsamen Abgleich erneut. Guesty-Schreibversuche beider
 Spiegel teilen sich ein persistentes globales Limit von höchstens zwei PUTs je
-30 Sekunden.
+30 Sekunden. Jeder Schreibplatz berücksichtigt zusätzlich bis zu drei
+Bestätigungsabfragen und wird unmittelbar vor dem Schreiben noch einmal gegen
+das gemeldete API-Limit geprüft. Für eine unbekannte Reservierung wird zuerst
+V3 verwendet. Antwortet der V3-Notizenpfad mit 404, obwohl genau diese
+Reservierung über V3 lesbar ist, wechselt die Integration auf den von Guesty
+bestätigten V2-Schreibweg mit dem obersten Payload `{"keyCode":"…"}` und merkt
+sich diesen Weg ausschließlich für diese Reservierung. Beide Spiegel können
+weiterhin gleichzeitig aktiv sein.
 
 Der Loxone-Benutzer wird dagegen erst kurz vor dem erlaubten Zeitraum angelegt.
 Standardmäßig beträgt der Vorlauf sechs Stunden. Seine Gültigkeit ist:
@@ -331,8 +348,9 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 
 #### 3. Guesty vorbereiten
 
-1. Der Guesty-Open-API-Anwendung Lese- und Schreibzugriff auf
-   **Reservations v3** geben.
+1. Der Guesty-Open-API-Anwendung Lese- und Schreibzugriff auf Reservierungen
+   geben. Die Integration verwendet abhängig vom Buchungsmodell die
+   Reservations-V2- oder Reservations-V3-Schnittstelle.
 2. In der Guest App beziehungsweise Nachrichtenvorlage die Quelle verwenden,
    die in Home Assistant aktiviert ist: Guestys **Keycode**-Baustein, die
    Variable des PIN-Custom-Fields (standardmäßig `{{door_code}}`) oder beide.

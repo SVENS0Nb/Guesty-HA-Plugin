@@ -179,8 +179,10 @@ RESERVATION_FIELDS: Final = (
     "checkIn checkOut checkInDateLocalized checkOutDateLocalized "
     "plannedArrival plannedDeparture lastUpdatedAt "
     "listing.defaultCheckInTime listing.defaultCheckOutTime "
-    "guest.fullName customFields"
+    "guest.fullName"
 )
+
+RESERVATION_PIN_FIELDS: Final = "_id listingId"
 
 WEBHOOK_SUBSCRIPTION_EVENTS: Final = (
     "reservation.created.v2",

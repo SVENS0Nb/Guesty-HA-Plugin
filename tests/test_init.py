@@ -16,6 +16,8 @@ from custom_components.guesty.const import (
     CONF_CLIENT_SECRET,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_CUSTOM_ENABLED,
+    CONF_PIN_NATIVE_ENABLED,
     CONF_TOKEN_EXPIRES_AT,
     CONF_WEBHOOK_ID,
     DOMAIN,
@@ -24,29 +26,52 @@ from custom_components.guesty.const import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("keycode_observed", "provider_enabled", "expected_calls"),
-    [(False, True, 1), (True, True, 0), (False, False, 0)],
+    (
+        "keycode_observed",
+        "custom_fields_observed",
+        "provider_enabled",
+        "native_enabled",
+        "custom_enabled",
+        "pin_read_failed",
+        "expected_calls",
+    ),
+    [
+        (False, True, True, True, True, False, 1),
+        (True, True, True, True, True, False, 0),
+        (False, False, False, True, True, False, 0),
+        (True, False, True, False, True, False, 1),
+        (False, False, True, True, True, True, 0),
+    ],
 )
-async def test_setup_refreshes_privacy_stripped_native_keycodes(
+async def test_setup_refreshes_privacy_stripped_pin_sources(
     hass,
     monkeypatch,
     keycode_observed,
+    custom_fields_observed,
     provider_enabled,
+    native_enabled,
+    custom_enabled,
+    pin_read_failed,
     expected_calls,
 ) -> None:
-    """PIN providers require one shared full read when cache omitted Keycodes."""
+    """PIN providers require one shared full read when cache omitted a source."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
         options={
             CONF_LOXONE_ENABLED: provider_enabled,
             CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+            CONF_PIN_NATIVE_ENABLED: native_enabled,
+            CONF_PIN_CUSTOM_ENABLED: custom_enabled,
         },
     )
     entry.add_to_hass(hass)
     reservation = SimpleNamespace(
         listing_id="listing-1",
         key_code_observed=keycode_observed,
+        key_code_read_failed=pin_read_failed,
+        custom_fields_observed=custom_fields_observed,
+        custom_fields_read_failed=pin_read_failed,
         is_active_status=lambda: True,
     )
     coordinator = SimpleNamespace(

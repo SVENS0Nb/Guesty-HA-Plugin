@@ -59,7 +59,7 @@ requires them.
 ### KB-ARCH-002 — Runtime setup and teardown are transactional
 
 - Status: Validated
-- Last validated: 2026-07-29
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/__init__.py`,
   `custom_components/guesty/scheduler.py`,
   `tests/test_init.py::test_partial_setup_failure_rolls_back_started_resources`,
@@ -167,75 +167,117 @@ state, and prior API error. Only a successful normal reservation synchronization
 resets global cache age and freshness; only a complete listing read advances the
 listing safety cursor.
 
-### KB-GUESTY-002 — Native Keycodes require Reservations v3
+### KB-GUESTY-002 — Native Keycode reads combine V2 and V3 backing models
 
 - Status: Validated
-- Last validated: 2026-07-31
+- Last validated: 2026-08-04
 - Evidence: redacted live API reproduction on 2026-07-28,
+  `custom_components/guesty/api.py::async_get_reservations`,
   `custom_components/guesty/api.py::async_get_reservation_key_codes`,
+  `tests/test_api.py::test_reservation_poll_reads_pin_sources_only_for_mapped_listings`,
+  `tests/test_api.py::test_optional_v2_pin_read_failure_keeps_fresh_reservations`,
+  `tests/test_api.py::test_sparse_per_reservation_pin_projection_is_classified_by_source`,
   `tests/test_api.py::test_native_keycode_reads_use_batched_v3_array_responses`,
   `tests/test_coordinator.py::test_disabled_native_keycode_source_skips_v3_enrichment`,
-  `tests/test_coordinator.py::test_full_poll_enriches_mapped_reservations_from_v3`
+  `tests/test_coordinator.py::test_full_poll_enriches_mapped_reservations_from_v3`,
+  `tests/test_coordinator.py::test_sparse_v3_channel_response_selects_observed_v2_keycode`,
+  `tests/test_coordinator.py::test_channel_sparse_v3_result_does_not_force_repeated_full_polls`,
+  `tests/test_coordinator.py::test_v3_keycode_failure_keeps_fresh_base_reservation_data`,
+  `tests/test_coordinator.py::test_targeted_missing_pin_projection_keeps_base_update_fail_closed`,
+  `tests/test_loxone.py::test_empty_channel_reservation_generates_pin_on_confirmed_v2_route`
 
-Guesty's legacy `/reservations` endpoints do not expose `notes.keyCode`, even
-when requested in their field projection. Native Keycodes must be read with
-`GET /v1/reservations-v3` using repeated `reservationIds[]` query parameters.
-That endpoint accepts at most ten reservation IDs per request. Guesty identifies
-returned v3 reservations with either `reservationId`, `_id`, or `id`. A
-redacted live comparison of 35 future reservations proved that the v3 `_id`
-values exactly match the internal legacy reservation IDs. Observed responses
-use a top-level JSON array, while Guesty's public example also shows a single
-reservation object; the parser therefore supports both shapes without
-associating an unexpected reservation with a requested ID.
+Guesty has two native-Keycode projections. V2-backed, legacy, and
+channel-imported reservations expose a top-level `keyCode` through the normal
+`GET /v1/reservations` collection and exact `GET /v1/reservations/{id}` calls;
+a controlled live read after the validated V2 write returned the exact value in
+both surfaces when `_id keyCode` was projected. V3-backed reservations expose
+`notes.keyCode` through `GET /v1/reservations-v3` using repeated
+`reservationIds[]` parameters. That endpoint accepts at most ten reservation
+IDs per request. Guesty identifies returned v3 reservations with either
+`reservationId`, `_id`, or `id`. A redacted live comparison of 35 future
+reservations proved that the v3 IDs match the internal legacy reservation IDs.
 
-Only active reservations belonging to listings mapped to an enabled Loxone or
-TTLock provider are enriched: changed reservations during incremental polls, a
-targeted reservation after a single webhook, and all applicable reservations
-during startup/daily full synchronization. This is an enrichment step inside
-the existing coordinator, not another poller. If native Keycode synchronization
-is disabled, the coordinator skips all of these additional v3 Keycode reads;
-the configurable reservation custom field may remain the sole PIN authority.
+The base reservation request deliberately excludes both PIN-bearing fields.
+Inside the same coordinator refresh, one minimal V2 projection requests only
+`_id`, `listingId`, and the enabled `keyCode`/`customFields` sources, filtered
+to Loxone/TTLock-mapped listings. Only active mapped reservations receive the
+bounded V3 enrichment. This is not an independent poller. Disabled sources and
+unmapped listings cause no PIN-field reads.
 
-### KB-GUESTY-003 — Native Keycode writes are minimal and confirmed
+A populated explicit V2 Keycode is preserved when the alternate V3 response is
+empty or sparse. Guesty's V2 projection can omit an empty requested `keyCode`;
+an exact returned V2 reservation records that surface as observed while leaving
+the route undecided. If the paired V3 response returns the exact reservation
+without its V3-only `notes` container, the coordinator safely classifies the
+reservation as V2-backed. A reservation missing entirely from either result is
+still unreadable. If native synchronization is disabled, V2 `keyCode` and V3
+notes reads are both skipped and the custom field may remain the sole PIN
+authority. Failure of either optional enrichment does not discard fresh base
+dates or statuses. The failed source is marked unreadable for that in-memory
+snapshot so reconciliation cannot fan out into per-reservation reads, generate
+a replacement against unknown remote state, or blindly overwrite it. Another
+populated mirror or a confirmed private baseline may still keep providers
+operational. A non-secret persistent retry marker makes the next scheduled
+shared refresh a full reservation read even after restart; only a successful
+full PIN enrichment clears that marker.
+
+### KB-GUESTY-003 — Native Keycode writes are route-matched and confirmed
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-08-04
 - Evidence: redacted live API reproduction on 2026-07-28,
   `custom_components/guesty/api.py`,
   `tests/test_api.py::test_native_keycode_uses_minimal_v3_notes_payload`,
-  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`,
+  `tests/test_api.py::test_native_keycode_v3_404_falls_back_to_confirmed_v2_write`,
   `tests/test_api.py::test_native_keycode_requires_exact_success_confirmation`
 
-The only supported write route is
+The validated V3 write route is
 `PUT /v1/reservations-v3/{reservationId}/notes` with only
 `{"notes":{"keyCode":"..."}}`. Some Guesty applications can read the exact
-existing reservation through v3 while that dedicated notes route consistently
-returns HTTP 404. The integration verifies the exact reservation through v3 so
-that condition is reported as an unavailable Keycode endpoint rather than a
-missing reservation, and preserves the failed PUT's `x-request-id`.
+existing reservation through v3 while that dedicated notes route returns HTTP
+404 because the reservation uses the older backing model. The integration
+verifies the exact reservation through v3 and preserves the failed PUT's
+`x-request-id` before selecting the V2 route.
 
 A native write is successful only after Guesty confirms the exact reservation
-ID and value in the response or a bounded v3 read-back. Resource IDs must be
-validated before they are interpolated into paths. Never emulate a native
-Keycode write through the legacy general reservation updater. The independently
+ID and value through an authoritative response or bounded read-back. Resource
+IDs must be validated before they are interpolated into paths. The independently
 verified reservation custom field described by `KB-PIN-001` is a redundant PIN
-mirror, not an undocumented compatibility route for `notes.keyCode`.
+mirror, not a native-route substitute.
+
+Guesty Engineering confirmed that V2-created, legacy, and channel-imported
+reservations instead use `PUT /v1/reservations/{id}` with the minimal top-level
+payload `{"keyCode":"..."}`. `KB-GUESTY-011` records the live validation. The
+integration probes V3 first only when the backing model is unknown, then uses
+V2 only when a second persistent write slot was reserved. A confirmed route is
+cached per reservation, never account-wide. Each route requires an exact
+matching response or bounded route-matched read-back; HTTP 200 alone is
+insufficient.
 
 ### KB-GUESTY-004 — Sparse and empty projections have different meanings
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/models.py`,
   `tests/test_models.py::test_omitted_notes_are_not_treated_as_an_empty_native_keycode`,
   `tests/test_coordinator.py::test_v3_observed_empty_keycode_remains_authoritative`,
-  `tests/test_coordinator.py::test_sparse_v3_keycode_response_is_not_an_observed_deletion`
+  `tests/test_coordinator.py::test_sparse_v3_keycode_response_is_not_an_observed_deletion`,
+  `tests/test_api.py::test_targeted_sparse_pin_projection_does_not_fan_out`
 
-An omitted `notes` object means the Keycode was not observed. It is not proof
+An omitted `notes` object means the V3 Keycode was not observed. It is not proof
 that a user deleted the field and must not rotate or revoke an otherwise known
-PIN. The same distinction applies to a sparse reservation custom-field
-projection. An explicit invalid value fails closed. An explicitly empty value
+PIN. A requested V3 reservation missing from the response is marked temporarily
+unreadable. A returned exact V3 reservation without `notes` selects the V2 route
+only when the same refresh also observed that exact reservation through the V2
+Keycode projection; without that pair it remains unreadable. The same distinction
+applies to a sparse reservation custom-field projection: an omitted requested
+`customFields` container is marked unreadable and retried by the shared full
+refresh, never by one exact request per reservation. An explicit invalid value
+fails closed. An explicitly empty value
 in only one mirror is repaired from the other confirmed mirror; two empty
-changed mirrors are ambiguous and fail closed according to `KB-PIN-001`.
+changed mirrors are ambiguous and fail closed according to `KB-PIN-001`. An
+explicitly populated top-level V2 `keyCode` must not be erased merely because
+the alternate V3 projection is empty or sparse.
 
 ### KB-GUESTY-005 — Door links use reservation custom fields, not Keycode
 
@@ -411,7 +453,7 @@ push delivery automatically; config-entry unload cancels the task.
 - Evidence: redacted live API and production-log reproduction on 2026-07-28,
   `custom_components/guesty/api.py`,
   `tests/test_api.py::test_native_keycode_accepts_v3_success_using_internal_id`,
-  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`
+  `tests/test_api.py::test_native_keycode_v3_404_falls_back_to_confirmed_v2_write`
 
 A redacted live comparison requested 35 future reservations by their internal
 IDs. Reservations v3 returned every exact requested reservation, used `_id`,
@@ -425,17 +467,18 @@ For the affected Open API application, the same exact reservations remained
 readable through Reservations v3 while repeated dedicated
 `PUT /v1/reservations-v3/{reservationId}/notes` calls returned HTTP 404 with
 distinct request IDs. That 404 is not sufficient evidence that a reservation
-is missing. Production then proved that the general legacy
+is missing. Production then proved that the general V2
 `PUT /v1/reservations/{reservationId}` can return success and trigger Guesty
-reservation-change notifications while a bounded v3 read-back remains empty.
-That route is a no-op for `notes.keyCode` and must never be called as a
-fallback. The integration now verifies the exact v3 reservation, reports a
-stable endpoint-unavailable error with the original request ID, and retries
-only the documented v3 route with bounded persistent backoff.
+notifications while silently ignoring a wrongly nested `notes.keyCode`
+payload. Guesty Support and `KB-GUESTY-011` later confirmed that the same V2
+route uses the different top-level `keyCode` payload. The integration now
+verifies the exact v3 reservation, preserves the original request ID, and uses
+the confirmed V2 shape only inside the shared persistent write budget.
 
 The confirmed readable-reservation 404 is reservation-specific for scheduling
-purposes. It consumes its persistent global write slot and retains per-record
-backoff, but it does not stop the other bounded write in that pass. Global
+purposes. If a second slot was reserved it may be consumed immediately by the
+V2 fallback; otherwise the per-reservation route cache schedules V2 for the
+next bounded pass. Global
 authentication, permission, transport, payload, rate-limit, and server failures
 may still stop the batch.
 
@@ -522,9 +565,10 @@ credentials are therefore no longer a plausible explanation for that case.
 ### KB-GUESTY-010 — Live Keycode probes use a hard write guard
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-08-04
 - Evidence: `scripts/guesty_live_write_guard.py`,
-  `tests/test_live_write_guard.py`
+  `tests/test_live_write_guard.py::test_live_token_cache_reuses_token_across_process_instances`,
+  token-cache security and expiry tests in `tests/test_live_write_guard.py`
 
 Manual and agent-driven tests against Guesty's live native-Keycode endpoint use
 the repository guard rather than issuing a direct PUT. The guard is armed only
@@ -536,11 +580,90 @@ remote outcome may be unknown.
 
 The last permit is recorded atomically before network I/O in private,
 cross-process state. Consequently, restarting a shell or launching a second
-test process cannot create writes less than 30 seconds apart. Diagnostic code
-must reuse one OAuth token for the complete run and must stop on OAuth
-rate-limiting rather than minting tokens repeatedly. This deliberately stricter
-manual-test policy does not replace the integration runtime's persistent global
-two-writes-per-30-seconds queue.
+test process cannot create writes less than 30 seconds apart.
+
+The same helper owns a private persistent OAuth cache. Every related live-test
+process resolves its token through `GuestyLiveTokenCache` before preflight.
+The cache holds the access token and absolute expiration under mode `0600`,
+stores only a SHA-256 credential-context fingerprint rather than raw Client ID
+or Client Secret, uses an atomic replace, and holds a cross-process lock across
+the cache check and the single token fetch. A matching token remains reusable
+until the refresh margin; changed credentials or an expiring token require one
+new fetch. Malformed state fails closed without calling the fetcher, preventing
+token amplification after a corrupt file. Diagnostic code must stop on OAuth
+rate-limiting rather than bypassing this cache. These deliberately stricter
+manual-test controls do not replace the integration runtime's persistent token
+lifecycle or global two-writes-per-30-seconds queue.
+
+### KB-GUESTY-011 — V2-created reservations use a top-level Keycode
+
+- Status: Validated
+- Last validated: 2026-08-04
+- Evidence: Guesty Engineering support correspondence on 2026-08-04;
+  [Guesty V2 update reservation](https://open-api-docs.guesty.com/reference/put_reservations-id);
+  guarded redacted live reproduction using
+  `scripts/guesty_live_write_guard.py`
+
+Guesty Engineering states that
+`PUT /v1/reservations-v3/{reservationId}/notes` is intended for reservations
+created through the V3 flow, while V2-created, legacy, and channel-imported
+reservations must be altered through the V2 reservation API. This explains the
+previous source-specific V3 404 pattern. The public V2 update endpoint defines
+its request body only as an arbitrary object and does not document the Keycode
+shape or an authoritative Keycode read-back. Guesty API Support subsequently
+provided and tested the missing contract: V2 updates use a top-level
+`{"keyCode":"..."}` payload, not the V3-style
+`{"notes":{"keyCode":"..."}}` payload.
+
+A guarded live test selected an exact readable, confirmed, future `airbnb2`
+reservation. Its V3 response omitted `notes`. After the mandatory 30-second
+wait, `PUT /v1/reservations/{id}` with a preserved mutable-notes object and a
+temporary `keyCode` returned HTTP 200. Four exact V3 reads over the following
+15 seconds never projected the temporary value. The second and final guarded
+write restored the original empty value and also returned HTTP 200; subsequent
+V3 reads remained sparse, so restoration could not be positively confirmed
+through that surface. Both request IDs were retained outside the repository.
+
+A second guarded end-to-end V2 test used the same future source class and one
+OAuth token. Before writing, the full `GET /v1/reservations/{id}`, a
+`fields=notes` projection, and a `fields=notes.keyCode` projection all returned
+HTTP 200 while omitting both `notes` and `keyCode`. The V2 PUT again returned
+HTTP 200. Four bounded rounds of all three V2 reads over 15 seconds still
+omitted the temporary value. The second guarded PUT restored the original
+empty value and returned HTTP 200; all V2 reads again matched the original
+absence. The write and restore request IDs remain outside the repository.
+
+A third isolated V2 test targeted an exact confirmed future `airbnb2`
+reservation whose native Keycode was empty. It sent a plain six-digit ASCII
+value with no configured suffix or Unicode character. The single guarded
+`PUT /v1/reservations/{id}` again returned HTTP 200, but its response did not
+confirm `notes.keyCode`; four bounded exact V3 read-backs over 15 seconds still
+omitted the value, and a subsequent manual check found the Keycode empty in the
+Guesty UI. This rules out the check-mark suffix as the cause of the silent V2
+no-op. Guesty API Support later identified the actual cause: all three probes
+used the wrong nested V3 payload shape against the V2 updater. HTTP 200 did not
+mean that Guesty accepted or persisted that unsupported field shape.
+
+For a V2-created or channel-imported reservation, the support-confirmed write
+contract is `PUT /v1/reservations/{id}` with a minimal top-level
+`{"keyCode":"..."}` body. Do not wrap it in `notes`. An HTTP-200 response alone
+is insufficient proof of persistence because Guesty silently accepted the
+previously unsupported nested shape.
+
+A final controlled test targeted an exact confirmed future `bookingCom`
+reservation with an empty native Keycode. One guarded V2 PUT used the minimal
+top-level payload, including the configured suffix. Guesty returned HTTP 200
+and the exact reservation plus Keycode in the write response; the user then
+confirmed the same value in Guesty's UI. A subsequent read-only verification
+requested top-level `keyCode` from both `GET /v1/reservations` and exact
+`GET /v1/reservations/{id}`; both returned the exact stored value. This
+validates the V2 write and read contracts and proves that the suffix was
+accepted. Production support may therefore include top-level `keyCode` in the
+existing V2 poll and use this write route for V2-backed reservations, but must
+retain the global write budget, avoid unrelated reservation fields, require
+exact response/read-back confirmation, and cache the confirmed route per
+reservation. V3-backed reservations continue to use the dedicated V3 notes
+endpoint and nested notes payload.
 
 ## Reservation, time, and entity semantics
 
@@ -609,16 +732,18 @@ are available only after explicit privacy opt-in.
 ### KB-PIN-001 — Native Keycode and a custom field are reconciled mirrors
 
 - Status: Validated
-- Last validated: 2026-07-31
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_existing_custom_field_pin_is_adopted_and_fills_native`,
   `tests/test_loxone.py::test_custom_only_mode_ignores_native_keycode_completely`,
   `tests/test_loxone.py::test_native_only_mode_ignores_custom_field_completely`,
+  `tests/test_loxone.py::test_confirmed_v2_route_is_cached_while_custom_mirror_stays_active`,
   `tests/test_config_flow.py::test_options_flow_preserves_legacy_pin_custom_field_suggestion`,
   manual-source edit, mismatch, sparse-response, and retry tests
 
-Every reservation PIN has two Guesty mirrors: native Reservations-v3
-`notes.keyCode` and a configurable reservation custom field whose default is
+Every reservation PIN has two Guesty mirrors: Guesty's native Keycode (V2
+top-level `keyCode` or V3 `notes.keyCode`, depending on the reservation backing
+model) and a configurable reservation custom field whose default is
 `{{door_code}}`. The field reference accepts a safe ID, display name, or
 `{{variable}}`. Both sources retain independent confirmed baselines, sync
 flags, error reasons, and retry state in the private store.
@@ -674,12 +799,14 @@ the PIN.
 ### KB-PIN-003 — Both Guesty PIN mirrors share one persistent budget
 
 - Status: Validated
-- Last validated: 2026-07-29
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_two_keycodes_are_written_per_30_second_window`,
   `tests/test_loxone.py::test_keycode_endpoint_failure_prioritizes_custom_fallback`,
   `tests/test_loxone.py::test_guesty_write_budget_preserves_reported_api_headroom`,
+  `tests/test_loxone.py::test_write_rechecks_rate_headroom_immediately_before_put`,
   `tests/test_loxone.py::test_exhausted_guesty_headroom_queues_without_a_put`,
+  `tests/test_api.py::test_bounded_write_does_not_replay_after_rejected_token`,
   `tests/test_loxone.py::test_persisted_guesty_write_limit_survives_manager_restart`
 
 All native and custom-field PIN publication paths share a persistent global
@@ -689,9 +816,16 @@ slot. Queue passes, webhook work, reservation-specific retries, source
 migration, suffix changes, and restarts must not bypass it. Current and nearest
 stays are prioritized while preserving Guesty API headroom.
 
-Every documented v3 native or custom-field PUT consumes exactly one slot. New
-reservations receive one confirmed mirror before redundancy backfill is allowed
-to consume capacity. An application-wide
+Every V2 native, V3 native, or custom-field PUT consumes exactly one slot. An
+unknown V3 route may fall back to V2 only after two slots were persisted in
+advance; a confirmed one-attempt result refunds the demonstrably unused slot.
+Each slot reserves API headroom for one PUT plus up to three bounded
+confirmation reads. PIN PUTs, confirmation reads, and route-discovery reads do
+not perform hidden authentication or transport retries. An HTTP 401/403
+invalidates the rejected token so the next separately budgeted operation
+refreshes it first; no request in the write envelope is replayed invisibly.
+New reservations receive one confirmed mirror before redundancy backfill is
+allowed to consume capacity. An application-wide
 notes-endpoint, authentication, permission, transport, or payload failure may
 stop the current batch so the remaining slot and normal Guesty synchronization
 headroom are not wasted on the same predictable error. A reservation-specific
@@ -703,12 +837,14 @@ most constrained available minute/hour/day window and always retains four
 requests for normal Guesty traffic. The persistent two-writes-per-30-seconds
 limit is already far below the second allowance, so a transiently low second
 bucket does not pause work until the next reservation poll. The generic header
-has no explicit window and is therefore diagnostic-only. At four or fewer
-requests in a long window, Keycode and door-link capacity is zero and the
-managers wait at least until the next configured reservation poll instead of
-creating a 30-second no-traffic loop. A later response without valid long-window
-headers clears obsolete headroom rather than retaining a stale block
-indefinitely.
+has no explicit window and is therefore diagnostic-only. With fewer than eight
+requests in a long window, one complete write envelope no longer fits; with
+fewer than twelve, an unknown-route two-slot fallback does not fit. Headroom is
+recalculated immediately before every PUT because reads earlier in the same
+pass may have reduced it. When no envelope fits, managers wait at least until
+the next configured reservation poll instead of creating an immediate
+no-traffic loop. A later response without valid long-window headers clears
+obsolete headroom rather than retaining a stale block indefinitely.
 
 ### KB-PIN-004 — Plaintext lifetime is deliberately bounded
 
@@ -728,9 +864,11 @@ PIN.
 ### KB-PIN-005 — Persistent Guesty retries recover across API migrations
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_setup_recovers_persisted_native_404_backoff_once`,
+  `tests/test_loxone.py::test_v3_retry_state_migrates_endpoint_failure_to_v2_route`,
+  `tests/test_loxone.py::test_v3_retry_state_does_not_misclassify_generic_rejection_as_v2`,
   `tests/test_loxone.py::test_recovered_404_backlog_resumes_through_global_write_budget`,
   `tests/test_loxone.py::test_setup_recovers_guesty_backoff_after_client_change`
 
@@ -740,8 +878,14 @@ failure state once, and changing the Guesty client ID reschedules pending
 Guesty writes so retry state created under the previous credential context
 cannot remain silently deferred. This recovery behavior is not evidence that
 the OAuth clients have different rights; `KB-GUESTY-009` records that their
-configured rights are equal. Obsolete persisted route-selection state is
-removed because every application now uses only the documented v3 notes route.
+configured rights are equal. Obsolete account-wide route-selection state is
+removed. Confirmed native routes are stored per reservation because one Guesty
+account may contain both V2- and V3-backed bookings.
+Only the specific `guesty_keycode_endpoint_unavailable` result from a proven
+V3-notes 404 plus exact V3 read may seed V2 during migration. A generic
+`guesty_keycode_rejected` retry is requeued but remains route-unknown. When
+route discovery cannot reserve the fallback PUT immediately, it caches V2 and
+uses the next shared write slot instead of entering generic failure backoff.
 Neither recovery path rotates or discards the stored six-digit PIN, clears
 confirmed Guesty state, or bypasses the shared two-writes-per-30-seconds
 budget. Persisted retries that remain deferred are summarized safely in the
@@ -1061,16 +1205,17 @@ write route for individual channel reservations. The configured PIN custom
 field is now a fully verified redundant mirror with deterministic per-source
 baselines. It remains separate from the door-access URL custom field.
 
-### KB-RET-002 — Legacy reservation reads cannot validate native Keycodes
+### KB-RET-002 — V2 reads cannot validate native Keycodes
 
 - Status: Retired
 - Last validated: 2026-07-28
-- Superseded by: KB-GUESTY-002
+- Superseded by: KB-GUESTY-002, KB-GUESTY-011
 - Evidence: redacted live API reproduction on 2026-07-28,
   `tests/test_api.py::test_native_keycode_reads_use_batched_v3_array_responses`
 
-Adding `notes.keyCode` to a legacy field projection does not make the legacy
-endpoint return it. Do not infer an empty Keycode from that response.
+Adding `notes.keyCode` to a V2 projection does not return the V3 notes field.
+That narrow observation remains true, but it no longer implies that V2 cannot
+validate its own native field: project the separate top-level `keyCode` instead.
 
 ### KB-RET-003 — Confirmed PINs must not rotate automatically
 
@@ -1095,18 +1240,19 @@ Guesty can retain stale `checkIn`/`checkOut` timestamps after a manual
 `plannedArrival`/`plannedDeparture` edit. Valid planned local times therefore
 take precedence.
 
-### KB-RET-005 — The legacy general updater cannot write native Keycodes
+### KB-RET-005 — The V2 updater cannot write native Keycodes
 
 - Status: Retired
 - Last validated: 2026-07-28
-- Superseded by: KB-GUESTY-003
+- Superseded by: KB-GUESTY-011
 - Evidence: production log and Guesty UI notifications on 2026-07-28,
-  `tests/test_api.py::test_native_keycode_404_verifies_reservation_without_legacy_write`
+  `tests/test_api.py::test_native_keycode_v3_404_falls_back_to_confirmed_v2_write`
 
 The general `PUT /v1/reservations/{reservationId}` endpoint can acknowledge a
-payload containing `notes.keyCode` and emit reservation-change notifications
-without persisting the Keycode. Never treat HTTP success from this endpoint as
-a compatibility route, even with a later v3 read-back.
+payload containing nested `notes.keyCode` and emit notifications without
+persisting the Keycode. That rejected payload shape is retired. Guesty Support
+and the controlled live test validated the different top-level
+`{"keyCode":"..."}` V2 contract recorded in `KB-GUESTY-011`.
 
 ## Validation and release knowledge
 
@@ -1155,3 +1301,11 @@ tag points to the same commit and manifest version.
 | 2026-07-31 | Selectable Guesty PIN-source review | Added independent Keycode/custom-field switches, removed disabled sources from reads, writes, conflicts, retries, and readiness, retained safe re-enable baselines, and enforced at least one active source for configured PIN providers |
 | 2026-07-31 | Focused TTLock active-stay recovery review | Persisted a one-time per-lock start for retroactive delivery, preserved checkout and healthy legacy passcodes, covered partial multi-lock retry/restart stability, and requeued only matching old failures once |
 | 2026-08-01 | TTLock options-session and active-stay authentication diagnosis | Live status confirmed `authentication_failed`; changed unchanged-account validation to reuse and persist the live rotating OAuth session, made password repair immediately adopt tokens and release auth backoff, and added regression coverage for repeated blank-password configuration and current-stay recovery |
+| 2026-08-04 | Focused Guesty V2 native-Keycode compatibility probes | Recorded Guesty Engineering's V2/V3 creation-flow distinction; guarded future Airbnb V2 updates returned HTTP 200, but neither full nor projected bounded V2 or exact V3 reads exposed the temporary Keycode, so the V2 contract remains provisional and disabled |
+| 2026-08-04 | Guesty V2 Keycode suffix isolation | A single guarded write of a plain six-digit ASCII Keycode also returned HTTP 200 without response confirmation, V3 read-back, or a visible Guesty UI change; Unicode and the configured suffix are therefore excluded as the cause |
+| 2026-08-04 | Guesty V2 payload contract clarification | Guesty API Support confirmed and tested that legacy/channel reservation updates require a top-level `{"keyCode":"..."}` body; the earlier nested `notes.keyCode` probes were silently ignored despite HTTP 200 |
+| 2026-08-04 | Guesty V2 Keycode contract validation | A guarded top-level Keycode update of a confirmed future Booking.com reservation returned the exact value in Guesty's response and was independently confirmed in the Guesty UI, validating the V2 route including the configured suffix |
+| 2026-08-04 | Dual-model native Keycode implementation review | Added top-level V2 Keycode reads to the shared reservation poll, retained bounded V3 enrichment, introduced exact route-matched V2/V3 writes with a per-reservation route cache, preserved the independent custom-field mirror, and kept every fallback inside the persistent two-PUTs-per-30-seconds budget |
+| 2026-08-04 | Manual live-test OAuth reuse remediation | Added a credential-bound, private, atomic, cross-process token cache so failed preflight filters and separate diagnostic processes reuse one valid Guesty token instead of consuming the five-token daily allowance |
+| 2026-08-04 | Post-implementation PIN safety and traffic remediation | Decoupled base reservation freshness from optional PIN enrichment, limited PIN reads to mapped listings and enabled sources, prevented blind writes after unreadable sources, bounded every write/confirmation request envelope, removed hidden write retries, corrected per-reservation route migration, and restored fast bounded V2 route continuation |
+| 2026-08-04 | Sparse dual-model PIN regression remediation | Paired an exact sparse V3 row with the same refresh's successful V2 Keycode observation to classify legacy/channel reservations without blocking their first code, kept truly missing rows fail-closed, and prevented omitted `customFields` projections from causing per-reservation read fan-out |

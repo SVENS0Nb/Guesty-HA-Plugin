@@ -84,8 +84,10 @@ primary responsibilities are:
 4. Optionally publish a secure per-reservation web page that operates one to six
    Home Assistant `lock.*` entities.
 5. Optionally create one stable six-digit reservation PIN, synchronize it with
-   one or both independently enabled Guesty sources—native `notes.keyCode` and
-   a configurable reservation custom field (default `{{door_code}}`)—and
+   one or both independently enabled Guesty sources—native Keycode (top-level
+   `keyCode` on V2-backed reservations or `notes.keyCode` on V3-backed
+   reservations) and a configurable reservation custom field (default
+   `{{door_code}}`)—and
    deliver it shortly before the stay to Loxone, TTLock, or both.
 
 All optional access systems are configured through the Home Assistant UI and
@@ -249,9 +251,11 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 
 ## Guesty dual-source PIN lifecycle
 
-- Every reservation PIN has two equal Guesty mirrors: native Reservations-v3
-  `notes.keyCode` and the configurable reservation custom field (default
-  `{{door_code}}`). Resolve the latter by safe ID, name, or `{{variable}}`.
+- Every reservation PIN has two equal Guesty mirrors: Guesty's native Keycode
+  and the configurable reservation custom field (default `{{door_code}}`).
+  The native mirror has two backing-model routes: V2 top-level `keyCode` for
+  legacy/channel-imported reservations and V3 `notes.keyCode` for V3-created
+  reservations. Resolve the custom field by safe ID, name, or `{{variable}}`.
   The separate door-access URL custom field remains a different data path.
   Operators may enable either mirror independently, but a configured PIN
   provider requires at least one. A disabled mirror is excluded from reads,
@@ -275,30 +279,56 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   mirror so a failing native endpoint cannot block a healthy custom field (or
   vice versa). A stale failed mirror must never become authoritative merely
   because its propagation retry is pending.
-- Write the native field with
-  `PUT /v1/reservations-v3/{reservationId}/notes` and the minimal payload
-  `{"notes":{"keyCode":"..."}}`. Treat the write as successful only after exact
-  response or bounded v3 read-back confirmation. This is the only supported
-  Keycode write route. The general legacy `PUT /v1/reservations/{id}` updater
-  can return success and emit reservation-change events while ignoring
-  `notes.keyCode`; never use it as a Keycode fallback.
-- Read native Keycodes only from `GET /v1/reservations-v3`. The legacy
-  `/reservations` endpoints do not expose `notes.keyCode` even when it is
-  projected. A v3 reservation may identify itself with `reservationId`, `_id`,
-  or `id`; accept a top-level array or one reservation object and associate only
-  an exact requested ID. The endpoint accepts at most ten reservation IDs per
-  request. Enrich only active reservations for listings mapped to an enabled
-  PIN provider: changed reservations on incremental polls, one targeted batch
-  after a single webhook, and all applicable reservations during the
-  daily/startup full sync. Do not add a second poller.
+- V3-backed native writes use
+  `PUT /v1/reservations-v3/{reservationId}/notes` with the minimal payload
+  `{"notes":{"keyCode":"..."}}`. V2-backed/legacy/channel writes use
+  `PUT /v1/reservations/{reservationId}` with the separately support-confirmed
+  minimal top-level payload `{"keyCode":"..."}`. A nested `notes` payload on
+  the V2 updater is a silent no-op and is forbidden. Treat either route as
+  successful only after an exact response or bounded route-matched read-back;
+  HTTP success alone is never sufficient. Cache a confirmed route per
+  reservation, never account-wide. See `KB-GUESTY-003` and `KB-GUESTY-011`.
+- Keep the base V2 reservation projection free of `keyCode` and `customFields`.
+  During the same coordinator refresh, request one minimal V2 PIN projection
+  containing only `_id`, `listingId`, and the enabled PIN sources, filtered to
+  listings mapped to Loxone or TTLock. Continue the bounded V3
+  `GET /v1/reservations-v3` enrichment for active mapped reservations so
+  V3-backed `notes.keyCode` is observed. This is enrichment inside the shared
+  coordinator, not another poller. Disabled sources and unmapped listings must
+  cause no PIN-field traffic. Guesty's V2 projection may omit an empty requested
+  `keyCode`; the returned exact reservation still records that the V2 surface
+  was observed, without guessing the backing model. When the paired V3 result
+  returns that same reservation without `notes`, classify it as V2-backed. A
+  reservation missing entirely from either result remains unreadable. A
+  populated, explicit V2 Keycode must not be erased by an empty/sparse alternate
+  V3 projection. A v3 reservation
+  may identify itself with `reservationId`, `_id`, or `id`; accept a top-level
+  array or one reservation object and associate only an exact requested ID.
+  The endpoint accepts at most ten reservation IDs per request. Enrich only
+  active reservations for mapped listings during the shared poll/webhook flow.
   When native Keycode synchronization is disabled, skip this enrichment
   entirely, including startup and webhook-triggered v3 Keycode reads.
+- PIN enrichment is optional to occupancy, calendars, dates, status, and access
+  cleanup. A failed PIN projection must not discard an otherwise successful
+  base reservation refresh or fan out into one exact read per reservation.
+  A returned PIN row that omits requested `customFields`, or a requested row
+  missing entirely, is an affected unreadable source rather than permission for
+  a per-reservation fallback read. Mark it unreadable for that snapshot and retry
+  only through the next shared refresh. Persist a non-secret retry marker so that
+  refresh is a full reservation read even across restart, and clear it only
+  after a successful full PIN enrichment. Never generate or overwrite a source
+  that could not be read unless another populated mirror or a confirmed
+  private baseline safely establishes the canonical PIN.
 - Guesty's returned Keycode and configured custom field are reconciled through
   their per-source baselines. A valid, unique manual change in either field
   must propagate to the other field and existing Loxone/TTLock objects.
 - An omitted `notes` projection means “not observed,” not “the user deleted the
-  Keycode.” Never rotate or overwrite a privately cached PIN solely because a
-  sparse response omitted `notes`.
+  Keycode.” A requested V3 reservation missing from the result is temporarily
+  unreadable. A returned exact V3 reservation without `notes` selects the V2
+  route only when the same refresh successfully observed that reservation's V2
+  Keycode surface; otherwise it is also unreadable. Use the persistent full
+  enrichment retry for genuine unreadability. Never rotate or overwrite a
+  privately cached PIN solely because a sparse response omitted `notes`.
 - A sparse `notes` projection must not strand an explicitly pending native
   Keycode publication. After bounded backoff, retry the exact stable private PIN
   for a failed initial write, source migration, or configured suffix change;
@@ -320,12 +350,25 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Use one persistent global limit of at most two Guesty PIN-mirror write attempts
   in any 30-second window. Normal queue passes, reservation-specific retries,
   webhook-triggered passes, and restarts share this limit. Failed and ambiguous
-  PUTs consume a slot. Native and custom-field PUTs consume the same slots.
+  PUTs consume a slot. Native V2, native V3, and custom-field PUTs consume the
+  same slots. Reserve two persistent slots before an unknown V3 route may fall
+  back to V2, and refund only a demonstrably unused reservation after a
+  confirmed one-attempt result.
   Prioritize giving new reservations one confirmed mirror before spending
   capacity on redundancy backfill.
   Prioritize current and nearest stays. An application-wide failure of the
   dedicated notes route may stop the current batch so identical failures do not
   waste the second slot or Guesty's normal synchronization headroom.
+- Budget each persistent PUT slot as an envelope of the PUT plus up to three
+  bounded confirmation reads. Recalculate Guesty's reported long-window
+  headroom immediately before every PUT; require eight remaining requests for
+  one slot and twelve for two while preserving the four-request normal-traffic
+  reserve. If even one envelope does not fit, wait until the next configured
+  reservation refresh rather than scheduling an immediate no-traffic loop.
+  PIN-mirror PUTs and their confirmation/route-discovery GETs must disable
+  internal authentication and transport retries. A rejected token invalidates
+  itself so the next separately budgeted attempt refreshes first; no request in
+  the write envelope may be replayed invisibly.
 - Every PIN-mirror path must consume that same write budget, including
   sparse cached snapshots and one-time migrations from private stored PINs.
   Never bypass the queue merely because Guesty omitted the `notes` projection.
@@ -336,27 +379,38 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   Delete any tentative remote object, expose a conflict, and use persistent
   retry backoff until a manual Guesty edit supplies a different PIN.
 - A 404 from the dedicated v3 notes route is not proof that the reservation is
-  missing when an exact v3 read still returns it. Classify that case as a
-  Keycode-endpoint outage, preserve the original `x-request-id`, do not issue a
-  legacy write, and use bounded persistent retry. Account-wide endpoint,
-  authentication, permission, transport, or payload errors may stop the batch
-  to avoid unnecessary traffic.
+  missing when an exact v3 read still returns it. Preserve the original
+  `x-request-id`, classify the reservation as V2-backed, and use the validated
+  top-level V2 Keycode update if a second persistent write slot was reserved.
+  Otherwise cache V2 for the next bounded retry. A failed or ambiguous fallback
+  consumes its reserved slots. Account-wide authentication, permission,
+  transport, or payload errors may stop the batch to avoid unnecessary traffic.
+  A retry-state migration may seed the V2 route only from the proven
+  `guesty_keycode_endpoint_unavailable` classification; a generic rejection is
+  requeued but remains route-unknown. Route discovery with insufficient
+  fallback capacity must use the next shared write slot, not generic
+  five-minute error backoff.
 - Native Keycode failures log only the hashed reservation marker, stable
   operation/reason, safe endpoint label, HTTP status, bounded `x-request-id`,
   retry count/delay, and available rate-limit headroom. A successful write may
   log the marker and retry count, but never the PIN or full reservation ID.
-- Manual or agent-driven live Keycode tests use
-  `scripts.guesty_live_write_guard.GuestyLiveWriteGuard`; direct unguarded PUTs
-  to the live notes endpoint are forbidden. Arm the guard only after all
+- Manual or agent-driven live Keycode tests use both
+  `scripts.guesty_live_write_guard.GuestyLiveTokenCache` and
+  `GuestyLiveWriteGuard`; direct unguarded PUTs to the live notes endpoint are
+  forbidden. Resolve the OAuth token through the private persistent cache
+  before preflight so failed filters, script restarts, and separate diagnostic
+  processes reuse the same still-valid token. Arm the write guard only after all
   read-only preflight work has completed and the target and payload are frozen.
   The first attempt always waits a full 30 seconds after arming. A test run may
   consume at most two attempts, and a second attempt requires analysis of the
   first result plus another full 30-second wait. Failed, timed-out, ambiguous,
   and rejected PUTs all consume an attempt. The guard persists the last permit
   before network I/O so separate processes cannot bypass the spacing rule.
-  Reuse one OAuth token for the whole test and never mint tokens in a retry
-  loop. This stricter diagnostic rule supplements, but does not change, the
-  integration runtime's own persistent write budget.
+  The token cache is credential-fingerprint-bound, locked across processes,
+  atomic, mode `0600`, and fail-closed when corrupt. Never bypass or delete it
+  merely to make a retry mint another token. This stricter diagnostic rule
+  supplements, but does not change, the integration runtime's own persistent
+  token lifecycle and write budget.
 - The privacy-filtered general cache never persists PIN fields. The private PIN
   store owns plaintext only while needed. Remove plaintext locally at
   cancellation/access end before attempting remote cleanup. Both Guesty fields

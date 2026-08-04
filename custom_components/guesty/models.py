@@ -191,8 +191,12 @@ class GuestyReservation:
     last_updated_at: str | None
     key_code: str | None = None
     key_code_observed: bool = False
+    key_code_v2_observed: bool = False
+    key_code_route: str | None = None
+    key_code_read_failed: bool = False
     custom_fields: dict[str, Any] = field(default_factory=dict)
     custom_fields_observed: bool = False
+    custom_fields_read_failed: bool = False
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
@@ -214,6 +218,18 @@ class GuestyReservation:
         guest = data.get("guest") or {}
         raw_notes = data.get("notes")
         notes = raw_notes if isinstance(raw_notes, dict) else {}
+        # Guesty has two reservation backing models. Legacy/channel-imported
+        # reservations expose the native Keycode as the top-level v2
+        # ``keyCode`` property, while v3 reservations expose it as
+        # ``notes.keyCode``. An explicitly projected top-level property is the
+        # authoritative observation for the normal v2 reservation poll. The
+        # coordinator may subsequently replace it with an explicit v3 notes
+        # observation for a v3-backed reservation.
+        top_level_key_code_observed = "keyCode" in data
+        if top_level_key_code_observed:
+            raw_key_code = data.get("keyCode")
+        else:
+            raw_key_code = notes.get("keyCode")
         raw_custom_fields = data.get("customFields")
         custom_fields: dict[str, Any] = {}
         if isinstance(raw_custom_fields, list):
@@ -242,14 +258,22 @@ class GuestyReservation:
             # reconciled as two mirrors. Only returned containers prove that a
             # source was observed; omitted projections must never look like a
             # manual deletion on a later sparse poll.
-            key_code=(
-                str(notes["keyCode"]).strip()
-                if notes.get("keyCode") is not None
-                else None
+            key_code=(str(raw_key_code).strip() if raw_key_code is not None else None),
+            key_code_observed=(
+                top_level_key_code_observed or isinstance(raw_notes, dict)
             ),
-            key_code_observed=isinstance(raw_notes, dict),
+            key_code_v2_observed=top_level_key_code_observed,
+            key_code_route=(
+                "v2"
+                if top_level_key_code_observed
+                and raw_key_code is not None
+                and str(raw_key_code).strip()
+                else ("v3" if isinstance(raw_notes, dict) else None)
+            ),
+            key_code_read_failed=False,
             custom_fields=custom_fields,
             custom_fields_observed=isinstance(raw_custom_fields, list),
+            custom_fields_read_failed=False,
         )
 
     def is_active_status(self) -> bool:
@@ -386,8 +410,12 @@ class GuestyReservation:
             # Guesty cache. The private Loxone store owns them until access expires.
             key_code=None,
             key_code_observed=False,
+            key_code_v2_observed=False,
+            key_code_route=None,
+            key_code_read_failed=False,
             custom_fields={},
             custom_fields_observed=False,
+            custom_fields_read_failed=False,
         )
 
 

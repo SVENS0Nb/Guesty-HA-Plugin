@@ -31,6 +31,7 @@ from .const import (
     OAUTH_RATE_LIMIT_MAX_DELAY,
     OAUTH_URL,
     RESERVATION_FIELDS,
+    RESERVATION_PIN_FIELDS,
     TOKEN_REFRESH_MARGIN,
     WEBHOOK_SUBSCRIPTION_EVENTS,
 )
@@ -45,7 +46,9 @@ RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 OBJECT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 MAX_NATIVE_KEYCODE_LENGTH = 64
 RequestParams = dict[str, str] | list[tuple[str, str]]
+KEYCODE_WRITE_ROUTE_V2 = "v2"
 KEYCODE_WRITE_ROUTE_V3 = "v3"
+KEYCODE_WRITE_ROUTES = {KEYCODE_WRITE_ROUTE_V2, KEYCODE_WRITE_ROUTE_V3}
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,14 @@ class GuestyKeyCodeWriteResult:
 
     attempts: int
     route: str
+
+
+@dataclass(frozen=True, slots=True)
+class GuestyKeyCodeReadResult:
+    """Separate explicit V3 Keycodes from returned sparse V2-backed rows."""
+
+    key_codes: dict[str, str | None]
+    sparse_ids: frozenset[str]
 
 
 def legacy_client_unique_id(client_id: str) -> str:
@@ -305,6 +316,9 @@ class GuestyApiClient:
         *,
         updated_since: datetime | None = None,
         listing_ids: Collection[str] | None = None,
+        pin_listing_ids: Collection[str] | None = None,
+        include_key_code: bool = False,
+        include_custom_fields: bool = False,
     ) -> list[GuestyReservation]:
         """Fetch reservations for the configured sync window."""
         await self._async_ensure_token()
@@ -323,44 +337,156 @@ class GuestyApiClient:
             },
         )
 
+        pin_ids = {
+            value for value in (pin_listing_ids or ()) if is_safe_resource_id(value)
+        }
+        pin_read_failed = False
+        pin_source_ids: set[str] = set()
+        pin_custom_fields_unreadable_ids: set[str] = set()
+        if pin_ids and (include_key_code or include_custom_fields):
+            pin_fields = [RESERVATION_PIN_FIELDS]
+            if include_key_code:
+                pin_fields.append("keyCode")
+            if include_custom_fields:
+                pin_fields.append("customFields")
+            pin_filters = build_reservation_filters(
+                days_past,
+                days_future,
+                updated_since=updated_since,
+                listing_ids=pin_ids,
+            )
+            try:
+                raw_pin_sources = await self._async_paginate(
+                    "/reservations",
+                    params={
+                        "fields": " ".join(pin_fields),
+                        "filters": json.dumps(pin_filters, separators=(",", ":")),
+                        "sort": "_id",
+                    },
+                )
+            except (GuestyApiError, GuestyAuthError) as err:
+                # PIN mirrors are optional enrichment. Keep fresh reservation
+                # dates/statuses usable and let the coordinator mark native
+                # observations unavailable rather than discarding the poll.
+                _LOGGER.warning(
+                    "Guesty optional v2 PIN enrichment failed; continuing with "
+                    "fresh reservation data: %s",
+                    err,
+                )
+                raw_pin_sources = []
+                pin_read_failed = True
+
+            reservations_by_id = {
+                str(item.get("_id") or item.get("id")): item
+                for item in raw_reservations
+                if isinstance(item, dict) and (item.get("_id") or item.get("id"))
+            }
+            for source in raw_pin_sources:
+                if not isinstance(source, dict):
+                    continue
+                reservation_id = str(source.get("_id") or source.get("id") or "")
+                target = reservations_by_id.get(reservation_id)
+                source_listing_id = source.get("listingId") or (
+                    source.get("listing") or {}
+                ).get("_id")
+                if target is None or source_listing_id not in pin_ids:
+                    continue
+                pin_source_ids.add(reservation_id)
+                if include_key_code:
+                    # Guesty's V2 projection omits an empty top-level Keycode.
+                    # Returning the exact requested reservation still proves
+                    # that this V2 surface was observed; keep the route unknown
+                    # until the paired V3 response identifies the backing model.
+                    target["keyCode"] = source.get("keyCode")
+                if include_custom_fields:
+                    raw_custom_fields = source.get("customFields")
+                    if isinstance(raw_custom_fields, list):
+                        target["customFields"] = raw_custom_fields
+                    else:
+                        pin_custom_fields_unreadable_ids.add(reservation_id)
+
         reservations: list[GuestyReservation] = []
         for item in raw_reservations:
             reservation = GuestyReservation.from_api(item)
             if reservation:
+                source_missing = bool(
+                    pin_ids
+                    and reservation.listing_id in pin_ids
+                    and reservation.id not in pin_source_ids
+                )
+                if (
+                    (pin_read_failed or source_missing)
+                    and include_key_code
+                    and reservation.listing_id in pin_ids
+                ):
+                    reservation.key_code_read_failed = True
+                if (
+                    (
+                        pin_read_failed
+                        or source_missing
+                        or reservation.id in pin_custom_fields_unreadable_ids
+                    )
+                    and include_custom_fields
+                    and reservation.listing_id in pin_ids
+                ):
+                    reservation.custom_fields_read_failed = True
                 reservations.append(reservation)
         return reservations
 
     async def async_get_reservation(
-        self, reservation_id: str
+        self,
+        reservation_id: str,
+        *,
+        include_key_code: bool = False,
+        include_custom_fields: bool = False,
     ) -> GuestyReservation | None:
         """Fetch a single reservation by id."""
         self._validate_resource_id(reservation_id, "reservation")
         await self._async_ensure_token()
         try:
+            fields = [RESERVATION_FIELDS]
+            if include_key_code:
+                fields.append("keyCode")
+            if include_custom_fields:
+                fields.append("customFields")
             data = await self._async_request(
                 "GET",
                 f"/reservations/{reservation_id}",
-                params={"fields": RESERVATION_FIELDS},
+                params={"fields": " ".join(fields)},
             )
         except GuestyNotFoundError:
             return None
         if isinstance(data, dict):
-            return GuestyReservation.from_api(data)
+            prepared = dict(data)
+            if include_key_code:
+                # See the collection read above: an exact V2 result with an
+                # omitted requested Keycode represents an observed empty V2
+                # surface, not a failed read.
+                prepared.setdefault("keyCode", None)
+            reservation = GuestyReservation.from_api(prepared)
+            if (
+                reservation is not None
+                and include_custom_fields
+                and not isinstance(data.get("customFields"), list)
+            ):
+                reservation.custom_fields_read_failed = True
+            return reservation
         return None
 
     async def async_get_reservation_key_codes(
         self,
         reservation_ids: Collection[str],
-    ) -> dict[str, str | None]:
+    ) -> GuestyKeyCodeReadResult:
         """Fetch authoritative native Keycodes from Reservations v3 in batches."""
         unique_ids = sorted(set(reservation_ids))
         if not unique_ids:
-            return {}
+            return GuestyKeyCodeReadResult({}, frozenset())
         if any(not is_guesty_object_id(value) for value in unique_ids):
             raise GuestyApiError("Invalid reservation id")
 
         await self._async_ensure_token()
         key_codes: dict[str, str | None] = {}
+        sparse_ids: set[str] = set()
         for offset in range(0, len(unique_ids), V3_RESERVATION_BATCH_SIZE):
             batch = unique_ids[offset : offset + V3_RESERVATION_BATCH_SIZE]
             data = await self._async_request(
@@ -379,21 +505,28 @@ class GuestyApiClient:
                     continue
                 notes = item.get("notes")
                 if not isinstance(notes, dict):
-                    # A sparse v3 response must not masquerade as an explicitly
-                    # empty Keycode.
+                    # Preserve the distinction between an exact reservation
+                    # returned without V3 notes and a requested reservation
+                    # missing from the result entirely. The coordinator can
+                    # select V2 only when this is paired with a successful V2
+                    # Keycode projection for the same reservation.
+                    sparse_ids.add(str(reservation_id))
                     continue
                 raw_key_code = notes.get("keyCode")
                 key_codes[str(reservation_id)] = (
                     str(raw_key_code).strip() if raw_key_code is not None else None
                 )
-        return key_codes
+        return GuestyKeyCodeReadResult(key_codes, frozenset(sparse_ids))
 
     async def async_update_reservation_key_code(
         self,
         reservation_id: str,
         key_code: str,
+        *,
+        preferred_route: str = KEYCODE_WRITE_ROUTE_V3,
+        allow_v2_fallback: bool = True,
     ) -> GuestyKeyCodeWriteResult:
-        """Set and verify Guesty's native reservation Keycode."""
+        """Set and verify Guesty's native Keycode on either backing model."""
         if not isinstance(reservation_id, str) or not OBJECT_ID_PATTERN.fullmatch(
             reservation_id
         ):
@@ -404,6 +537,18 @@ class GuestyApiClient:
         value = key_code.strip()
         if len(value) > MAX_NATIVE_KEYCODE_LENGTH:
             raise ValueError("Guesty reservation Keycode is too long")
+        if preferred_route not in KEYCODE_WRITE_ROUTES:
+            raise ValueError("Unsupported Guesty Keycode write route")
+
+        if preferred_route == KEYCODE_WRITE_ROUTE_V2:
+            await self._async_update_reservation_key_code_v2(
+                reservation_id,
+                value,
+            )
+            return GuestyKeyCodeWriteResult(
+                attempts=1,
+                route=KEYCODE_WRITE_ROUTE_V2,
+            )
 
         try:
             data = await self._async_request(
@@ -413,18 +558,26 @@ class GuestyApiClient:
                 # The minimal payload avoids round-tripping server-managed
                 # fields such as doneBy.
                 json_body={"notes": {"keyCode": value}},
+                retry_auth=False,
                 retry_transport=False,
             )
         except GuestyNotFoundError as err:
-            # Some Guesty applications can read the exact reservation through
-            # Reservations v3 while the documented notes updater returns 404.
-            # Verify that distinction for useful diagnostics, but never fall
-            # back to the legacy general reservation updater: Guesty may accept
-            # that request and emit reservation-change events while silently
-            # ignoring notes.keyCode.
+            # Channel-imported and other legacy-backed reservations remain
+            # readable through Reservations v3, but Guesty returns 404 from
+            # the v3 notes updater. Prove that route-specific distinction
+            # before using the separately validated v2 top-level Keycode API.
             await self._async_get_reservation_v3(reservation_id)
+            if allow_v2_fallback:
+                await self._async_update_reservation_key_code_v2(
+                    reservation_id,
+                    value,
+                )
+                return GuestyKeyCodeWriteResult(
+                    attempts=2,
+                    route=KEYCODE_WRITE_ROUTE_V2,
+                )
             raise GuestyKeyCodeUnavailableError(
-                "Guesty Keycode update endpoint is unavailable",
+                "Guesty v3 Keycode route is unavailable; use v2",
                 err.status_code,
                 request_id=err.request_id,
                 endpoint=err.endpoint,
@@ -440,6 +593,70 @@ class GuestyApiClient:
             route=KEYCODE_WRITE_ROUTE_V3,
         )
 
+    async def _async_update_reservation_key_code_v2(
+        self,
+        reservation_id: str,
+        value: str,
+    ) -> None:
+        """Set and verify the top-level Keycode on a v2-backed reservation."""
+        data = await self._async_request(
+            "PUT",
+            f"/reservations/{reservation_id}",
+            # Guesty API Support confirmed this exact top-level shape. A
+            # nested notes object is accepted as a no-op on this endpoint.
+            json_body={"keyCode": value},
+            retry_auth=False,
+            retry_transport=False,
+        )
+        await self._async_confirm_reservation_key_code_v2(
+            reservation_id,
+            value,
+            data,
+        )
+
+    async def _async_confirm_reservation_key_code_v2(
+        self,
+        reservation_id: str,
+        expected_value: str,
+        response: Any,
+    ) -> None:
+        """Require an exact v2 response or bounded top-level read-back."""
+        if self._reservation_has_key_code_v2(
+            response,
+            reservation_id,
+            expected_value,
+        ):
+            return
+
+        for attempt in range(3):
+            current = await self._async_get_reservation_v2_key_code(reservation_id)
+            if self._reservation_has_key_code_v2(
+                current,
+                reservation_id,
+                expected_value,
+            ):
+                return
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
+        raise GuestyApiError("Guesty did not persist the reservation Keycode")
+
+    async def _async_get_reservation_v2_key_code(
+        self,
+        reservation_id: str,
+    ) -> dict[str, Any]:
+        """Return one exact v2 reservation with its top-level Keycode."""
+        data = await self._async_request(
+            "GET",
+            f"/reservations/{reservation_id}",
+            params={"fields": "_id keyCode"},
+            retry_auth=False,
+            retry_transport=False,
+        )
+        for item in self._normalize_results(data):
+            if self._reservation_id(item) == reservation_id:
+                return item
+        raise GuestyApiError("Guesty v2 returned no matching reservation")
+
     async def _async_confirm_reservation_key_code(
         self,
         reservation_id: str,
@@ -447,7 +664,7 @@ class GuestyApiClient:
         response: Any,
     ) -> None:
         """Require an exact response or bounded authoritative read-back."""
-        if self._reservation_has_key_code(
+        if self._reservation_has_key_code_v3(
             response,
             reservation_id,
             expected_value,
@@ -456,7 +673,7 @@ class GuestyApiClient:
 
         for attempt in range(3):
             current = await self._async_get_reservation_v3(reservation_id)
-            if self._reservation_has_key_code(
+            if self._reservation_has_key_code_v3(
                 current,
                 reservation_id,
                 expected_value,
@@ -475,6 +692,8 @@ class GuestyApiClient:
             "GET",
             "/reservations-v3",
             params=[("reservationIds[]", reservation_id)],
+            retry_auth=False,
+            retry_transport=False,
         )
         for item in self._normalize_results(data):
             if self._reservation_id(item) == reservation_id:
@@ -493,7 +712,7 @@ class GuestyApiClient:
         return None
 
     @classmethod
-    def _reservation_has_key_code(
+    def _reservation_has_key_code_v3(
         cls,
         data: Any,
         reservation_id: str,
@@ -502,7 +721,7 @@ class GuestyApiClient:
         """Return whether an exact response object confirms the Keycode."""
         if isinstance(data, list):
             return any(
-                cls._reservation_has_key_code(
+                cls._reservation_has_key_code_v3(
                     item,
                     reservation_id,
                     expected_value,
@@ -518,7 +737,37 @@ class GuestyApiClient:
                 and str(notes.get("keyCode", "")).strip() == expected_value
             )
         return any(
-            cls._reservation_has_key_code(
+            cls._reservation_has_key_code_v3(
+                data.get(key),
+                reservation_id,
+                expected_value,
+            )
+            for key in ("data", "result", "reservation", "reservations", "results")
+        )
+
+    @classmethod
+    def _reservation_has_key_code_v2(
+        cls,
+        data: Any,
+        reservation_id: str,
+        expected_value: str,
+    ) -> bool:
+        """Return whether an exact v2 response confirms top-level Keycode."""
+        if isinstance(data, list):
+            return any(
+                cls._reservation_has_key_code_v2(
+                    item,
+                    reservation_id,
+                    expected_value,
+                )
+                for item in data
+            )
+        if not isinstance(data, dict):
+            return False
+        if cls._reservation_id(data) == reservation_id:
+            return str(data.get("keyCode", "")).strip() == expected_value
+        return any(
+            cls._reservation_has_key_code_v2(
                 data.get(key),
                 reservation_id,
                 expected_value,
@@ -586,6 +835,8 @@ class GuestyApiClient:
             "PUT",
             f"/reservations-v3/{reservation_id}/custom-fields",
             json_body={"customFields": [{"fieldId": field_id, "value": value}]},
+            retry_auth=False,
+            retry_transport=False,
         )
         if not isinstance(data, dict) or data.get("reservationId") != reservation_id:
             raise GuestyApiError("Guesty did not confirm the custom field update")
@@ -651,6 +902,8 @@ class GuestyApiClient:
                 data = await self._async_request(
                     "GET",
                     f"/reservations-v3/{reservation_id}/custom-fields/{field_id}",
+                    retry_auth=False,
+                    retry_transport=False,
                 )
             except GuestyNotFoundError:
                 data = None
@@ -1249,6 +1502,13 @@ class GuestyApiClient:
                         status=retry_response.status,
                         headers=retry_response.headers,
                     )
+
+            if response.status in {401, 403} and not retry_auth:
+                # A bounded external write must never be replayed internally.
+                # Invalidate the rejected token so the next independently
+                # budgeted operation refreshes before issuing another request.
+                if self._access_token == request_token:
+                    self._token_expires_at = None
 
             if response.status == 401:
                 raise GuestyAuthError(

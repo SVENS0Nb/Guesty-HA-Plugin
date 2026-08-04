@@ -7,7 +7,10 @@ import json
 import pytest
 
 from scripts.guesty_live_write_guard import (
+    GuestyLiveTokenCache,
     GuestyLiveWriteGuard,
+    LiveOAuthToken,
+    LiveTokenCacheStateError,
     LiveWriteDiagnosisRequiredError,
     LiveWriteGuardStateError,
     LiveWriteLimitError,
@@ -126,3 +129,125 @@ def test_invalid_persisted_state_fails_closed(tmp_path) -> None:
 
     with pytest.raises(LiveWriteGuardStateError):
         guard.wait_for_attempt()
+
+
+def test_live_token_cache_reuses_token_across_process_instances(tmp_path) -> None:
+    """Related diagnostic processes mint only one Guesty access token."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    fetch_count = 0
+
+    def fetch() -> LiveOAuthToken:
+        nonlocal fetch_count
+        fetch_count += 1
+        return LiveOAuthToken("bearer-token", fake.time() + 86400)
+
+    first = GuestyLiveTokenCache(state_path, clock=fake.time)
+    second = GuestyLiveTokenCache(state_path, clock=fake.time)
+
+    assert first.get_or_fetch("client-id", "client-secret", fetch).access_token == (
+        "bearer-token"
+    )
+    assert second.get_or_fetch("client-id", "client-secret", fetch).access_token == (
+        "bearer-token"
+    )
+    assert fetch_count == 1
+    assert state_path.stat().st_mode & 0o777 == 0o600
+    assert state_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_live_token_cache_does_not_store_raw_credentials(tmp_path) -> None:
+    """Private cache state contains a fingerprint rather than credentials."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    cache = GuestyLiveTokenCache(state_path, clock=fake.time)
+
+    cache.get_or_fetch(
+        "sensitive-client-id",
+        "sensitive-client-secret",
+        lambda: LiveOAuthToken("bearer-token", fake.time() + 86400),
+    )
+
+    raw = state_path.read_text(encoding="utf-8")
+    assert "sensitive-client-id" not in raw
+    assert "sensitive-client-secret" not in raw
+    assert "bearer-token" in raw
+
+
+def test_live_token_cache_refreshes_only_inside_margin(tmp_path) -> None:
+    """A cached token remains reusable until its configured refresh margin."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    issued = iter(("first-token", "second-token"))
+    fetch_count = 0
+
+    def fetch() -> LiveOAuthToken:
+        nonlocal fetch_count
+        fetch_count += 1
+        return LiveOAuthToken(next(issued), fake.time() + 1000)
+
+    cache = GuestyLiveTokenCache(
+        state_path,
+        clock=fake.time,
+        refresh_margin=100,
+    )
+    assert cache.get_or_fetch("client", "secret", fetch).access_token == "first-token"
+    fake.now += 899
+    assert cache.get_or_fetch("client", "secret", fetch).access_token == "first-token"
+    fake.now += 2
+    assert cache.get_or_fetch("client", "secret", fetch).access_token == "second-token"
+    assert fetch_count == 2
+
+
+def test_live_token_cache_changed_credentials_do_not_reuse_token(tmp_path) -> None:
+    """A changed secret cannot silently reuse another credential context."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    fetch_count = 0
+
+    def fetch() -> LiveOAuthToken:
+        nonlocal fetch_count
+        fetch_count += 1
+        return LiveOAuthToken(f"token-{fetch_count}", fake.time() + 86400)
+
+    cache = GuestyLiveTokenCache(state_path, clock=fake.time)
+    assert cache.get_or_fetch("client", "first-secret", fetch).access_token == (
+        "token-1"
+    )
+    assert cache.get_or_fetch("client", "second-secret", fetch).access_token == (
+        "token-2"
+    )
+    assert fetch_count == 2
+
+
+def test_live_token_cache_corruption_fails_without_fetching(tmp_path) -> None:
+    """Corrupt state cannot amplify OAuth traffic by falling through to fetch."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    state_path.write_text("not-json", encoding="utf-8")
+    cache = GuestyLiveTokenCache(state_path, clock=fake.time)
+    fetched = False
+
+    def fetch() -> LiveOAuthToken:
+        nonlocal fetched
+        fetched = True
+        return LiveOAuthToken("token", fake.time() + 86400)
+
+    with pytest.raises(LiveTokenCacheStateError):
+        cache.get_or_fetch("client", "secret", fetch)
+    assert fetched is False
+
+
+def test_live_token_cache_rejects_nearly_expired_fetch_result(tmp_path) -> None:
+    """A token unusable beyond the refresh margin is never cached."""
+    fake = FakeTime()
+    state_path = tmp_path / "token.json"
+    cache = GuestyLiveTokenCache(state_path, clock=fake.time)
+
+    with pytest.raises(LiveTokenCacheStateError):
+        cache.get_or_fetch(
+            "client",
+            "secret",
+            lambda: LiveOAuthToken("token", fake.time() + 60),
+        )
+    assert not state_path.exists()

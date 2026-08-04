@@ -23,12 +23,14 @@ from .const import (
     CONF_GUESTY_WEBHOOK_ID,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_CUSTOM_ENABLED,
     CONF_PIN_NATIVE_ENABLED,
     CONF_TTLOCK_ACCOUNT,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
     CONF_TOKEN_EXPIRES_AT,
     CONF_WEBHOOK_ID,
+    DEFAULT_PIN_CUSTOM_ENABLED,
     DEFAULT_PIN_NATIVE_ENABLED,
 )
 from .coordinator import GuestyDataUpdateCoordinator
@@ -66,9 +68,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
 
         await coordinator.async_config_entry_first_refresh()
 
-        # The general cache intentionally strips reservation Keycodes. When a
+        # The general cache intentionally strips reservation PIN fields. When a
         # PIN provider is enabled after a restart, perform one shared full read
-        # instead of treating the missing cached value as an authoritative edit.
+        # instead of treating a missing cached source as an authoritative edit.
         mapped_listing_ids: set[str] = set()
         if entry.options.get(CONF_LOXONE_ENABLED, False):
             mappings = entry.options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
@@ -78,19 +80,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
             ttlock_mappings = entry.options.get(CONF_TTLOCK_LISTING_MAPPINGS, {})
             if isinstance(ttlock_mappings, dict):
                 mapped_listing_ids.update(ttlock_mappings)
-        if (
-            mapped_listing_ids
-            and entry.options.get(
-                CONF_PIN_NATIVE_ENABLED,
-                DEFAULT_PIN_NATIVE_ENABLED,
-            )
-            and coordinator.data is not None
-            and any(
-                reservation.is_active_status()
-                and reservation.listing_id in mapped_listing_ids
-                and not reservation.key_code_observed
+        native_enabled = entry.options.get(
+            CONF_PIN_NATIVE_ENABLED,
+            DEFAULT_PIN_NATIVE_ENABLED,
+        )
+        custom_enabled = entry.options.get(
+            CONF_PIN_CUSTOM_ENABLED,
+            DEFAULT_PIN_CUSTOM_ENABLED,
+        )
+        active_mapped = (
+            [
+                reservation
                 for reservation in coordinator.data.reservations
+                if reservation.is_active_status()
+                and reservation.listing_id in mapped_listing_ids
+            ]
+            if mapped_listing_ids and coordinator.data is not None
+            else []
+        )
+        pin_read_failed = any(
+            (native_enabled and getattr(reservation, "key_code_read_failed", False))
+            or (
+                custom_enabled
+                and getattr(reservation, "custom_fields_read_failed", False)
             )
+            for reservation in active_mapped
+        )
+        if not pin_read_failed and any(
+            (native_enabled and not reservation.key_code_observed)
+            or (custom_enabled and not reservation.custom_fields_observed)
+            for reservation in active_mapped
         ):
             await coordinator.async_force_full_sync()
     except BaseException:

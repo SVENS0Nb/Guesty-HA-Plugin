@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -15,6 +15,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.guesty.api import (
     GuestyAuthError,
+    GuestyKeyCodeReadResult,
     GuestyPermissionError,
     GuestyRetryableError,
 )
@@ -121,6 +122,31 @@ def test_full_sync_uses_dedicated_timestamp(
         "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
     )
     assert _is_full_reservation_sync_due(last_full_sync) is expected
+
+
+@pytest.mark.asyncio
+async def test_failed_pin_enrichment_forces_next_shared_refresh_to_be_full(
+    hass,
+    monkeypatch,
+) -> None:
+    """A persisted optional-read failure cannot age out of incremental results."""
+    cache = _empty_cache()
+    cache.update(
+        {
+            "last_full_reservation_sync": NOW.isoformat(),
+            "pin_enrichment_retry_needed": True,
+        }
+    )
+    storage = SimpleNamespace(async_load=AsyncMock(return_value=cache))
+    instance = _coordinator(hass, storage=storage)
+    expected = object()
+    fetch = AsyncMock(return_value=expected)
+    monkeypatch.setattr(instance, "_async_fetch_data", fetch)
+
+    result = await instance._async_update_data()
+
+    assert result is expected
+    fetch.assert_awaited_once_with(full_reservation_sync=True)
 
 
 @pytest.mark.asyncio
@@ -682,6 +708,25 @@ async def test_v3_observed_empty_keycode_remains_authoritative(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_v3_projection_cannot_erase_populated_v2_keycode(hass) -> None:
+    """A channel Keycode survives the sparse alternate reservation model."""
+    entry = _mapped_entry()
+    reservation_id = "507f1f77bcf86cd799439011"
+    reservation = _reservation(reservation_id, key_code="700070#️⃣")
+    reservation.key_code_route = "v2"
+    client = SimpleNamespace(
+        async_get_reservation_key_codes=AsyncMock(return_value={reservation_id: None})
+    )
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([reservation])
+
+    assert reservation.key_code == "700070#️⃣"
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_route == "v2"
+
+
+@pytest.mark.asyncio
 async def test_sparse_v3_keycode_response_is_not_an_observed_deletion(hass) -> None:
     """A missing v3 reservation or notes object cannot revoke a private PIN."""
     entry = _mapped_entry()
@@ -694,6 +739,36 @@ async def test_sparse_v3_keycode_response_is_not_an_observed_deletion(hass) -> N
 
     assert reservation.key_code is None
     assert reservation.key_code_observed is False
+    assert reservation.key_code_read_failed is True
+
+
+@pytest.mark.asyncio
+async def test_sparse_v3_channel_response_selects_observed_v2_keycode(hass) -> None:
+    """A paired sparse V3 row identifies the successfully observed V2 surface."""
+    entry = _mapped_entry()
+    reservation_id = "507f1f77bcf86cd799439011"
+    reservation = _reservation(reservation_id)
+    reservation.key_code = None
+    reservation.key_code_observed = True
+    reservation.key_code_v2_observed = True
+    reservation.key_code_route = None
+    client = SimpleNamespace(
+        async_get_reservation_key_codes=AsyncMock(
+            return_value=GuestyKeyCodeReadResult(
+                {},
+                frozenset({reservation_id}),
+            )
+        )
+    )
+    instance = _coordinator(hass, client=client, entry=entry)
+
+    await instance._async_enrich_native_keycodes([reservation])
+
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_v2_observed is True
+    assert reservation.key_code_route == "v2"
+    assert reservation.key_code_read_failed is False
 
 
 @pytest.mark.asyncio
@@ -711,6 +786,7 @@ async def test_full_poll_enriches_mapped_reservations_from_v3(
         {
             "listings": {"listing-1": _listing().to_dict()},
             "last_listing_sync": NOW.isoformat(),
+            "pin_enrichment_retry_needed": True,
         }
     )
     client = SimpleNamespace(
@@ -737,8 +813,114 @@ async def test_full_poll_enriches_mapped_reservations_from_v3(
     client.async_get_reservation_key_codes.assert_awaited_once_with({reservation_id})
     assert result.reservations[0].key_code == "799999"
     assert result.reservations[0].key_code_observed is True
-    saved = storage.async_save.await_args.args[0]["reservations"][0]
-    assert "key_code" not in saved
+    saved_cache = storage.async_save.await_args.args[0]
+    assert "key_code" not in saved_cache["reservations"][0]
+    assert "pin_enrichment_retry_needed" not in saved_cache
+
+
+@pytest.mark.asyncio
+async def test_v3_keycode_failure_keeps_fresh_base_reservation_data(
+    hass,
+    monkeypatch,
+) -> None:
+    """Optional Keycode enrichment cannot make a successful poll stale."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    reservation_id = "507f1f77bcf86cd799439011"
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_listing_sync": NOW.isoformat(),
+        }
+    )
+    reservation = _reservation(reservation_id)
+    reservation.check_in_utc = "2026-08-20T15:00:00Z"
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_reservations=AsyncMock(return_value=[reservation]),
+        async_get_reservation_key_codes=AsyncMock(
+            side_effect=GuestyRetryableError("v3 unavailable")
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    result = await instance._async_fetch_data(full_reservation_sync=True)
+
+    assert result.data_stale is False
+    assert result.last_error is None
+    assert result.reservations[0].check_in_utc == "2026-08-20T15:00:00Z"
+    assert result.reservations[0].key_code_read_failed is True
+    saved = storage.async_save.await_args.args[0]
+    assert saved["last_reservation_sync"] == NOW.isoformat()
+    assert saved["pin_enrichment_retry_needed"] is True
+
+
+@pytest.mark.asyncio
+async def test_channel_sparse_v3_result_does_not_force_repeated_full_polls(
+    hass,
+    monkeypatch,
+) -> None:
+    """An exact V2/V3 route pair clears the persistent enrichment retry marker."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    reservation_id = "507f1f77bcf86cd799439011"
+    cache = _empty_cache()
+    cache.update(
+        {
+            "listings": {"listing-1": _listing().to_dict()},
+            "last_listing_sync": NOW.isoformat(),
+            "pin_enrichment_retry_needed": True,
+        }
+    )
+    reservation = _reservation(reservation_id)
+    reservation.key_code = None
+    reservation.key_code_observed = True
+    reservation.key_code_v2_observed = True
+    reservation.key_code_route = None
+    reservation.custom_fields = {}
+    reservation.custom_fields_observed = True
+    client = SimpleNamespace(
+        access_token="token",
+        token_expires_at=123.0,
+        async_get_reservations=AsyncMock(return_value=[reservation]),
+        async_get_reservation_key_codes=AsyncMock(
+            return_value=GuestyKeyCodeReadResult(
+                {},
+                frozenset({reservation_id}),
+            )
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    result = await instance._async_fetch_data(full_reservation_sync=True)
+
+    current = result.reservations[0]
+    assert current.key_code_route == "v2"
+    assert current.key_code_read_failed is False
+    saved = storage.async_save.await_args.args[0]
+    assert "pin_enrichment_retry_needed" not in saved
 
 
 @pytest.mark.asyncio
@@ -766,10 +948,53 @@ async def test_targeted_webhook_enriches_mapped_reservation_from_v3(hass) -> Non
 
     await instance._async_apply_reservation_webhook(reservation_id)
 
-    client.async_get_reservation.assert_awaited_once_with(reservation_id)
+    assert client.async_get_reservation.await_args_list == [
+        call(reservation_id),
+        call(
+            reservation_id,
+            include_key_code=True,
+            include_custom_fields=True,
+        ),
+    ]
     client.async_get_reservation_key_codes.assert_awaited_once_with({reservation_id})
     assert instance.data.reservations[0].key_code == "788888"
     assert instance.data.reservations[0].key_code_observed is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_missing_pin_projection_keeps_base_update_fail_closed(
+    hass,
+) -> None:
+    """A transient enrichment 404 cannot trigger blind PIN reconciliation."""
+    reservation_id = "507f1f77bcf86cd799439011"
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(
+            side_effect=[_reservation(reservation_id), None]
+        ),
+        async_get_reservation_key_codes=AsyncMock(
+            side_effect=GuestyRetryableError("v3 unavailable")
+        ),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    await instance._async_apply_reservation_webhook(reservation_id)
+
+    current = instance.data.reservations[0]
+    assert current.id == reservation_id
+    assert current.key_code_read_failed is True
+    assert current.custom_fields_read_failed is True
+    assert storage.async_save.await_args.args[0]["pin_enrichment_retry_needed"] is True
 
 
 @pytest.mark.asyncio

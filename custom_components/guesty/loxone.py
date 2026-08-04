@@ -21,11 +21,14 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyKeyCodeWriteResult,
     GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    KEYCODE_WRITE_ROUTE_V2,
     KEYCODE_WRITE_ROUTE_V3,
+    KEYCODE_WRITE_ROUTES,
     is_safe_resource_id,
 )
 from .const import (
@@ -86,10 +89,12 @@ _GUESTY_KEYCODE_WRITE_BATCH_SIZE = 2
 _GUESTY_KEYCODE_QUEUE_DELAY_SECONDS = 30
 _GUESTY_MIN_WRITE_SPACING_SECONDS = 0
 _GUESTY_RATE_LIMIT_RESERVE = 4
+_GUESTY_REQUESTS_PER_WRITE_SLOT = 4
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
+_GUESTY_NATIVE_WRITE_ROUTE_KEY = "native_write_route"
 _GUESTY_NATIVE_OPERATION = "guesty_native"
 _GUESTY_CUSTOM_OPERATION = "guesty_custom"
 _PIN_FIELD_RESOLVE_OPERATION = "pin_field_resolve"
@@ -97,7 +102,7 @@ _PIN_STATE_SCHEMA_VERSION_KEY = "pin_state_schema_version"
 _PIN_STATE_SCHEMA_VERSION = 2
 _RESOLVED_PIN_FIELD_KEY = "resolved_pin_field"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
-_GUESTY_RETRY_STATE_VERSION = 3
+_GUESTY_RETRY_STATE_VERSION = 4
 _GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
     "custom_field_unavailable",
@@ -426,8 +431,14 @@ class GuestyLoxoneManager:
                     in {
                         "guesty_reservation_not_found",
                         "guesty_keycode_rejected",
+                        "guesty_keycode_endpoint_unavailable",
                     }
                 )
+                if (
+                    stale_native_404
+                    and last_error == "guesty_keycode_endpoint_unavailable"
+                ):
+                    record[_GUESTY_NATIVE_WRITE_ROUTE_KEY] = KEYCODE_WRITE_ROUTE_V2
                 if not (
                     legacy_reasonless_retry or stale_native_404 or credentials_changed
                 ):
@@ -1003,9 +1014,14 @@ class GuestyLoxoneManager:
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
         if not isinstance(remaining, int):
             return global_capacity
-        # Native Keycode synchronization normally needs only one minimal PUT.
-        # Keep several requests available for reservation and webhook traffic.
-        capacity = max(0, remaining - _GUESTY_RATE_LIMIT_RESERVE)
+        # Every externally budgeted PUT can require up to three bounded
+        # confirmation reads. Charge that complete envelope before the write so
+        # route discovery and eventual consistency cannot consume the reserve
+        # needed by normal reservation and webhook traffic.
+        capacity = max(
+            0,
+            (remaining - _GUESTY_RATE_LIMIT_RESERVE) // _GUESTY_REQUESTS_PER_WRITE_SLOT,
+        )
         return min(global_capacity, capacity)
 
     def _next_guesty_write_at(self, now: datetime) -> datetime:
@@ -1023,7 +1039,10 @@ class GuestyLoxoneManager:
             )
 
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
-        if isinstance(remaining, int) and remaining <= _GUESTY_RATE_LIMIT_RESERVE:
+        if (
+            isinstance(remaining, int)
+            and remaining < _GUESTY_RATE_LIMIT_RESERVE + _GUESTY_REQUESTS_PER_WRITE_SLOT
+        ):
             raw_interval = self.entry.options.get(
                 CONF_SCAN_INTERVAL,
                 self.entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
@@ -1063,6 +1082,23 @@ class GuestyLoxoneManager:
         # accepted a request must still consume the shared traffic allowance.
         await self._storage.async_save(self._data)
         return True
+
+    async def _async_refund_guesty_write_slots(
+        self,
+        now: datetime,
+        count: int,
+    ) -> None:
+        """Release pre-reserved fallback slots that were not used."""
+        if count <= 0:
+            return
+        attempts = self._recent_guesty_write_attempts(now)
+        if count >= len(attempts):
+            self._data.pop(_GUESTY_WRITE_ATTEMPTS_KEY, None)
+        else:
+            self._data[_GUESTY_WRITE_ATTEMPTS_KEY] = [
+                attempt.isoformat() for attempt in attempts[:-count]
+            ]
+        await self._storage.async_save(self._data)
 
     def _reservation_sync_order(
         self,
@@ -1411,7 +1447,31 @@ class GuestyLoxoneManager:
         now: datetime,
     ) -> None:
         """Write and confirm the native Guesty Keycode mirror."""
-        if not await self._async_reserve_guesty_write_slots(now, 1):
+        self._guesty_writes_remaining = min(
+            self._guesty_writes_remaining,
+            self._guesty_write_budget(now),
+        )
+        if self._guesty_writes_remaining <= 0:
+            raise _GuestyWriteDeferred(
+                self._queue_source_write(
+                    record,
+                    now,
+                    _GUESTY_NATIVE_OPERATION,
+                    "native",
+                )
+            )
+        preferred_route = record.get(_GUESTY_NATIVE_WRITE_ROUTE_KEY)
+        if preferred_route not in KEYCODE_WRITE_ROUTES:
+            preferred_route = reservation.key_code_route
+        if preferred_route not in KEYCODE_WRITE_ROUTES:
+            preferred_route = KEYCODE_WRITE_ROUTE_V3
+
+        allow_v2_fallback = bool(
+            preferred_route == KEYCODE_WRITE_ROUTE_V3
+            and self._guesty_writes_remaining >= 2
+        )
+        reserved_slots = 2 if allow_v2_fallback else 1
+        if not await self._async_reserve_guesty_write_slots(now, reserved_slots):
             self._guesty_writes_remaining = 0
             raise _GuestyWriteDeferred(
                 self._queue_source_write(
@@ -1421,16 +1481,66 @@ class GuestyLoxoneManager:
                     "native",
                 )
             )
-        self._guesty_writes_remaining = max(0, self._guesty_writes_remaining - 1)
+        self._guesty_writes_remaining = max(
+            0,
+            self._guesty_writes_remaining - reserved_slots,
+        )
         try:
-            await self._client.async_update_reservation_key_code(
-                reservation.id,
-                value,
+            if preferred_route == KEYCODE_WRITE_ROUTE_V3 and allow_v2_fallback:
+                # These are the client's defaults; omitting them preserves
+                # compatibility with older test doubles and API clients.
+                result = await self._client.async_update_reservation_key_code(
+                    reservation.id,
+                    value,
+                )
+            else:
+                result = await self._client.async_update_reservation_key_code(
+                    reservation.id,
+                    value,
+                    preferred_route=preferred_route,
+                    allow_v2_fallback=False,
+                )
+        except GuestyKeyCodeUnavailableError:
+            # The API client only raises this after proving that the exact
+            # reservation exists in v3 while its notes updater returns 404.
+            # Cache the required v2 backing model for the bounded next retry.
+            record[_GUESTY_NATIVE_WRITE_ROUTE_KEY] = KEYCODE_WRITE_ROUTE_V2
+            self._last_guesty_writes += reserved_slots
+            raise _GuestyWriteDeferred(
+                self._queue_source_write(
+                    record,
+                    now,
+                    _GUESTY_NATIVE_OPERATION,
+                    "native",
+                )
             )
-        finally:
-            self._last_guesty_writes += 1
+        except Exception:
+            # Unknown outcomes stay conservatively charged. A timeout after an
+            # accepted request must not permit more than two PUTs per window.
+            self._last_guesty_writes += reserved_slots
+            raise
+
+        actual_attempts = (
+            result.attempts
+            if isinstance(result, GuestyKeyCodeWriteResult)
+            and 1 <= result.attempts <= reserved_slots
+            else 1
+        )
+        confirmed_route = (
+            result.route
+            if isinstance(result, GuestyKeyCodeWriteResult)
+            and result.route in KEYCODE_WRITE_ROUTES
+            else preferred_route
+        )
+        unused_slots = reserved_slots - actual_attempts
+        if unused_slots:
+            await self._async_refund_guesty_write_slots(now, unused_slots)
+            self._guesty_writes_remaining += unused_slots
+        self._last_guesty_writes += actual_attempts
+        record[_GUESTY_NATIVE_WRITE_ROUTE_KEY] = confirmed_route
         reservation.key_code = value
         reservation.key_code_observed = True
+        reservation.key_code_route = confirmed_route
         record["native_baseline_value"] = value
         record["native_synced"] = True
         record.pop("native_last_error", None)
@@ -1449,6 +1559,19 @@ class GuestyLoxoneManager:
         now: datetime,
     ) -> None:
         """Write and confirm the configurable Guesty custom-field mirror."""
+        self._guesty_writes_remaining = min(
+            self._guesty_writes_remaining,
+            self._guesty_write_budget(now),
+        )
+        if self._guesty_writes_remaining <= 0:
+            raise _GuestyWriteDeferred(
+                self._queue_source_write(
+                    record,
+                    now,
+                    _GUESTY_CUSTOM_OPERATION,
+                    "custom",
+                )
+            )
         if not await self._async_reserve_guesty_write_slots(now, 1):
             self._guesty_writes_remaining = 0
             raise _GuestyWriteDeferred(
@@ -1616,43 +1739,108 @@ class GuestyLoxoneManager:
             await self._storage.async_save(self._data)
             return ["pin_source_not_configured"], None
 
-        native_observed = bool(native_enabled and reservation.key_code_observed)
-        native_value = (
-            self._clean_guesty_value(reservation.key_code) if native_enabled else None
+        native_read_failed = bool(
+            native_enabled
+            and reservation.key_code_read_failed
+            and not (
+                reservation.key_code_route == KEYCODE_WRITE_ROUTE_V2
+                and self._clean_guesty_value(reservation.key_code) is not None
+            )
         )
+        native_observed = bool(
+            native_enabled and reservation.key_code_observed and not native_read_failed
+        )
+        native_value = (
+            self._clean_guesty_value(reservation.key_code) if native_observed else None
+        )
+        if (
+            native_observed
+            and reservation.key_code_route in KEYCODE_WRITE_ROUTES
+            and record.get(_GUESTY_NATIVE_WRITE_ROUTE_KEY) not in KEYCODE_WRITE_ROUTES
+        ):
+            # An explicit native read can seed an unknown route. A route
+            # learned from an actual write/404 probe remains stronger than an
+            # empty alternate-model projection. This is private
+            # per-reservation state, never an account-wide assumption.
+            record[_GUESTY_NATIVE_WRITE_ROUTE_KEY] = reservation.key_code_route
+        if (
+            native_enabled
+            and not reservation.key_code_read_failed
+            and record.get("native_last_error")
+            == "guesty_native_keycode_read_unavailable"
+        ):
+            record.pop("native_last_error", None)
         custom_observed = False
         custom_value: str | None = None
         errors: list[str] = []
         next_run: datetime | None = None
+        if native_read_failed:
+            if record.get("native_synced") is not True:
+                record["native_synced"] = False
+            record["native_last_error"] = "guesty_native_keycode_read_unavailable"
+            errors.append("guesty_native_keycode_read_unavailable")
+        custom_read_failed = bool(
+            custom_enabled
+            and reservation.custom_fields_read_failed
+            and not reservation.custom_fields_observed
+        )
 
         if custom_enabled and custom_field_id is not None:
-            retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
-            if retry_at is not None and retry_at > now:
-                custom_field_error = str(
-                    record.get("custom_last_error") or "guesty_custom_field_unavailable"
-                )
-                next_run = self._earlier(next_run, retry_at)
-            else:
-                try:
-                    (
-                        custom_observed,
-                        custom_value,
-                    ) = await self._async_custom_field_observation(
-                        reservation,
-                        record,
-                        custom_field_id,
-                    )
-                except (GuestyApiError, GuestyAuthError) as err:
-                    custom_field_error = self._guesty_error_reason(err)
-                    if isinstance(err, GuestyNotFoundError):
-                        self._data.pop(_RESOLVED_PIN_FIELD_KEY, None)
+            if custom_read_failed:
+                if record.get("custom_synced") is not True:
                     record["custom_synced"] = False
-                    record["custom_last_error"] = custom_field_error
-                    self._record_retry_failure(record, _GUESTY_CUSTOM_OPERATION, now)
-                    retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
-                    if retry_at is not None:
-                        next_run = self._earlier(next_run, retry_at)
-                    errors.append(custom_field_error)
+                custom_field_error = "guesty_custom_field_read_unavailable"
+                record["custom_last_error"] = custom_field_error
+                errors.append(custom_field_error)
+            else:
+                retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
+                if retry_at is not None and retry_at > now:
+                    custom_field_error = str(
+                        record.get("custom_last_error")
+                        or "guesty_custom_field_unavailable"
+                    )
+                    next_run = self._earlier(next_run, retry_at)
+                else:
+                    try:
+                        (
+                            custom_observed,
+                            custom_value,
+                        ) = await self._async_custom_field_observation(
+                            reservation,
+                            record,
+                            custom_field_id,
+                        )
+                    except (GuestyApiError, GuestyAuthError) as err:
+                        custom_field_error = self._guesty_error_reason(err)
+                        if isinstance(err, GuestyNotFoundError):
+                            self._data.pop(_RESOLVED_PIN_FIELD_KEY, None)
+                        record["custom_synced"] = False
+                        record["custom_last_error"] = custom_field_error
+                        self._record_retry_failure(
+                            record, _GUESTY_CUSTOM_OPERATION, now
+                        )
+                        retry_at = self._retry_at(record, _GUESTY_CUSTOM_OPERATION)
+                        if retry_at is not None:
+                            next_run = self._earlier(next_run, retry_at)
+                        errors.append(custom_field_error)
+
+        if (
+            (native_read_failed or custom_read_failed)
+            and not any(
+                observed and value is not None
+                for observed, value in (
+                    (native_observed, native_value),
+                    (custom_observed, custom_value),
+                )
+            )
+            and self._canonical_display_value(record, reservation.listing_id) is None
+        ):
+            # An unread source could already contain a manually chosen PIN.
+            # Without either a healthy populated mirror or a confirmed private
+            # baseline, generating a replacement would risk overwriting it.
+            self._refresh_guesty_aggregate_state(record)
+            await self._storage.async_save(self._data)
+            return errors, next_run
 
         desired, conflict = self._select_dual_source_value(
             reservation,
@@ -1756,6 +1944,15 @@ class GuestyLoxoneManager:
                 )
             )
         for source, operation, observed, current, field_id in mirrors:
+            if source == "native" and native_read_failed:
+                # Fresh dates/statuses remain usable when the optional Keycode
+                # read fails, but an unobserved native field must never be
+                # generated or overwritten blindly. The independent custom
+                # mirror may continue and the next coordinator refresh retries
+                # the read without a separate traffic loop.
+                continue
+            if source == "custom" and custom_read_failed:
+                continue
             if (
                 source == "custom"
                 and custom_field_id is not None
@@ -2558,6 +2755,18 @@ class GuestyLoxoneManager:
         """Return a privacy-safe operational summary without PINs or names."""
         records = self._records
         retry_counts, next_retry = self._guesty_retry_summary()
+        native_routes = {
+            route
+            for record in records.values()
+            if isinstance(record, dict)
+            and (route := record.get(_GUESTY_NATIVE_WRITE_ROUTE_KEY))
+            in KEYCODE_WRITE_ROUTES
+        }
+        native_route = (
+            next(iter(native_routes))
+            if len(native_routes) == 1
+            else ("mixed" if native_routes else "automatic")
+        )
         return {
             "enabled": bool(self.entry.options.get(CONF_LOXONE_ENABLED, False)),
             "native_keycode_enabled": self._native_pin_enabled,
@@ -2573,7 +2782,7 @@ class GuestyLoxoneManager:
             "provisioned_during_last_reconcile": self._last_provisioned,
             "deleted_during_last_reconcile": self._last_deleted,
             "guesty_writes_during_last_reconcile": self._last_guesty_writes,
-            "guesty_keycode_write_route": KEYCODE_WRITE_ROUTE_V3,
+            "guesty_keycode_write_route": native_route,
             "queued_during_last_reconcile": self._last_queued,
             "local_records": len(records),
             "native_keycodes_synced": sum(

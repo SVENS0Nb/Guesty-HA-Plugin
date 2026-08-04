@@ -19,10 +19,13 @@ from custom_components.guesty.api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyKeyCodeReadResult,
+    GuestyKeyCodeWriteResult,
     GuestyKeyCodeUnavailableError,
     GuestyNotFoundError,
     GuestyPermissionError,
     GuestyRetryableError,
+    KEYCODE_WRITE_ROUTE_V2,
     KEYCODE_WRITE_ROUTE_V3,
     account_unique_id_from_access_token,
     is_guesty_object_id,
@@ -795,6 +798,219 @@ def test_targeted_reservation_filters_limit_new_listing_traffic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reservation_poll_omits_disabled_pin_sources(monkeypatch) -> None:
+    """The shared occupancy poll never requests PIN fields by default."""
+    client = _client()
+    paginate = AsyncMock(
+        return_value=[
+            {
+                "_id": "507f1f77bcf86cd799439011",
+                "listingId": "listing-1",
+                "status": "confirmed",
+                "checkIn": "2026-08-10T15:00:00Z",
+                "checkOut": "2026-08-11T11:00:00Z",
+            }
+        ]
+    )
+    monkeypatch.setattr(client, "_async_paginate", paginate)
+
+    reservations = await client.async_get_reservations(30, 365)
+
+    assert len(reservations) == 1
+    assert reservations[0].key_code_observed is False
+    assert reservations[0].custom_fields_observed is False
+    assert paginate.await_count == 1
+    fields = paginate.await_args.kwargs["params"]["fields"]
+    assert "keyCode" not in fields
+    assert "customFields" not in fields
+
+
+@pytest.mark.asyncio
+async def test_reservation_poll_reads_pin_sources_only_for_mapped_listings(
+    monkeypatch,
+) -> None:
+    """One minimal V2 enrichment cannot expose PINs from unrelated listings."""
+    client = _client()
+    mapped_id = "507f1f77bcf86cd799439011"
+    unrelated_id = "507f1f77bcf86cd799439012"
+    base = [
+        {
+            "_id": mapped_id,
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-08-10T15:00:00Z",
+            "checkOut": "2026-08-11T11:00:00Z",
+        },
+        {
+            "_id": unrelated_id,
+            "listingId": "listing-2",
+            "status": "confirmed",
+            "checkIn": "2026-08-12T15:00:00Z",
+            "checkOut": "2026-08-13T11:00:00Z",
+        },
+    ]
+    paginate = AsyncMock(
+        side_effect=[
+            base,
+            [
+                {
+                    "_id": mapped_id,
+                    "listingId": "listing-1",
+                    "keyCode": "712345#",
+                    "customFields": [{"fieldId": "field-1", "value": "712345#"}],
+                },
+                {
+                    "_id": unrelated_id,
+                    "listingId": "listing-2",
+                    "keyCode": "799999",
+                    "customFields": [{"fieldId": "field-1", "value": "799999"}],
+                },
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_paginate", paginate)
+
+    reservations = await client.async_get_reservations(
+        30,
+        365,
+        pin_listing_ids={"listing-1"},
+        include_key_code=True,
+        include_custom_fields=True,
+    )
+
+    by_id = {reservation.id: reservation for reservation in reservations}
+    assert by_id[mapped_id].key_code == "712345#"
+    assert by_id[mapped_id].custom_fields == {"field-1": "712345#"}
+    assert by_id[unrelated_id].key_code_observed is False
+    assert by_id[unrelated_id].custom_fields_observed is False
+    assert paginate.await_count == 2
+    pin_call = paginate.await_args_list[1]
+    assert pin_call.kwargs["params"]["fields"] == ("_id listingId keyCode customFields")
+    assert {
+        "operator": "$in",
+        "field": "listingId",
+        "value": ["listing-1"],
+    } in json.loads(pin_call.kwargs["params"]["filters"])
+
+
+@pytest.mark.asyncio
+async def test_sparse_per_reservation_pin_projection_is_classified_by_source(
+    monkeypatch,
+) -> None:
+    """A returned empty V2 Keycode is usable while omitted customFields fail closed."""
+    client = _client()
+    reservation_id = "507f1f77bcf86cd799439011"
+    paginate = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": reservation_id,
+                    "listingId": "listing-1",
+                    "status": "confirmed",
+                    "checkIn": "2026-08-10T15:00:00Z",
+                    "checkOut": "2026-08-11T11:00:00Z",
+                }
+            ],
+            [
+                {
+                    "_id": reservation_id,
+                    "listingId": "listing-1",
+                    # Guesty omits an empty V2 Keycode and can return a sparse
+                    # custom-field projection independently.
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(client, "_async_paginate", paginate)
+
+    reservations = await client.async_get_reservations(
+        30,
+        365,
+        pin_listing_ids={"listing-1"},
+        include_key_code=True,
+        include_custom_fields=True,
+    )
+
+    reservation = reservations[0]
+    assert reservation.key_code is None
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_v2_observed is True
+    assert reservation.key_code_route is None
+    assert reservation.key_code_read_failed is False
+    assert reservation.custom_fields_observed is False
+    assert reservation.custom_fields_read_failed is True
+
+
+@pytest.mark.asyncio
+async def test_optional_v2_pin_read_failure_keeps_fresh_reservations(
+    monkeypatch,
+) -> None:
+    """A failed PIN projection cannot discard fresh dates and statuses."""
+    client = _client()
+    reservation_id = "507f1f77bcf86cd799439011"
+    paginate = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "_id": reservation_id,
+                    "listingId": "listing-1",
+                    "status": "confirmed",
+                    "checkIn": "2026-08-10T15:00:00Z",
+                    "checkOut": "2026-08-11T11:00:00Z",
+                }
+            ],
+            GuestyRetryableError("PIN projection offline"),
+        ]
+    )
+    monkeypatch.setattr(client, "_async_paginate", paginate)
+
+    reservations = await client.async_get_reservations(
+        30,
+        365,
+        pin_listing_ids={"listing-1"},
+        include_key_code=True,
+        include_custom_fields=True,
+    )
+
+    assert [reservation.id for reservation in reservations] == [reservation_id]
+    assert reservations[0].key_code_read_failed is True
+    assert reservations[0].custom_fields_read_failed is True
+
+
+@pytest.mark.asyncio
+async def test_bounded_write_does_not_replay_after_rejected_token() -> None:
+    """A PIN PUT consumes exactly one external attempt after HTTP 401."""
+
+    class ResponseContext:
+        async def __aenter__(self):
+            return SimpleNamespace(
+                status=401,
+                headers={},
+                content=SimpleNamespace(
+                    read=AsyncMock(side_effect=[b'{"message":"expired"}', b""])
+                ),
+                charset="utf-8",
+            )
+
+        async def __aexit__(self, *_args):
+            return False
+
+    session = SimpleNamespace(request=MagicMock(return_value=ResponseContext()))
+    client = GuestyApiClient(session, "client", "secret", "token", float("inf"))
+
+    with pytest.raises(GuestyAuthError):
+        await client._async_request_once(
+            "PUT",
+            "/reservations-v3/507f1f77bcf86cd799439011/notes",
+            json_body={"notes": {"keyCode": "712345"}},
+            retry_auth=False,
+        )
+
+    assert session.request.call_count == 1
+    assert client.token_expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_webhook_registration_uses_only_documented_events(monkeypatch) -> None:
     """Compatibility-only event names cannot make registration fail."""
     assert WEBHOOK_SUBSCRIPTION_EVENTS == (
@@ -905,6 +1121,37 @@ async def test_deleted_reservation_returns_none(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_targeted_sparse_pin_projection_does_not_fan_out(monkeypatch) -> None:
+    """A targeted V2 result classifies both optional PIN sources in one request."""
+    client = _client()
+    reservation_id = "507f1f77bcf86cd799439011"
+    request = AsyncMock(
+        return_value={
+            "_id": reservation_id,
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-08-10T15:00:00Z",
+            "checkOut": "2026-08-11T11:00:00Z",
+        }
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    reservation = await client.async_get_reservation(
+        reservation_id,
+        include_key_code=True,
+        include_custom_fields=True,
+    )
+
+    assert reservation is not None
+    assert reservation.key_code_observed is True
+    assert reservation.key_code_v2_observed is True
+    assert reservation.key_code_read_failed is False
+    assert reservation.custom_fields_observed is False
+    assert reservation.custom_fields_read_failed is True
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_native_keycode_uses_minimal_v3_notes_payload(monkeypatch) -> None:
     """Keycodes use the internal ID and never round-trip unrelated notes."""
     client = _client()
@@ -928,6 +1175,7 @@ async def test_native_keycode_uses_minimal_v3_notes_payload(monkeypatch) -> None
         "PUT",
         f"/reservations-v3/{reservation_id}/notes",
         json_body={"notes": {"keyCode": "712345#"}},
+        retry_auth=False,
         retry_transport=False,
     )
 
@@ -958,10 +1206,10 @@ async def test_native_keycode_accepts_v3_success_using_internal_id(
 
 
 @pytest.mark.asyncio
-async def test_native_keycode_404_verifies_reservation_without_legacy_write(
+async def test_native_keycode_v3_404_falls_back_to_confirmed_v2_write(
     monkeypatch,
 ) -> None:
-    """A route-specific 404 never mutates the reservation through legacy API."""
+    """A route-specific v3 404 uses Guesty's confirmed top-level v2 shape."""
     client = _client()
     reservation_id = "6a64b5dcec567638fee95de9"
     request = AsyncMock(
@@ -978,6 +1226,61 @@ async def test_native_keycode_404_verifies_reservation_without_legacy_write(
                     "notes": {},
                 }
             ],
+            {"_id": reservation_id, "keyCode": "712345#"},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345#",
+    )
+
+    assert result == GuestyKeyCodeWriteResult(
+        attempts=2,
+        route=KEYCODE_WRITE_ROUTE_V2,
+    )
+    assert request.await_args_list == [
+        call(
+            "PUT",
+            f"/reservations-v3/{reservation_id}/notes",
+            json_body={"notes": {"keyCode": "712345#"}},
+            retry_auth=False,
+            retry_transport=False,
+        ),
+        call(
+            "GET",
+            "/reservations-v3",
+            params=[("reservationIds[]", reservation_id)],
+            retry_auth=False,
+            retry_transport=False,
+        ),
+        call(
+            "PUT",
+            f"/reservations/{reservation_id}",
+            json_body={"keyCode": "712345#"},
+            retry_auth=False,
+            retry_transport=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_v3_404_can_defer_v2_for_write_budget(
+    monkeypatch,
+) -> None:
+    """One remaining write slot learns the v2 route without exceeding it."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        side_effect=[
+            GuestyNotFoundError(
+                "notes route unavailable",
+                status_code=404,
+                request_id="request-404",
+                endpoint="reservations-v3",
+            ),
+            [{"_id": reservation_id, "notes": {}}],
         ]
     )
     monkeypatch.setattr(client, "_async_request", request)
@@ -986,24 +1289,73 @@ async def test_native_keycode_404_verifies_reservation_without_legacy_write(
         await client.async_update_reservation_key_code(
             reservation_id,
             "712345#",
+            allow_v2_fallback=False,
         )
 
     assert raised.value.status_code == 404
     assert raised.value.request_id == "request-404"
     assert raised.value.endpoint == "reservations-v3"
-    assert request.await_args_list == [
-        call(
-            "PUT",
-            f"/reservations-v3/{reservation_id}/notes",
-            json_body={"notes": {"keyCode": "712345#"}},
-            retry_transport=False,
-        ),
-        call(
-            "GET",
-            "/reservations-v3",
-            params=[("reservationIds[]", reservation_id)],
-        ),
-    ]
+    assert request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_preferred_v2_uses_only_top_level_payload(
+    monkeypatch,
+) -> None:
+    """A cached v2 route never probes v3 or sends the rejected notes shape."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(return_value={"_id": reservation_id, "keyCode": "700070#️⃣"})
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "700070#️⃣",
+        preferred_route=KEYCODE_WRITE_ROUTE_V2,
+    )
+
+    assert result == GuestyKeyCodeWriteResult(
+        attempts=1,
+        route=KEYCODE_WRITE_ROUTE_V2,
+    )
+    request.assert_awaited_once_with(
+        "PUT",
+        f"/reservations/{reservation_id}",
+        json_body={"keyCode": "700070#️⃣"},
+        retry_auth=False,
+        retry_transport=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_keycode_v2_uses_exact_readback_when_response_is_sparse(
+    monkeypatch,
+) -> None:
+    """A v2 HTTP success is trusted only after exact top-level read-back."""
+    client = _client()
+    reservation_id = "6a64b5dcec567638fee95de9"
+    request = AsyncMock(
+        side_effect=[
+            {"_id": reservation_id},
+            {"_id": reservation_id, "keyCode": "712345"},
+        ]
+    )
+    monkeypatch.setattr(client, "_async_request", request)
+
+    result = await client.async_update_reservation_key_code(
+        reservation_id,
+        "712345",
+        preferred_route=KEYCODE_WRITE_ROUTE_V2,
+    )
+
+    assert result.route == KEYCODE_WRITE_ROUTE_V2
+    assert request.await_args_list[-1] == call(
+        "GET",
+        f"/reservations/{reservation_id}",
+        params={"fields": "_id keyCode"},
+        retry_auth=False,
+        retry_transport=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -1089,11 +1441,14 @@ async def test_native_keycode_reads_use_batched_v3_array_responses(
 
     result = await client.async_get_reservation_key_codes(reversed(reservation_ids))
 
-    assert result == {
-        reservation_ids[0]: "712345",
-        reservation_ids[1]: None,
-        reservation_ids[10]: "734567#",
-    }
+    assert result == GuestyKeyCodeReadResult(
+        {
+            reservation_ids[0]: "712345",
+            reservation_ids[1]: None,
+            reservation_ids[10]: "734567#",
+        },
+        frozenset({reservation_ids[2]}),
+    )
     assert request.await_args_list == [
         call(
             "GET",
@@ -1131,7 +1486,10 @@ async def test_native_keycode_reads_single_v3_reservation_object(
 
     result = await client.async_get_reservation_key_codes({reservation_id})
 
-    assert result == {reservation_id: "712345#"}
+    assert result == GuestyKeyCodeReadResult(
+        {reservation_id: "712345#"},
+        frozenset(),
+    )
 
 
 @pytest.mark.asyncio
@@ -1258,10 +1616,14 @@ async def test_reservation_custom_field_uses_v3_endpoint(monkeypatch) -> None:
                 }
             ]
         },
+        retry_auth=False,
+        retry_transport=False,
     )
     request.assert_any_await(
         "GET",
         "/reservations-v3/reservation-1/custom-fields/65fab102a5284d73c6206db0",
+        retry_auth=False,
+        retry_transport=False,
     )
     assert request.await_count == 2
 

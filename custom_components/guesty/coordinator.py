@@ -18,6 +18,7 @@ from .api import (
     GuestyApiClient,
     GuestyApiError,
     GuestyAuthError,
+    GuestyKeyCodeReadResult,
     GuestyPermissionError,
     is_guesty_object_id,
     is_safe_resource_id,
@@ -27,6 +28,7 @@ from .const import (
     CONF_LISTING_SYNC_INTERVAL,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_CUSTOM_ENABLED,
     CONF_PIN_NATIVE_ENABLED,
     CONF_RESERVATION_DAYS_FUTURE,
     CONF_RESERVATION_DAYS_PAST,
@@ -36,6 +38,7 @@ from .const import (
     CONF_TTLOCK_LISTING_MAPPINGS,
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_LISTING_SYNC_INTERVAL,
+    DEFAULT_PIN_CUSTOM_ENABLED,
     DEFAULT_PIN_NATIVE_ENABLED,
     DEFAULT_RESERVATION_DAYS_FUTURE,
     DEFAULT_RESERVATION_DAYS_PAST,
@@ -63,6 +66,7 @@ from .storage import GuestyStorage
 
 _LOGGER = logging.getLogger(__name__)
 INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=5)
+_PIN_ENRICHMENT_RETRY_KEY = "pin_enrichment_retry_needed"
 
 
 def _is_full_reservation_sync_due(last_full_sync: str | None) -> bool:
@@ -244,7 +248,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         async with self._refresh_lock:
             cache = await self._storage.async_load()
             last_full_sync = cache.get("last_full_reservation_sync")
-            full_reservation_sync = _is_full_reservation_sync_due(last_full_sync)
+            full_reservation_sync = bool(
+                cache.get(_PIN_ENRICHMENT_RETRY_KEY)
+                or _is_full_reservation_sync_due(last_full_sync)
+            )
             return await self._async_fetch_data(
                 full_reservation_sync=full_reservation_sync
             )
@@ -315,6 +322,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 updated_since = parsed - INCREMENTAL_SYNC_OVERLAP
 
         try:
+            pin_read_kwargs = self._reservation_pin_read_kwargs()
             if should_sync_listings:
                 listings_result, reservations_result = await asyncio.gather(
                     self._client.async_get_listings(),
@@ -322,6 +330,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         days_past,
                         days_future,
                         updated_since=None if full_reservation_sync else updated_since,
+                        **pin_read_kwargs,
                     ),
                 )
             else:
@@ -330,9 +339,15 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     days_past,
                     days_future,
                     updated_since=None if full_reservation_sync else updated_since,
+                    **pin_read_kwargs,
                 )
 
-            await self._async_enrich_native_keycodes(reservations_result)
+            await self._async_try_enrich_native_keycodes(reservations_result)
+            pin_enrichment_failed = any(
+                reservation.key_code_read_failed
+                or reservation.custom_fields_read_failed
+                for reservation in reservations_result
+            )
 
             if listings_result is not None:
                 listings = {listing.id: listing for listing in listings_result}
@@ -372,6 +387,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     "last_error": None,
                 }
             )
+            if pin_enrichment_failed:
+                cache[_PIN_ENRICHMENT_RETRY_KEY] = True
+            elif full_reservation_sync:
+                cache.pop(_PIN_ENRICHMENT_RETRY_KEY, None)
             self._update_cached_auth_state(cache)
             await self._storage.async_save(cache)
             api_success = True
@@ -655,6 +674,9 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         days_past,
                         days_future,
                         listing_ids=added_listing_ids,
+                        **self._reservation_pin_read_kwargs(
+                            listing_ids=added_listing_ids
+                        ),
                     )
                 except (GuestyApiError, GuestyAuthError) as err:
                     _LOGGER.warning(
@@ -662,7 +684,13 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         err,
                     )
                 else:
-                    await self._async_enrich_native_keycodes(listing_reservations)
+                    await self._async_try_enrich_native_keycodes(listing_reservations)
+                    if any(
+                        reservation.key_code_read_failed
+                        or reservation.custom_fields_read_failed
+                        for reservation in listing_reservations
+                    ):
+                        cache[_PIN_ENRICHMENT_RETRY_KEY] = True
                     reservations = merge_reservations(
                         reservations,
                         listing_reservations,
@@ -701,7 +729,51 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         try:
             reservation = await self._client.async_get_reservation(reservation_id)
             if reservation is not None:
-                await self._async_enrich_native_keycodes([reservation])
+                pin_listing_ids = self._pin_provider_listing_ids()
+                if reservation.listing_id in pin_listing_ids:
+                    try:
+                        enriched = await self._client.async_get_reservation(
+                            reservation_id,
+                            include_key_code=self.config_entry.options.get(
+                                CONF_PIN_NATIVE_ENABLED,
+                                DEFAULT_PIN_NATIVE_ENABLED,
+                            ),
+                            include_custom_fields=self.config_entry.options.get(
+                                CONF_PIN_CUSTOM_ENABLED,
+                                DEFAULT_PIN_CUSTOM_ENABLED,
+                            ),
+                        )
+                    except (GuestyApiError, GuestyAuthError) as err:
+                        if self.config_entry.options.get(
+                            CONF_PIN_NATIVE_ENABLED,
+                            DEFAULT_PIN_NATIVE_ENABLED,
+                        ):
+                            reservation.key_code_read_failed = True
+                        if self.config_entry.options.get(
+                            CONF_PIN_CUSTOM_ENABLED,
+                            DEFAULT_PIN_CUSTOM_ENABLED,
+                        ):
+                            reservation.custom_fields_read_failed = True
+                        _LOGGER.warning(
+                            "Guesty optional targeted PIN enrichment failed; "
+                            "continuing with the reservation update: %s",
+                            err,
+                        )
+                    else:
+                        if enriched is not None:
+                            reservation = enriched
+                        else:
+                            if self.config_entry.options.get(
+                                CONF_PIN_NATIVE_ENABLED,
+                                DEFAULT_PIN_NATIVE_ENABLED,
+                            ):
+                                reservation.key_code_read_failed = True
+                            if self.config_entry.options.get(
+                                CONF_PIN_CUSTOM_ENABLED,
+                                DEFAULT_PIN_CUSTOM_ENABLED,
+                            ):
+                                reservation.custom_fields_read_failed = True
+                await self._async_try_enrich_native_keycodes([reservation])
         except (GuestyApiError, GuestyAuthError) as err:
             _LOGGER.warning(
                 "Webhook reservation refresh failed; running incremental sync: %s",
@@ -733,6 +805,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 days_future=days_future,
             )
             cache["reservations"] = self._reservations_for_cache(reservations)
+            if reservation.key_code_read_failed or (
+                reservation.custom_fields_read_failed
+            ):
+                cache[_PIN_ENRICHMENT_RETRY_KEY] = True
             self._update_cached_auth_state(cache)
             await self._storage.async_save(cache)
             self._async_set_targeted_data_from_cache(
@@ -740,12 +816,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 reservation_overrides={reservation.id: reservation},
             )
 
-    def _native_keycode_listing_ids(self) -> set[str]:
-        """Return listings whose enabled PIN provider needs native Keycodes."""
+    def _pin_provider_listing_ids(self) -> set[str]:
+        """Return listings mapped to either PIN delivery provider."""
         listing_ids: set[str] = set()
         options = self.config_entry.options
-        if not options.get(CONF_PIN_NATIVE_ENABLED, DEFAULT_PIN_NATIVE_ENABLED):
-            return listing_ids
         if options.get(CONF_LOXONE_ENABLED, False):
             mappings = options.get(CONF_LOXONE_LISTING_MAPPINGS, {})
             if isinstance(mappings, dict):
@@ -759,6 +833,65 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     value for value in mappings if is_safe_resource_id(value)
                 )
         return listing_ids
+
+    def _native_keycode_listing_ids(self) -> set[str]:
+        """Return mapped listings whose enabled PIN source needs native Keycodes."""
+        if not self.config_entry.options.get(
+            CONF_PIN_NATIVE_ENABLED,
+            DEFAULT_PIN_NATIVE_ENABLED,
+        ):
+            return set()
+        return self._pin_provider_listing_ids()
+
+    def _reservation_pin_read_kwargs(
+        self,
+        *,
+        listing_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return minimal optional V2 PIN projection arguments."""
+        mapped = self._pin_provider_listing_ids()
+        if listing_ids is not None:
+            mapped.intersection_update(listing_ids)
+        if not mapped:
+            return {}
+        options = self.config_entry.options
+        include_key_code = bool(
+            options.get(CONF_PIN_NATIVE_ENABLED, DEFAULT_PIN_NATIVE_ENABLED)
+        )
+        include_custom_fields = bool(
+            options.get(CONF_PIN_CUSTOM_ENABLED, DEFAULT_PIN_CUSTOM_ENABLED)
+        )
+        if not include_key_code and not include_custom_fields:
+            return {}
+        return {
+            "pin_listing_ids": mapped,
+            "include_key_code": include_key_code,
+            "include_custom_fields": include_custom_fields,
+        }
+
+    async def _async_try_enrich_native_keycodes(
+        self,
+        reservations: list[GuestyReservation],
+    ) -> bool:
+        """Enrich native V3 Keycodes without blocking fresh base data."""
+        try:
+            await self._async_enrich_native_keycodes(reservations)
+        except (GuestyApiError, GuestyAuthError) as err:
+            mapped_listing_ids = self._native_keycode_listing_ids()
+            for reservation in reservations:
+                if (
+                    reservation.listing_id in mapped_listing_ids
+                    and reservation.is_active_status()
+                    and reservation.key_code_route != "v2"
+                ):
+                    reservation.key_code_read_failed = True
+            _LOGGER.warning(
+                "Guesty optional v3 Keycode enrichment failed; continuing with "
+                "fresh reservation data: %s",
+                err,
+            )
+            return False
+        return True
 
     async def _async_enrich_native_keycodes(
         self,
@@ -778,12 +911,47 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         if not targets:
             return
 
-        key_codes = await self._client.async_get_reservation_key_codes(targets)
+        read_result = await self._client.async_get_reservation_key_codes(targets)
+        if isinstance(read_result, GuestyKeyCodeReadResult):
+            key_codes = read_result.key_codes
+            sparse_ids = read_result.sparse_ids
+        else:
+            # Preserve compatibility with simple third-party/test clients that
+            # implemented the older mapping-only interface.
+            key_codes = read_result
+            sparse_ids = frozenset()
         for reservation in reservations:
             if reservation.id not in key_codes:
+                if reservation.id in sparse_ids and reservation.key_code_v2_observed:
+                    # Guesty returns legacy/channel reservations through V3 but
+                    # omits their V3-only notes container. Paired with a
+                    # successful V2 Keycode projection for the exact same ID,
+                    # this identifies the V2 backing model even when the empty
+                    # top-level Keycode itself was omitted.
+                    reservation.key_code_read_failed = False
+                    reservation.key_code_observed = True
+                    reservation.key_code_route = "v2"
+                    continue
+                if reservation.id in targets and reservation.key_code_route != "v2":
+                    # A missing reservation or notes container is sparse, not
+                    # proof that the native field is empty. Keep this source
+                    # fail-closed until the next shared full enrichment.
+                    reservation.key_code_read_failed = True
+                continue
+            reservation.key_code_read_failed = False
+            if (
+                key_codes[reservation.id] is None
+                and reservation.key_code_route == "v2"
+                and reservation.key_code
+            ):
+                # A channel reservation may be readable through v3 while its
+                # native Keycode belongs exclusively to the v2 backing model.
+                # An empty v3 notes projection cannot erase a populated,
+                # explicitly observed top-level v2 Keycode.
                 continue
             reservation.key_code = key_codes[reservation.id]
             reservation.key_code_observed = True
+            reservation.key_code_route = "v3"
 
     async def _async_remove_reservation_from_cache(self, reservation_id: str) -> None:
         """Remove a reservation Guesty reports as no longer existing."""
