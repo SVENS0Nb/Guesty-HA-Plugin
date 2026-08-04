@@ -413,10 +413,8 @@ async def test_ttlock_only_listing_reuses_guesty_pin_without_loxone_side_effects
 
 
 @pytest.mark.asyncio
-async def test_bulk_native_keycode_migration_is_prioritized_and_bounded(
-    hass, monkeypatch
-) -> None:
-    """Nearest stays migrate first without exhausting Guesty's API allowance."""
+async def test_bulk_pin_migration_is_prioritized_and_bounded(hass, monkeypatch) -> None:
+    """Nearest stays finish both mirrors before more distant reservations."""
     reservations = [
         _reservation(
             check_in=NOW + timedelta(days=days),
@@ -449,6 +447,19 @@ async def test_bulk_native_keycode_migration_is_prioritized_and_bounded(
     )
     await manager.async_reconcile()
 
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+    ] == ["reservation-1", "reservation-2"]
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=62),
+    )
+    await manager.async_reconcile()
+
     assert guesty_client.async_update_reservation_key_code.await_count == 4
     assert [
         item.args[0]
@@ -459,8 +470,27 @@ async def test_bulk_native_keycode_migration_is_prioritized_and_bounded(
         "reservation-3",
         "reservation-4",
     ]
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=93),
+    )
+    await manager.async_reconcile()
+
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+    ] == [
+        "reservation-1",
+        "reservation-2",
+        "reservation-3",
+        "reservation-4",
+    ]
     assert all(
-        manager._records[reservation.id]["field_synced"] for reservation in reservations
+        manager._records[reservation.id]["native_synced"]
+        and manager._records[reservation.id]["custom_synced"]
+        for reservation in reservations
     )
     assert manager.diagnostics()["native_keycodes_pending"] == 0
     assert manager.diagnostics()["native_keycodes_queued"] == 0
@@ -1403,6 +1433,19 @@ async def test_guesty_write_limit_is_global_across_overlapping_reconciles(
         loxone.dt_util,
         "utcnow",
         lambda: NOW + timedelta(seconds=31),
+    )
+    await manager.async_reconcile()
+
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+    ] == [missing[0].id, missing[1].id]
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=62),
     )
     await manager.async_reconcile()
 
@@ -2446,10 +2489,79 @@ async def test_already_ended_active_reservation_does_not_create_local_state(
 
     await manager.async_reconcile()
 
-    assert reservation.key_code is None
+    assert reservation.key_code == "712345"
     assert reservation.id not in manager._records
     guesty_client.async_update_reservation_key_code.assert_not_awaited()
     remote.async_add_or_update_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ended_confirmed_reservation_cannot_block_future_custom_mirror(
+    hass, monkeypatch
+) -> None:
+    """A checked-out booking is cleanup-only and cannot starve PIN backfill."""
+    ended = _reservation(
+        check_in=NOW - timedelta(days=2),
+        check_out=NOW - timedelta(minutes=1),
+        key_code="711111",
+        reservation_id="reservation-ended",
+    )
+    future = _reservation(
+        check_in=NOW + timedelta(days=2),
+        check_out=NOW + timedelta(days=3),
+        key_code="722222",
+        reservation_id="reservation-future",
+    )
+    future.custom_fields = {}
+    future.custom_fields_observed = True
+    manager, coordinator, guesty_client, _remote = _manager(hass, monkeypatch, future)
+    coordinator.data.reservations = [ended, future]
+
+    await manager.async_reconcile()
+
+    assert ended.id not in manager._records
+    assert manager._records[future.id]["native_synced"] is True
+    assert manager._records[future.id]["custom_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        future.id,
+        PIN_FIELD_ID,
+        "722222",
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_backfill_is_prioritized_by_nearest_check_in(
+    hass, monkeypatch
+) -> None:
+    """Nearest stays consume bounded mirror slots before distant bookings."""
+    reservations = [
+        _reservation(
+            check_in=NOW + timedelta(days=days),
+            check_out=NOW + timedelta(days=days + 1),
+            key_code=code,
+            reservation_id=f"reservation-{days}",
+        )
+        for days, code in ((1, "711111"), (2, "722222"), (30, "733333"))
+    ]
+    for reservation in reservations:
+        reservation.custom_fields = {}
+        reservation.custom_fields_observed = True
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservations[0]
+    )
+    coordinator.data.reservations = reservations
+
+    await manager.async_reconcile()
+
+    assert [
+        item.args[0]
+        for item in guesty_client.async_update_reservation_custom_field.await_args_list
+    ] == ["reservation-1", "reservation-2"]
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    assert manager._records[reservations[0].id]["custom_synced"] is True
+    assert manager._records[reservations[1].id]["custom_synced"] is True
+    assert manager._records[reservations[2].id]["custom_synced"] is False
 
 
 @pytest.mark.asyncio

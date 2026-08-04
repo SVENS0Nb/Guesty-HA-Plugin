@@ -718,6 +718,118 @@ async def test_booking_time_change_updates_existing_passcodes(
 
 
 @pytest.mark.asyncio
+async def test_planned_time_change_is_pending_until_ttlock_confirms_new_window(
+    hass, monkeypatch
+) -> None:
+    """Manual Guesty planned times invalidate a recently verified TTLock window."""
+    reservation = GuestyReservation.from_api(
+        {
+            "_id": "reservation-1",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-20T13:00:00+00:00",
+            "checkOut": "2026-07-22T12:00:00+00:00",
+            "checkInDateLocalized": "2026-07-20",
+            "checkOutDateLocalized": "2026-07-22",
+            "plannedArrival": "13:00",
+            "plannedDeparture": "12:00",
+            "lastUpdatedAt": NOW.isoformat(),
+            "customFields": [],
+        }
+    )
+    assert reservation is not None
+    manager, coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    updated = GuestyReservation.from_api(
+        {
+            "_id": "reservation-1",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-20T13:00:00+00:00",
+            "checkOut": "2026-07-22T12:00:00+00:00",
+            "checkInDateLocalized": "2026-07-20",
+            "checkOutDateLocalized": "2026-07-22",
+            "plannedArrival": "14:30",
+            "plannedDeparture": "09:15",
+            "lastUpdatedAt": (NOW + timedelta(minutes=1)).isoformat(),
+            "customFields": [],
+        }
+    )
+    assert updated is not None
+    coordinator.data.reservations = [updated]
+
+    pending = manager.listing_status_snapshot("listing-1")
+    assert pending["ttlock_status"] == "pending"
+    assert pending["provisioned_locks"] == 0
+    assert manager.diagnostics()["pending_window_updates"] == 1
+
+    await manager.async_reconcile()
+
+    expected_start = datetime.fromisoformat("2026-07-20T14:30:00+00:00")
+    expected_end = datetime.fromisoformat("2026-07-22T09:15:00+00:00")
+    assert remote.async_change_passcode.await_count == 2
+    assert all(
+        call.kwargs["valid_from"] == expected_start
+        and call.kwargs["valid_until"] == expected_end
+        for call in remote.async_change_passcode.await_args_list
+    )
+    record = manager._records[updated.id]
+    assert all(
+        state["confirmed_window_fingerprint"] == record["desired_window_fingerprint"]
+        for state in record["locks"].values()
+    )
+    assert manager.listing_status_snapshot("listing-1")["ttlock_status"] == (
+        "provisioned"
+    )
+    assert manager.diagnostics()["pending_window_updates"] == 0
+
+
+@pytest.mark.asyncio
+async def test_current_stay_planned_time_change_preserves_clamp_and_updates_checkout(
+    hass, monkeypatch
+) -> None:
+    """A current stay keeps its safe start while a new Guesty end is delivered."""
+    reservation = GuestyReservation.from_api(
+        {
+            "_id": "reservation-1",
+            "listingId": "listing-1",
+            "status": "confirmed",
+            "checkIn": "2026-07-18T10:00:00+00:00",
+            "checkOut": "2026-07-21T12:00:00+00:00",
+            "checkInDateLocalized": "2026-07-18",
+            "checkOutDateLocalized": "2026-07-21",
+            "plannedArrival": "10:00",
+            "plannedDeparture": "12:00",
+            "lastUpdatedAt": NOW.isoformat(),
+            "customFields": [],
+        }
+    )
+    assert reservation is not None
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.planned_arrival = "11:30"
+    reservation.planned_departure = "15:30"
+    await manager.async_reconcile()
+
+    expected_end = datetime.fromisoformat("2026-07-21T15:30:00+00:00")
+    assert remote.async_change_passcode.await_count == 2
+    assert all(
+        call.kwargs["valid_from"] == NOW and call.kwargs["valid_until"] == expected_end
+        for call in remote.async_change_passcode.await_args_list
+    )
+    assert {
+        state["remote_valid_from"]
+        for state in manager._records[reservation.id]["locks"].values()
+    } == {NOW.isoformat()}
+
+
+@pytest.mark.asyncio
 async def test_booking_moved_beyond_lead_removes_early_remote_passcodes(
     hass, monkeypatch
 ) -> None:

@@ -802,6 +802,9 @@ the PIN.
 - Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_two_keycodes_are_written_per_30_second_window`,
+  `tests/test_loxone.py::test_bulk_pin_migration_is_prioritized_and_bounded`,
+  `tests/test_loxone.py::test_custom_backfill_is_prioritized_by_nearest_check_in`,
+  `tests/test_loxone.py::test_ended_confirmed_reservation_cannot_block_future_custom_mirror`,
   `tests/test_loxone.py::test_keycode_endpoint_failure_prioritizes_custom_fallback`,
   `tests/test_loxone.py::test_guesty_write_budget_preserves_reported_api_headroom`,
   `tests/test_loxone.py::test_write_rechecks_rate_headroom_immediately_before_put`,
@@ -824,8 +827,15 @@ confirmation reads. PIN PUTs, confirmation reads, and route-discovery reads do
 not perform hidden authentication or transport retries. An HTTP 401/403
 invalidates the rejected token so the next separately budgeted operation
 refreshes it first; no request in the write envelope is replayed invisibly.
-New reservations receive one confirmed mirror before redundancy backfill is
-allowed to consume capacity. An application-wide
+Within a newly generated reservation, one mirror is confirmed before its
+redundant mirror may consume a second slot. Across reservations, current and
+nearest stays keep priority for both initial publication and redundancy
+backfill. A distant stay therefore cannot postpone the second enabled Guesty
+mirror of a nearer booking. Reservations whose complete configured access
+window has ended do not participate in PIN generation, mirror repair, conflict
+ownership, or queue priority even when Guesty still labels them `confirmed`;
+their remote-provider and private-state cleanup remains mandatory. An
+application-wide
 notes-endpoint, authentication, permission, transport, or payload failure may
 stop the current batch so the remaining slot and normal Guesty synchronization
 headroom are not wasted on the same predictable error. A reservation-specific
@@ -1032,9 +1042,11 @@ and confirmed access window remain unchanged.
 ### KB-TTLOCK-002 — Passcodes are independently recoverable per lock
 
 - Status: Validated
-- Last validated: 2026-07-31
+- Last validated: 2026-08-04
 - Evidence: `custom_components/guesty/ttlock.py`, `tests/test_ttlock.py`,
   `tests/test_ttlock.py::test_current_stay_uses_one_persisted_retroactive_ttlock_start`,
+  `tests/test_ttlock.py::test_planned_time_change_is_pending_until_ttlock_confirms_new_window`,
+  `tests/test_ttlock.py::test_current_stay_planned_time_change_preserves_clamp_and_updates_checkout`,
   `tests/test_ttlock.py::test_upgrade_preserves_confirmed_current_stay_start`,
   `tests/test_ttlock.py::test_missing_confirmed_code_is_recreated_with_current_start`,
   [TTLock period-passcode documentation](https://euopen.ttlock.com/doc/api/v3/keyboardPwd/get)
@@ -1048,6 +1060,15 @@ Before change/delete, verify that the remote passcode still carries the
 expected marker; never modify a foreign or manually renamed object. Reconcile
 drift at most every 30 minutes and coalesce reads per lock. Remote code
 collisions never rotate a confirmed Guesty PIN.
+
+The private record fingerprints the currently desired Guesty access window,
+and every lock independently stores the exact window most recently confirmed
+through TTLock. The 30-minute verification shortcut and the `provisioned`
+status apply only while those fingerprints match. A new reservation object
+containing changed `plannedArrival` or `plannedDeparture` therefore becomes
+pending immediately, updates the existing TTLock passcode ID, and returns to
+ready only after exact remote read-back. This separate proof also prevents a
+recently verified old period from hiding a fresh Guesty schedule change.
 
 If TTLock is first enabled or recovers only after an eligible stay has already
 started, transmitting the historical access start can make a newly delivered
@@ -1309,3 +1330,5 @@ tag points to the same commit and manifest version.
 | 2026-08-04 | Manual live-test OAuth reuse remediation | Added a credential-bound, private, atomic, cross-process token cache so failed preflight filters and separate diagnostic processes reuse one valid Guesty token instead of consuming the five-token daily allowance |
 | 2026-08-04 | Post-implementation PIN safety and traffic remediation | Decoupled base reservation freshness from optional PIN enrichment, limited PIN reads to mapped listings and enabled sources, prevented blind writes after unreadable sources, bounded every write/confirmation request envelope, removed hidden write retries, corrected per-reservation route migration, and restored fast bounded V2 route continuation |
 | 2026-08-04 | Sparse dual-model PIN regression remediation | Paired an exact sparse V3 row with the same refresh's successful V2 Keycode observation to classify legacy/channel reservations without blocking their first code, kept truly missing rows fail-closed, and prevented omitted `customFields` projections from causing per-reservation read fan-out |
+| 2026-08-04 | PIN mirror queue starvation diagnosis and remediation | Live read-only diagnostics showed all 41 native mirrors confirmed while all 41 custom mirrors remained queued despite ample API headroom. Excluded already-ended active-status reservations from PIN processing and made current and nearest stays finish redundancy backfill before more distant bookings; remote cleanup remains intact. |
+| 2026-08-04 | TTLock booking-window confirmation remediation | Bound every ready/verified TTLock passcode to the current desired Guesty access-window fingerprint, made planned arrival/departure replacements immediately pending until exact remote confirmation, preserved current-stay start clamping, and added safe pending-window diagnostics. |

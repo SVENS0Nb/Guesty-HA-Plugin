@@ -354,9 +354,15 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   same slots. Reserve two persistent slots before an unknown V3 route may fall
   back to V2, and refund only a demonstrably unused reservation after a
   confirmed one-attempt result.
-  Prioritize giving new reservations one confirmed mirror before spending
-  capacity on redundancy backfill.
-  Prioritize current and nearest stays. An application-wide failure of the
+  Within one newly generated reservation, confirm one Guesty mirror before
+  spending another slot on its redundant mirror. Across reservations, however,
+  current and nearest stays retain priority for both their first publication
+  and redundancy backfill; a distant or already ended booking must never hold
+  back a nearer stay. Once the configured access window has ended, exclude the
+  reservation from PIN generation, Guesty mirroring, conflict ownership, and
+  write-queue priority even if Guesty still reports an active status. Preserve
+  the normal Loxone, TTLock, and private-state cleanup path.
+  An application-wide failure of the
   dedicated notes route may stop the current batch so identical failures do not
   waste the second slot or Guesty's normal synchronization headroom.
 - Budget each persistent PUT slot as an envelope of the PUT plus up to three
@@ -468,6 +474,9 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   is created only inside the configured provisioning lead (default six hours
   before the allowed access start). Validity is exactly the shared early/late
   access window, with timespan user state and remote auto-delete.
+- After that complete access window ends, the booking is cleanup-only even if
+  Guesty has not yet changed its status. Do not generate or mirror another PIN
+  for it, but always retain the remote-user and private-state cleanup duties.
 - Preserve the stable reservation-derived user UUID and numeric PIN across time
   changes. Update validity, name, or groups in place. If a stay moves back
   outside the lead, remove the user and recreate it later with the same Guesty
@@ -512,6 +521,10 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   validity window. Booking time changes update existing passcodes without PIN
   rotation. Moving a stay outside the lead removes the remote passcode and adds
   it later with the same Guesty PIN.
+- Persist the current desired Guesty access-window fingerprint separately from
+  each lock's remotely confirmed window. A recently verified passcode is ready
+  only while both match; any fresh booking-time change must bypass the normal
+  30-minute verification shortcut until TTLock confirms the new period.
 - When TTLock is enabled or repaired after a stay has already started, clamp a
   previously undelivered lock's remote start to the first reconciliation time
   and persist that per-lock value. Reuse it across retries and restarts so the

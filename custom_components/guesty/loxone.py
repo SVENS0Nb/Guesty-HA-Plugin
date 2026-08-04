@@ -586,17 +586,28 @@ class GuestyLoxoneManager:
             self._clear_disabled_pin_source_state()
 
             eligible: dict[str, GuestyReservation] = {}
+            invalid_active_reservation_ids: set[str] = set()
             listings: dict[str, GuestyListing] = {}
             pin_listing_ids = self._pin_listing_ids
             if pin_listing_ids and data is not None:
                 listings = dict(data.listings)
-                eligible = {
-                    reservation.id: reservation
-                    for reservation in data.reservations
-                    if reservation.is_active_status()
-                    and reservation.listing_id in pin_listing_ids
-                    and reservation.listing_id in data.listings
-                }
+                for reservation in data.reservations:
+                    if (
+                        not reservation.is_active_status()
+                        or reservation.listing_id not in pin_listing_ids
+                        or reservation.listing_id not in data.listings
+                    ):
+                        continue
+                    try:
+                        _start, end = self._access_window(
+                            reservation,
+                            data.listings[reservation.listing_id],
+                        )
+                    except (TypeError, ValueError):
+                        invalid_active_reservation_ids.add(reservation.id)
+                        continue
+                    if end > now:
+                        eligible[reservation.id] = reservation
 
             offline_provisioning = bool(
                 self.entry.options.get(
@@ -684,6 +695,13 @@ class GuestyLoxoneManager:
 
             for reservation_id in list(self._records):
                 if reservation_id in eligible:
+                    continue
+                if reservation_id in invalid_active_reservation_ids:
+                    # Invalid live timing cannot authorize access, but it also
+                    # is not proof that the booking was cancelled. Preserve an
+                    # existing private record until a later valid snapshot can
+                    # safely reconcile or retire it.
+                    errors.append("invalid_reservation_time")
                     continue
                 # An unavailable Guesty API cannot prove a cancellation. Keep
                 # the code-free/future record until a fresh pass, unless the
@@ -798,13 +816,6 @@ class GuestyLoxoneManager:
                             now,
                             custom_field_id,
                             custom_field_error=custom_field_error,
-                            defer_custom_mirror=any(
-                                other_id != reservation.id
-                                and not self._records.get(other_id, {}).get(
-                                    "field_synced"
-                                )
-                                for other_id in eligible
-                            ),
                         )
                         errors.extend(sync_errors)
                         if sync_next_run is not None:
@@ -1720,7 +1731,6 @@ class GuestyLoxoneManager:
         custom_field_id: str | None,
         *,
         custom_field_error: str | None,
-        defer_custom_mirror: bool = False,
     ) -> tuple[list[str], datetime | None]:
         """Reconcile native and custom Guesty PIN mirrors without ping-pong."""
         native_enabled = self._native_pin_enabled
@@ -1959,18 +1969,13 @@ class GuestyLoxoneManager:
                 and custom_field_error is None
                 and native_enabled
                 and record.get("native_synced") is True
-                and (
-                    generated_new_value
-                    or (
-                        defer_custom_mirror
-                        and record.get("native_last_error")
-                        in {None, _GUESTY_SYNC_QUEUED}
-                    )
-                )
+                and generated_new_value
             ):
-                # Keep the established throughput of two newly booked
-                # reservations per 30-second window. A redundancy write never
-                # starves a booking that has not reached either Guesty source.
+                # Give another newly observed reservation its first confirmed
+                # Guesty mirror before backfilling this newly generated value.
+                # On later passes reservations are still processed by current
+                # stay and then nearest check-in, so a distant or already ended
+                # booking cannot hold back a nearer redundancy write.
                 record["custom_synced"] = False
                 retry_at = self._queue_source_write(
                     record,

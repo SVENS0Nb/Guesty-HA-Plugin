@@ -254,6 +254,10 @@ Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
 `awaiting_payment`, `checked_in` und entsprechende Guesty-Varianten). Dadurch
 wird der Code auch für eine zukünftige Reservierung unmittelbar nach Webhook
 oder spätestens beim nächsten normalen Reservierungsabgleich erzeugt. Der
+PIN-Prozess ignoriert eine Buchung vollständig, sobald ihr konfigurierter
+Zugangszeitraum einschließlich Nachlauf beendet ist, selbst wenn Guesty ihren
+Status noch nicht aktualisiert hat. Die notwendige Löschung bereits angelegter
+Loxone-/TTLock-Zugänge und privater Zustände wird trotzdem ausgeführt. Der
 gemeinsame Guesty-Client,
 OAuth-Token, Webhook, Reservierungs-Cache und 5-Minuten-Abgleich werden
 wiederverwendet; es gibt keinen zweiten Poller. Der normale
@@ -396,8 +400,11 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
    Optionen **aktivierten** Guesty-PIN-Quellen denselben sechsstelligen Wert
    anzeigen. Deaktivierte Quellen werden bewusst weder gelesen noch
    beschrieben. Bei der erstmaligen
-   Aktivierung mit vielen vorhandenen Reservierungen werden aktuelle und nahe
-   Buchungen zuerst und danach global höchstens zwei Feldwerte innerhalb von
+   Aktivierung mit vielen vorhandenen Reservierungen werden laufende und
+   zeitlich nächste Buchungen zuerst verarbeitet. Für diese werden auch die
+   aktivierten redundanten Guesty-Spiegel fertiggestellt, bevor weiter entfernte
+   Buchungen folgen. Bereits beendete Buchungen belegen keinen Platz in dieser
+   Warteschlange. Global werden höchstens zwei Feldwerte innerhalb von
    30 Sekunden geschrieben. Normale Warteschlange, einzelne Fehlerrückläufe und
    ein Neustart teilen sich dasselbe persistent gespeicherte Limit. Der nächste
    Teil folgt automatisch, sobald wieder ein Schreibplatz frei ist; dadurch
@@ -560,7 +567,9 @@ ist dafür nicht erforderlich.
   Passcodes werden mit derselben ID aktualisiert.
 - Änderungen an Check-in, Check-out oder den Zugangs-Offsets aktualisieren die
   Gültigkeitszeit auf allen zugeordneten Schlössern. Der Code bleibt dabei
-  unverändert.
+  unverändert. Der Status wechselt bis zur bestätigten Rücklesung des neuen
+  Zeitraums auf `Ausstehend`; eine noch frische Bestätigung des alten Zeitraums
+  kann die Änderung nicht mehr verdecken.
 - Wird TTLock erst während eines bereits laufenden Aufenthalts aktiviert oder
   nach einem Fehler wieder erreichbar, beginnt ein noch nicht übertragener
   Passcode einmalig zum Zeitpunkt der Nachholung. Dieser Zeitpunkt bleibt auch

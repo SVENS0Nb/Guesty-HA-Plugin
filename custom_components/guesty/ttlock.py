@@ -66,6 +66,8 @@ _REMOTE_INVALID_STATUSES = {2, 5, 7, 9}
 _REMOTE_PENDING_STATUSES = {3, 4, 6, 8}
 _REMOTE_VALID_FROM_KEY = "remote_valid_from"
 _REMOTE_VALID_FROM_CLAMPED_KEY = "remote_valid_from_clamped"
+_DESIRED_WINDOW_FINGERPRINT_KEY = "desired_window_fingerprint"
+_CONFIRMED_WINDOW_FINGERPRINT_KEY = "confirmed_window_fingerprint"
 _RETROACTIVE_START_STATE_VERSION_KEY = "retroactive_start_state_version"
 _RETROACTIVE_START_STATE_VERSION = 1
 
@@ -403,6 +405,9 @@ class GuestyTTLockManager:
                     record["listing_id"] = reservation.listing_id
                     record["access_start"] = start.isoformat()
                     record["access_end"] = end.isoformat()
+                    record[_DESIRED_WINDOW_FINGERPRINT_KEY] = self._window_fingerprint(
+                        start, end
+                    )
                     record.setdefault("locks", {})
                     marker = self._passcode_name(reservation.id)
 
@@ -572,6 +577,8 @@ class GuestyTTLockManager:
         if not isinstance(locks, dict):
             locks = record["locks"] = {}
         record[_ACCOUNT_SNAPSHOT_KEY] = self._account_snapshot(client)
+        desired_window_fingerprint = self._window_fingerprint(start, end)
+        record[_DESIRED_WINDOW_FINGERPRINT_KEY] = desired_window_fingerprint
 
         for lock_id in lock_ids:
             state = locks.setdefault(str(lock_id), {})
@@ -581,7 +588,17 @@ class GuestyTTLockManager:
             fingerprint = self._fingerprint(lock_id, code, remote_start, end)
             verified_at = self._parse_time(state.get("verified_at"))
             if (
+                not isinstance(state.get(_CONFIRMED_WINDOW_FINGERPRINT_KEY), str)
+                and state.get("fingerprint") == fingerprint
+            ):
+                # Older releases already verified this exact code and remote
+                # period but did not persist the separate source-window proof.
+                # Adopt it without rewriting a healthy current-stay passcode.
+                state[_CONFIRMED_WINDOW_FINGERPRINT_KEY] = desired_window_fingerprint
+            if (
                 state.get("fingerprint") == fingerprint
+                and state.get(_CONFIRMED_WINDOW_FINGERPRINT_KEY)
+                == desired_window_fingerprint
                 and isinstance(state.get("keyboard_pwd_id"), int)
                 and verified_at is not None
                 and verified_at <= now
@@ -601,7 +618,12 @@ class GuestyTTLockManager:
             ):
                 # A locally remembered ID is not proof of ownership. TTLock IDs
                 # may disappear or the local store may be restored out of date.
-                for key in ("keyboard_pwd_id", "fingerprint", "verified_at"):
+                for key in (
+                    "keyboard_pwd_id",
+                    "fingerprint",
+                    "verified_at",
+                    _CONFIRMED_WINDOW_FINGERPRINT_KEY,
+                ):
                     state.pop(key, None)
                 password_id = None
                 owned = None
@@ -636,6 +658,7 @@ class GuestyTTLockManager:
                 )
             ):
                 state["fingerprint"] = fingerprint
+                state[_CONFIRMED_WINDOW_FINGERPRINT_KEY] = desired_window_fingerprint
                 state["verified_at"] = now.isoformat()
                 state["synced_at"] = now.isoformat()
                 state.pop("create_started", None)
@@ -650,7 +673,12 @@ class GuestyTTLockManager:
                     )
                 if remote_status in _REMOTE_INVALID_STATUSES:
                     await self._async_delete_lock_state(record, lock_id, state, marker)
-                    for key in ("keyboard_pwd_id", "fingerprint", "verified_at"):
+                    for key in (
+                        "keyboard_pwd_id",
+                        "fingerprint",
+                        "verified_at",
+                        _CONFIRMED_WINDOW_FINGERPRINT_KEY,
+                    ):
                         state.pop(key, None)
                     password_id = None
                     owned = None
@@ -771,6 +799,7 @@ class GuestyTTLockManager:
                     )
                 raise TTLockApiError("TTLock did not confirm the passcode operation")
             state["fingerprint"] = fingerprint
+            state[_CONFIRMED_WINDOW_FINGERPRINT_KEY] = desired_window_fingerprint
             state.pop("create_started", None)
             state["verified_at"] = now.isoformat()
             state["synced_at"] = now.isoformat()
@@ -1047,6 +1076,12 @@ class GuestyTTLockManager:
         value = "\0".join((str(lock_id), code, start.isoformat(), end.isoformat()))
         return hashlib.sha256(value.encode()).hexdigest()
 
+    @staticmethod
+    def _window_fingerprint(start: datetime, end: datetime) -> str:
+        """Fingerprint the authoritative Guesty access window."""
+        value = "\0".join((start.isoformat(), end.isoformat()))
+        return hashlib.sha256(value.encode()).hexdigest()
+
     @classmethod
     def _passcode_matches(
         cls,
@@ -1144,6 +1179,7 @@ class GuestyTTLockManager:
         _priority, start, end, reservation = min(
             candidates, key=lambda item: (item[0], item[1], item[3].id)
         )
+        desired_window_fingerprint = self._window_fingerprint(start, end)
         lead = timedelta(
             minutes=int(
                 self.entry.options.get(
@@ -1173,7 +1209,11 @@ class GuestyTTLockManager:
             for lock_id in lock_ids
             if isinstance(locks, dict)
             and isinstance(locks.get(str(lock_id)), dict)
-            and self._state_is_verified(locks[str(lock_id)], now)
+            and self._state_is_verified(
+                locks[str(lock_id)],
+                now,
+                desired_window_fingerprint=desired_window_fingerprint,
+            )
         )
         snapshot["provisioned_locks"] = ready
         retry_at = self._retry_at(record)
@@ -1232,7 +1272,43 @@ class GuestyTTLockManager:
                 for record in records.values()
                 if isinstance(record, dict) and self._retry_at(record) is not None
             ),
+            "pending_window_updates": self._pending_window_update_count(),
         }
+
+    def _pending_window_update_count(self) -> int:
+        """Count reservations whose delivered lock period is no longer current."""
+        data = self._coordinator.data
+        if data is None:
+            return 0
+        pending = 0
+        for reservation in data.reservations:
+            if (
+                not reservation.is_active_status()
+                or reservation.listing_id not in self._mappings
+            ):
+                continue
+            listing = data.listings.get(reservation.listing_id)
+            record = self._records.get(reservation.id)
+            if listing is None or not isinstance(record, dict):
+                continue
+            try:
+                start, end = self._pin_manager.reservation_access_window(
+                    reservation, listing
+                )
+            except (TypeError, ValueError):
+                continue
+            desired = self._window_fingerprint(start, end)
+            locks = record.get("locks")
+            if not isinstance(locks, dict):
+                continue
+            if any(
+                isinstance(state, dict)
+                and isinstance(state.get("keyboard_pwd_id"), int)
+                and state.get(_CONFIRMED_WINDOW_FINGERPRINT_KEY) != desired
+                for state in locks.values()
+            ):
+                pending += 1
+        return pending
 
     def account_for_reconfigure(self) -> dict[str, Any]:
         """Return current private credentials for the in-process options flow."""
@@ -1359,10 +1435,22 @@ class GuestyTTLockManager:
         return result
 
     @classmethod
-    def _state_is_verified(cls, state: Mapping[str, Any], now: datetime) -> bool:
+    def _state_is_verified(
+        cls,
+        state: Mapping[str, Any],
+        now: datetime,
+        *,
+        desired_window_fingerprint: str | None = None,
+    ) -> bool:
         """Return whether local readiness is backed by a recent remote read."""
         if not isinstance(state.get("keyboard_pwd_id"), int) or not isinstance(
             state.get("fingerprint"), str
+        ):
+            return False
+        if (
+            desired_window_fingerprint is not None
+            and state.get(_CONFIRMED_WINDOW_FINGERPRINT_KEY)
+            != desired_window_fingerprint
         ):
             return False
         verified_at = cls._parse_time(state.get("verified_at"))
