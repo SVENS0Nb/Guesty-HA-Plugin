@@ -943,7 +943,10 @@ or listing IDs, or request-specific access-window values.
   `tests/test_access.py::test_door_label_change_does_not_rotate_access_link`,
   `tests/test_access.py::test_legacy_fingerprint_migrates_without_rotating_access_link`,
   `tests/test_access.py::test_changed_legacy_authorization_state_rotates_access_link`,
-  `tests/test_access.py::test_booking_time_change_still_rotates_access_link`
+  `tests/test_access.py::test_booking_time_change_still_rotates_access_link`,
+  `tests/test_access.py::test_active_remote_drift_is_repaired_without_token_rotation`,
+  `tests/test_access.py::test_unknown_token_schedules_one_bounded_current_link_audit`,
+  `tests/test_access.py::test_remote_link_audit_is_bounded_and_prioritized`
 
 Tokens are unguessable and HMAC-bound to a private secret, reservation,
 permission version, and relevant access inputs. Only token hashes are indexed.
@@ -961,6 +964,20 @@ bounded backoff and seven-day tombstones. A transient error must not create a
 rotate/recreate loop. A stale snapshot beyond the configured threshold blocks
 new unlock actions, while a single failed poll may continue from the last safe
 state.
+
+Guesty's remote custom field is also a mutable mirror rather than permanent
+proof of the local record. Current stays are read back at the normal five-minute
+reservation interval, stays beginning within 24 hours are checked hourly, and
+more distant future links daily. Each pass checks at most two records, keeps
+normal Guesty headroom, and prioritizes current access before the nearest
+future stay. A missing or different remote value is repaired by republishing
+the current local URL without rotating its still-valid bearer token. Remote
+read failure preserves the last confirmed local authorization and uses
+persistent backoff. An otherwise valid-format unknown public token can request
+one current-stay audit, but this path is rate-limited to once per five minutes
+and performs no network I/O in the HTTP request itself. This closes drift from
+old/backup Home Assistant writers or later Guesty field changes without turning
+random public tokens into Guesty traffic amplification.
 
 ### KB-ACCESS-003 — Portal localization and branding contract
 

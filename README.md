@@ -190,6 +190,14 @@ Endpunkt für Reservierungs-Custom-Fields.
   „fail closed“ und verweigert die Öffnung. Ein einzelner Listing- oder
   Reservierungs-Webhook setzt dieses globale Alter nicht zurück.
 - Unveränderte Reservierungen erzeugen keine weiteren Guesty-Schreibzugriffe.
+- Bereits bestätigte Links werden verkehrsarm gegen das aktuelle Guesty-Feld
+  geprüft: laufende Aufenthalte beim normalen Reservierungsabgleich, innerhalb
+  der nächsten 24 Stunden stündlich und weiter entfernte Buchungen täglich.
+  Fehlt der Link dort oder steht noch die URL einer älteren beziehungsweise
+  anderen Home-Assistant-Instanz im Feld, wird die aktuelle URL ohne unnötigen
+  Tokenwechsel wiederhergestellt. Pro Lauf werden höchstens zwei Felder
+  geprüft; ein Guesty-Lesefehler lässt den zuletzt bestätigten Link bestehen und
+  verwendet Backoff.
 - Neue Links werden pro Abgleich in kleinen Batches veröffentlicht. Dadurch
   bleibt auch bei vielen zukünftigen Reservierungen API-Kapazität für den
   normalen Buchungs- und Webhook-Abgleich frei.
@@ -790,6 +798,10 @@ python -m pytest
   „Gast-Zugangslink“ aktivieren: `Synchronisiert` mit `access_url` bestätigt die
   lokale Erzeugung und den von Guesty bestätigten Schreibvorgang; `Ausstehend`
   oder `Fehler` zeigt, dass die Veröffentlichung noch nicht bestätigt ist
+- **Aktiver Link zeigt „Zugang nicht verfügbar“** – den Link einmal aufrufen
+  und anschließend Diagnosedaten laden. `outside_access_window` weist auf das
+  Buchungszeitfenster hin; `unknown_token` stößt höchstens einmal in fünf
+  Minuten einen begrenzten Abgleich der aktuell laufenden Guesty-Links an.
 - **Diagnostics** – Integration → ⋮ → Diagnose-Daten herunterladen
 - **Ausführliche Logs** – folgende Konfiguration in `configuration.yaml`
   eintragen und Home Assistant neu starten:

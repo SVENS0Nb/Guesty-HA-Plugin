@@ -70,6 +70,7 @@ async def _manager(hass, monkeypatch) -> tuple[GuestyAccessManager, object]:
     client = SimpleNamespace(
         async_resolve_custom_field=AsyncMock(return_value="65fab102a5284d73c6206db0"),
         async_update_reservation_custom_field=AsyncMock(),
+        async_get_reservation_custom_field=AsyncMock(),
         async_delete_reservation_custom_field=AsyncMock(),
     )
     entry = MockConfigEntry(
@@ -111,6 +112,191 @@ async def test_reconcile_writes_each_unchanged_link_only_once(
         f"https://ha.test/api/guesty/access/{manager.entry.entry_id}/"
     )
     client.async_resolve_custom_field.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_active_remote_drift_is_repaired_without_token_rotation(
+    hass, monkeypatch
+) -> None:
+    """A stale Guesty field is replaced with the still-current local URL."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    expected_url = client.async_update_reservation_custom_field.await_args.args[2]
+    record.pop("remote_verified_at")
+    client.async_get_reservation_custom_field.return_value = (
+        "https://ha.test/api/guesty/access/old-entry/old-token"
+    )
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    client.async_get_reservation_custom_field.assert_awaited_once_with(
+        "reservation-1", "65fab102a5284d73c6206db0"
+    )
+    client.async_update_reservation_custom_field.assert_awaited_once_with(
+        "reservation-1",
+        "65fab102a5284d73c6206db0",
+        expected_url,
+    )
+    assert record["version"] == old_version
+    assert manager._token_for("reservation-1", record["version"]) == old_token
+    assert record["field_synced"] is True
+    assert record["write_verified"] is True
+    assert manager.diagnostics()["remote_drift_during_last_reconcile"] == 1
+
+
+@pytest.mark.asyncio
+async def test_matching_remote_link_is_audited_without_an_extra_write(
+    hass, monkeypatch
+) -> None:
+    """A current Guesty value refreshes proof without needless write traffic."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    expected_url = client.async_update_reservation_custom_field.await_args.args[2]
+    record.pop("remote_verified_at")
+    client.async_get_reservation_custom_field.return_value = expected_url
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    client.async_get_reservation_custom_field.assert_awaited_once()
+    client.async_update_reservation_custom_field.assert_not_awaited()
+    diagnostics = manager.diagnostics()
+    assert diagnostics["remote_verified_during_last_reconcile"] == 1
+    assert diagnostics["remote_drift_during_last_reconcile"] == 0
+    assert diagnostics["remotely_checked_records"] == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_link_read_failure_keeps_last_confirmed_url(
+    hass, monkeypatch
+) -> None:
+    """A verification outage cannot revoke or rewrite a valid local link."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record.pop("remote_verified_at")
+    client.async_get_reservation_custom_field.side_effect = GuestyRetryableError(
+        "offline"
+    )
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    client.async_update_reservation_custom_field.assert_not_awaited()
+    assert record["field_synced"] is True
+    assert record["write_verified"] is True
+    assert record["verify_retry_count"] == 1
+    assert manager.diagnostics()["last_remote_verification_error"] == (
+        "GuestyRetryableError"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_token_schedules_one_bounded_current_link_audit(
+    hass, monkeypatch
+) -> None:
+    """A public stale token triggers repair without an unbounded GET loop."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    expected_url = client.async_update_reservation_custom_field.await_args.args[2]
+    client.async_get_reservation_custom_field.return_value = "stale"
+    client.async_update_reservation_custom_field.reset_mock()
+    schedule = MagicMock()
+    monkeypatch.setattr(manager, "async_schedule_reconcile", schedule)
+
+    assert manager._validate_token("x" * 40) is None
+    assert manager._validate_token("y" * 40) is None
+
+    schedule.assert_called_once_with()
+    assert manager._force_remote_verification is True
+    await manager.async_reconcile()
+
+    client.async_get_reservation_custom_field.assert_awaited_once()
+    client.async_update_reservation_custom_field.assert_awaited_once_with(
+        "reservation-1",
+        "65fab102a5284d73c6206db0",
+        expected_url,
+    )
+    assert record["version"] == old_version
+    assert manager._force_remote_verification is False
+
+
+@pytest.mark.asyncio
+async def test_remote_link_audit_is_bounded_and_prioritized(hass, monkeypatch) -> None:
+    """One pass checks no more than two current links before future work."""
+    manager, client = await _manager(hass, monkeypatch)
+    for number in range(2, 4):
+        reservation = _reservation()
+        reservation.id = f"reservation-{number}"
+        manager._coordinator.data.reservations.append(reservation)
+    await manager.async_reconcile()
+    assert len(manager._records) == 3
+    for record in manager._records.values():
+        record.pop("remote_verified_at")
+
+    async def _remote_value(reservation_id, _field_id):
+        return manager._access_url_for_record(
+            reservation_id,
+            manager._records[reservation_id],
+        )
+
+    client.async_get_reservation_custom_field.reset_mock()
+    client.async_get_reservation_custom_field.side_effect = _remote_value
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    assert client.async_get_reservation_custom_field.await_count == 2
+    checked = {
+        call.args[0]
+        for call in client.async_get_reservation_custom_field.await_args_list
+    }
+    assert checked == {"reservation-1", "reservation-2"}
+    client.async_update_reservation_custom_field.assert_not_awaited()
+    assert manager.diagnostics()["remote_verified_during_last_reconcile"] == 2
+    assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
+
+    old_proof = (dt_util.utcnow() - timedelta(minutes=6)).isoformat()
+    for reservation_id in checked:
+        manager._records[reservation_id]["remote_verified_at"] = old_proof
+    client.async_get_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    next_checked = {
+        call.args[0]
+        for call in client.async_get_reservation_custom_field.await_args_list
+    }
+    assert "reservation-3" in next_checked
+
+
+@pytest.mark.asyncio
+async def test_remote_audit_rechecks_headroom_before_repair_write(
+    hass, monkeypatch
+) -> None:
+    """The verification GET cannot spend the reserve needed by normal sync."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    record.pop("remote_verified_at")
+    client.last_rate_limit_remaining = 5
+
+    async def _low_headroom(_reservation_id, _field_id):
+        client.last_rate_limit_remaining = 4
+        return "stale"
+
+    client.async_get_reservation_custom_field.side_effect = _low_headroom
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    client.async_get_reservation_custom_field.assert_awaited_once()
+    client.async_update_reservation_custom_field.assert_not_awaited()
+    assert record["field_synced"] is False
+    assert record["write_verified"] is False
+    assert manager.diagnostics()["deferred_during_last_reconcile"] == 1
 
 
 @pytest.mark.asyncio

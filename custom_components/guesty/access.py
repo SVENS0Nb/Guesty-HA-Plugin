@@ -81,8 +81,14 @@ ACCESS_STORAGE_KEY = "guesty_access"
 ACCESS_MANAGERS = "access_managers"
 ACCESS_VIEW_REGISTERED = "access_view_registered"
 _ACCESS_FIELD_WRITE_BATCH_SIZE = 2
+_ACCESS_FIELD_VERIFY_BATCH_SIZE = 2
 _ACCESS_FINGERPRINT_VERSION = 2
 _GUESTY_RATE_LIMIT_RESERVE = 4
+_ACCESS_ACTIVE_VERIFY_INTERVAL = timedelta(minutes=5)
+_ACCESS_UPCOMING_VERIFY_INTERVAL = timedelta(hours=1)
+_ACCESS_FUTURE_VERIFY_INTERVAL = timedelta(hours=24)
+_ACCESS_UPCOMING_VERIFY_HORIZON = timedelta(hours=24)
+_ACCESS_UNKNOWN_TOKEN_REPAIR_COOLDOWN = timedelta(minutes=5)
 
 ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
     "de": {
@@ -251,9 +257,15 @@ class GuestyAccessManager:
         self._last_published_count = 0
         self._last_recovered_count = 0
         self._last_deferred_count = 0
+        self._last_remote_verified_count = 0
+        self._last_remote_drift_count = 0
+        self._last_remote_verification_at: str | None = None
+        self._last_remote_verification_error: str | None = None
         self._last_validation_failure: str | None = None
         self._last_validation_failure_at: str | None = None
         self._validation_failure_counts: defaultdict[str, int] = defaultdict(int)
+        self._force_remote_verification = False
+        self._unknown_token_repair_not_before: datetime | None = None
         self._validated_field_references: set[str] = set()
         self._listeners: set[Callable[[], None]] = set()
         self._last_action: dict[tuple[str, int], float] = {}
@@ -341,13 +353,21 @@ class GuestyAccessManager:
             self._last_published_count = 0
             self._last_recovered_count = 0
             self._last_deferred_count = 0
+            self._last_remote_verified_count = 0
+            self._last_remote_drift_count = 0
             records = self._records
             mappings = self._mappings
             enabled = bool(self.entry.options.get(CONF_ACCESS_ENABLED, False))
             coordinator_data = self._coordinator.data
             now = dt_util.utcnow()
+            source_safe_for_writes = bool(
+                coordinator_data is not None
+                and not self._access_data_too_old(coordinator_data)
+            )
+            force_remote_verification = self._force_remote_verification
+            self._force_remote_verification = False
             next_run: datetime | None = None
-            eligible: dict[str, tuple[GuestyReservation, str]] = {}
+            eligible: dict[str, tuple[GuestyReservation, str, datetime, datetime]] = {}
 
             if enabled and coordinator_data:
                 for reservation in coordinator_data.reservations:
@@ -360,13 +380,18 @@ class GuestyAccessManager:
                     if listing is None:
                         continue
                     try:
-                        _start, end = self._access_window(reservation)
+                        start, end = self._access_window(reservation)
                     except ValueError:
                         continue
                     if end <= now:
                         continue
                     fingerprint = self._reservation_fingerprint(reservation)
-                    eligible[reservation.id] = (reservation, fingerprint)
+                    eligible[reservation.id] = (
+                        reservation,
+                        fingerprint,
+                        start,
+                        end,
+                    )
             self._last_eligible_count = len(eligible)
 
             for reservation_id, record in list(records.items()):
@@ -374,7 +399,12 @@ class GuestyAccessManager:
                     record["revoked"] = True
                     record.setdefault("revoked_at", now.isoformat())
 
-            for reservation_id, (reservation, fingerprint) in eligible.items():
+            for reservation_id, (
+                reservation,
+                fingerprint,
+                _start,
+                _end,
+            ) in eligible.items():
                 existing = records.get(reservation_id)
                 if not isinstance(existing, dict):
                     existing = {}
@@ -409,8 +439,10 @@ class GuestyAccessManager:
                         }
                     )
                     existing.pop("recovery_marker", None)
+                    existing.pop("remote_verified_at", None)
                     self._clear_retry(existing, "publish")
                     self._clear_retry(existing, "cleanup")
+                    self._clear_retry(existing, "verify")
                 existing["revoked"] = False
                 existing.pop("revoked_at", None)
                 records[reservation_id] = existing
@@ -459,8 +491,70 @@ class GuestyAccessManager:
                 return
 
             writes_remaining = self._guesty_write_budget()
-            for reservation_id in sorted(eligible):
+            reads_remaining = self._guesty_verification_budget()
+            ordered_reservations = sorted(
+                eligible,
+                key=lambda reservation_id: self._access_priority(
+                    records[reservation_id],
+                    eligible[reservation_id][2],
+                    eligible[reservation_id][3],
+                    now,
+                    reservation_id,
+                ),
+            )
+            for reservation_id in ordered_reservations:
+                _reservation, _fingerprint, start, end = eligible[reservation_id]
                 record = records[reservation_id]
+                verify_due = bool(
+                    source_safe_for_writes
+                    and self._remote_verification_due(
+                        record,
+                        start,
+                        end,
+                        now,
+                        force=force_remote_verification and start <= now < end,
+                    )
+                )
+                if verify_due:
+                    reads_remaining = min(
+                        reads_remaining,
+                        self._guesty_verification_budget(),
+                    )
+                    if self._retry_is_deferred(record, "verify", now):
+                        retry_at = self._retry_at(record, "verify")
+                        if retry_at is not None:
+                            next_run = self._earlier(next_run, retry_at)
+                    elif reads_remaining <= 0:
+                        self._last_deferred_count += 1
+                        next_run = self._earlier(
+                            next_run,
+                            self._next_remote_verification_at(now),
+                        )
+                    else:
+                        reads_remaining -= 1
+                        verification_error = await self._async_verify_remote_link(
+                            reservation_id,
+                            record,
+                            field_id,
+                            base_url,
+                            now,
+                        )
+                        if verification_error is not None:
+                            self._record_retry_failure(record, "verify", now)
+                            self._last_remote_verification_error = type(
+                                verification_error
+                            ).__name__
+                            _LOGGER.warning(
+                                "Could not verify a Guesty access link for "
+                                "reservation marker=%s: %s",
+                                reservation_log_marker(reservation_id),
+                                type(verification_error).__name__,
+                            )
+                            retry_at = self._retry_at(record, "verify")
+                            if retry_at is not None:
+                                next_run = self._earlier(next_run, retry_at)
+                        else:
+                            self._clear_retry(record, "verify")
                 if self._retry_is_deferred(record, "publish", now):
                     self._last_deferred_count += 1
                     retry_at = self._retry_at(record, "publish")
@@ -472,6 +566,18 @@ class GuestyAccessManager:
                     reservation_id,
                     record,
                 )
+                if publish_required:
+                    writes_remaining = min(
+                        writes_remaining,
+                        self._guesty_write_budget(),
+                    )
+                if publish_required and not source_safe_for_writes:
+                    self._last_deferred_count += 1
+                    next_run = self._earlier(
+                        next_run,
+                        self._next_remote_verification_at(now),
+                    )
+                    continue
                 if publish_required and writes_remaining <= 0:
                     self._last_deferred_count += 1
                     next_run = self._earlier(
@@ -584,7 +690,11 @@ class GuestyAccessManager:
         record["url_hash"] = url_hash
         record["field_synced"] = True
         record["write_verified"] = True
+        verified_at = dt_util.utcnow().isoformat()
+        record["remote_verified_at"] = verified_at
+        self._last_remote_verification_at = verified_at
         record.pop("recovery_marker", None)
+        self._clear_retry(record, "verify")
         self._last_published_count += 1
         return field_id, None
 
@@ -645,6 +755,106 @@ class GuestyAccessManager:
             and record.get("write_verified")
         )
 
+    async def _async_verify_remote_link(
+        self,
+        reservation_id: str,
+        record: dict[str, Any],
+        field_id: str,
+        base_url: str,
+        now: datetime,
+    ) -> GuestyApiError | GuestyAuthError | None:
+        """Compare one locally confirmed link with Guesty's current value."""
+        expected_url, url_hash = self._access_url_and_hash(
+            base_url,
+            reservation_id,
+            record,
+        )
+        try:
+            remote_value = await self._client.async_get_reservation_custom_field(
+                reservation_id,
+                field_id,
+            )
+        except (GuestyApiError, GuestyAuthError) as err:
+            return err
+
+        verified_at = now.isoformat()
+        record["remote_verified_at"] = verified_at
+        self._last_remote_verification_at = verified_at
+        self._last_remote_verified_count += 1
+        self._last_remote_verification_error = None
+        if not isinstance(remote_value, str) or not hmac.compare_digest(
+            remote_value,
+            expected_url,
+        ):
+            # Guesty, a previous active instance, or a manual edit can replace
+            # the field after this Home Assistant instance confirmed its own
+            # write. Keep the current bearer token and republish that exact URL.
+            record["url_hash"] = url_hash
+            record["field_synced"] = False
+            record["write_verified"] = False
+            self._last_remote_drift_count += 1
+        else:
+            record["url_hash"] = url_hash
+            record["field_synced"] = True
+            record["write_verified"] = True
+        return None
+
+    def _remote_verification_due(
+        self,
+        record: Mapping[str, Any],
+        start: datetime,
+        end: datetime,
+        now: datetime,
+        *,
+        force: bool,
+    ) -> bool:
+        """Return whether Guesty's stored URL needs a bounded read-back."""
+        if not record.get("field_synced") or not record.get("write_verified"):
+            return False
+        if force:
+            return True
+        last_verified = self._stored_datetime(record.get("remote_verified_at"))
+        if last_verified is None:
+            return True
+        if start <= now < end:
+            interval = _ACCESS_ACTIVE_VERIFY_INTERVAL
+        elif start <= now + _ACCESS_UPCOMING_VERIFY_HORIZON:
+            interval = _ACCESS_UPCOMING_VERIFY_INTERVAL
+        else:
+            interval = _ACCESS_FUTURE_VERIFY_INTERVAL
+        return now - last_verified >= interval
+
+    @staticmethod
+    def _stored_datetime(value: Any) -> datetime | None:
+        """Parse one timezone-aware timestamp from private state."""
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = dt_util.parse_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed is not None and parsed.tzinfo is not None else None
+
+    @staticmethod
+    def _access_priority(
+        record: Mapping[str, Any],
+        start: datetime,
+        end: datetime,
+        now: datetime,
+        reservation_id: str,
+    ) -> tuple[int, datetime, datetime, str]:
+        """Prioritize active access while letting old audits make progress."""
+        if start <= now < end:
+            window_priority = 0
+        elif start <= now + _ACCESS_UPCOMING_VERIFY_HORIZON:
+            window_priority = 1
+        else:
+            window_priority = 2
+        last_verified = GuestyAccessManager._stored_datetime(
+            record.get("remote_verified_at")
+        ) or datetime.min.replace(tzinfo=now.tzinfo)
+        return (window_priority, last_verified, start, reservation_id)
+
     def _guesty_write_budget(self) -> int:
         """Reserve Guesty capacity for normal reservation and webhook traffic."""
         remaining = getattr(self._client, "last_rate_limit_remaining", None)
@@ -652,6 +862,26 @@ class GuestyAccessManager:
             return _ACCESS_FIELD_WRITE_BATCH_SIZE
         capacity = max(0, (remaining - _GUESTY_RATE_LIMIT_RESERVE) // 2)
         return min(_ACCESS_FIELD_WRITE_BATCH_SIZE, capacity)
+
+    def _guesty_verification_budget(self) -> int:
+        """Bound link read-backs while preserving normal Guesty headroom."""
+        remaining = getattr(self._client, "last_rate_limit_remaining", None)
+        if not isinstance(remaining, int):
+            return _ACCESS_FIELD_VERIFY_BATCH_SIZE
+        capacity = max(0, remaining - _GUESTY_RATE_LIMIT_RESERVE)
+        return min(_ACCESS_FIELD_VERIFY_BATCH_SIZE, capacity)
+
+    def _next_remote_verification_at(self, now: datetime) -> datetime:
+        """Continue a bounded verification backlog at the next normal poll."""
+        raw_interval = self.entry.options.get(
+            CONF_SCAN_INTERVAL,
+            self.entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+        )
+        try:
+            interval = max(30, int(raw_interval))
+        except (TypeError, ValueError):
+            interval = DEFAULT_SCAN_INTERVAL
+        return now + timedelta(seconds=interval)
 
     def _next_guesty_write_at(self, now: datetime) -> datetime:
         """Avoid a rapid no-traffic loop while Guesty headroom is exhausted."""
@@ -690,7 +920,7 @@ class GuestyAccessManager:
         """Return the next persistent publish or cleanup retry timestamp."""
         next_run: datetime | None = None
         for record in self._records.values():
-            for operation in ("publish", "cleanup"):
+            for operation in ("publish", "verify", "cleanup"):
                 retry_at = self._retry_at(record, operation)
                 if retry_at is not None and retry_at > now:
                     next_run = self._earlier(next_run, retry_at)
@@ -737,6 +967,8 @@ class GuestyAccessManager:
                 "write_verified": False,
             }
         )
+        record.pop("remote_verified_at", None)
+        self._clear_retry(record, "verify")
         self._rebuild_token_index()
 
     def _access_url_and_hash(
@@ -768,6 +1000,18 @@ class GuestyAccessManager:
             ),
             "verified_records": sum(
                 1 for record in records.values() if record.get("write_verified")
+            ),
+            "remotely_checked_records": sum(
+                1
+                for record in records.values()
+                if self._stored_datetime(record.get("remote_verified_at")) is not None
+            ),
+            "remote_verified_during_last_reconcile": (self._last_remote_verified_count),
+            "remote_drift_during_last_reconcile": self._last_remote_drift_count,
+            "last_remote_verification_at": self._last_remote_verification_at,
+            "last_remote_verification_error": (self._last_remote_verification_error),
+            "remote_verification_retries": sum(
+                1 for record in records.values() if record.get("verify_retry_count")
             ),
             "last_validation_failure": self._last_validation_failure,
             "last_validation_failure_at": self._last_validation_failure_at,
@@ -1209,9 +1453,22 @@ class GuestyAccessManager:
 
     def _reject_validation(self, reason: str) -> None:
         """Record one privacy-safe token rejection reason for diagnostics."""
+        now = dt_util.utcnow()
         self._last_validation_failure = reason
-        self._last_validation_failure_at = dt_util.utcnow().isoformat()
+        self._last_validation_failure_at = now.isoformat()
         self._validation_failure_counts[reason] += 1
+        if reason == "unknown_token" and (
+            self._unknown_token_repair_not_before is None
+            or now >= self._unknown_token_repair_not_before
+        ):
+            # A stale Guesty field cannot be mapped back from its bearer token,
+            # so audit only the bounded current-stay set. Rate-limit this public
+            # trigger to prevent random tokens from amplifying Guesty traffic.
+            self._unknown_token_repair_not_before = (
+                now + _ACCESS_UNKNOWN_TOKEN_REPAIR_COOLDOWN
+            )
+            self._force_remote_verification = True
+            self.async_schedule_reconcile()
         return None
 
     def _access_data_too_old(self, data: Any) -> bool:

@@ -462,6 +462,15 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   bounded writes, and seven-day tombstones. Heal a stale custom-field ID only
   for narrowly classified field-reference failures; a generic 404 or transient
   failure must not cause an endless rotate/recreate loop.
+- A locally confirmed door link is not permanent proof of Guesty's current
+  field value. Re-read current stays every normal reservation interval,
+  bookings starting within 24 hours hourly, and more distant stays daily. Audit
+  at most two links per pass with normal API headroom reserved. If Guesty is
+  empty or contains another instance's/older URL, republish the current URL
+  without rotating its still-valid token. An `unknown_token` request may queue
+  one current-stay audit, but that public trigger must be rate-limited and must
+  never create request-amplification traffic. A failed read preserves the last
+  locally confirmed link and uses persistent backoff.
 - External Home Assistant, logo, and favicon URLs must be credential-free HTTPS.
   Keep branding origins tightly scoped in CSP. Reverse proxies must not cache
   `/api/guesty/access/` and should redact token-bearing paths from logs.
