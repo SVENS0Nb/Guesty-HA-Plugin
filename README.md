@@ -173,6 +173,10 @@ Endpunkt für Reservierungs-Custom-Fields.
 - Bestätigte Reservierung: Token und Guesty-Link werden erzeugt.
 - Datum, Listing oder Schlosszuordnung geändert: Der alte Token wird sofort
   ungültig und ein neuer Link wird veröffentlicht.
+- Korrekturen am Gastnamen oder an sichtbaren beziehungsweise übersetzten
+  Türbezeichnungen ändern keine Berechtigung und ersetzen den Link deshalb
+  nicht. Bereits vorhandene Links werden beim Upgrade ohne Neuausgabe auf diese
+  stabilere Prüfung migriert.
 - Gelöschtes oder neu angelegtes Custom Field: Die gespeicherte Feld-ID wird
   nach einem Neustart neu geprüft. Nur wenn Guesty eindeutig eine ungültige
   Feldreferenz meldet und die neu aufgelöste ID wirklich abweicht, macht die
@@ -198,6 +202,11 @@ Endpunkt für Reservierungs-Custom-Fields.
 - „Synchronisiert“ wird erst gemeldet, nachdem der Wert über Guestys separaten
   Reservation-Custom-Field-GET-Endpunkt zurückgelesen wurde. Kurz verzögerte
   Guesty-Antworten werden begrenzt erneut geprüft.
+- Die öffentliche Seite zeigt bei einer Ablehnung weiterhin nur „Zugang nicht
+  verfügbar“. Home-Assistant-Diagnosedaten enthalten zusätzlich ausschließlich
+  datenschutzfreundliche Grundcodes und Zähler, damit sich ein alter Token, ein
+  abgelaufenes Zeitfenster oder ein veralteter Reservierungsstand unterscheiden
+  lassen.
 
 ### Reverse-Proxy-Sicherheit
 

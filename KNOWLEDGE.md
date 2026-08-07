@@ -914,8 +914,9 @@ write queue.
 ### KB-ACCESS-001 — Link authorization is server-owned and fail-closed
 
 - Status: Validated
-- Last validated: 2026-07-28
-- Evidence: `custom_components/guesty/access.py`, `tests/test_access.py`
+- Last validated: 2026-08-07
+- Evidence: `custom_components/guesty/access.py`,
+  `tests/test_access.py::test_expired_cache_or_changed_reservation_fails_closed`
 
 One opaque bearer URL is published per eligible reservation. Each selected
 listing can expose one to six server-mapped Home Assistant `lock.*` entities;
@@ -928,16 +929,32 @@ and a 15-second service timeout. Every action revalidates token, reservation
 fingerprint, active status, mapping, `[check-in - early, check-out + late)`
 window, and snapshot freshness.
 
+The public page deliberately keeps every denial generic. Runtime diagnostics
+retain only fixed privacy-safe rejection reason identifiers, timestamps, and
+counts. They never include the bearer URL, token, guest data, raw reservation
+or listing IDs, or request-specific access-window values.
+
 ### KB-ACCESS-002 — Door-link rotation and cleanup rules
 
 - Status: Validated
-- Last validated: 2026-07-28
-- Evidence: `custom_components/guesty/access.py`, `tests/test_access.py`
+- Last validated: 2026-08-07
+- Evidence: `custom_components/guesty/access.py`,
+  `tests/test_access.py::test_guest_name_change_does_not_rotate_access_link`,
+  `tests/test_access.py::test_door_label_change_does_not_rotate_access_link`,
+  `tests/test_access.py::test_legacy_fingerprint_migrates_without_rotating_access_link`,
+  `tests/test_access.py::test_changed_legacy_authorization_state_rotates_access_link`,
+  `tests/test_access.py::test_booking_time_change_still_rotates_access_link`
 
 Tokens are unguessable and HMAC-bound to a private secret, reservation,
 permission version, and relevant access inputs. Only token hashes are indexed.
 Permission, timing, mapping, or field-identity changes rotate the link;
-translation-only label changes do not.
+guest-name changes and every human-readable door-label change do not. Guest
+names and labels are presentation data rather than authorization inputs. A
+versioned fingerprint removes them while retaining listing ID, active state,
+the exact access window, ordered lock entity IDs, and custom-field reference.
+An exactly matching legacy presentation-sensitive fingerprint is migrated in
+place without changing the token or republishing the URL; an unexplained legacy
+mismatch still rotates fail-closed.
 
 Revocation occurs locally before Guesty field cleanup. Cleanup uses persistent
 bounded backoff and seven-day tombstones. A transient error must not create a
@@ -1332,3 +1349,4 @@ tag points to the same commit and manifest version.
 | 2026-08-04 | Sparse dual-model PIN regression remediation | Paired an exact sparse V3 row with the same refresh's successful V2 Keycode observation to classify legacy/channel reservations without blocking their first code, kept truly missing rows fail-closed, and prevented omitted `customFields` projections from causing per-reservation read fan-out |
 | 2026-08-04 | PIN mirror queue starvation diagnosis and remediation | Live read-only diagnostics showed all 41 native mirrors confirmed while all 41 custom mirrors remained queued despite ample API headroom. Excluded already-ended active-status reservations from PIN processing and made current and nearest stays finish redundancy backfill before more distant bookings; remote cleanup remains intact. |
 | 2026-08-04 | TTLock booking-window confirmation remediation | Bound every ready/verified TTLock passcode to the current desired Guesty access-window fingerprint, made planned arrival/departure replacements immediately pending until exact remote confirmation, preserved current-stay start clamping, and added safe pending-window diagnostics. |
+| 2026-08-07 | Door-link stability remediation | Removed guest names and visible door labels from authorization fingerprints, migrated unchanged legacy records without token rotation, retained rotation for timing and mapping changes, and added privacy-safe validation diagnostics. |

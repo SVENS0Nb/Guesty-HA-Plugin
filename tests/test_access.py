@@ -114,6 +114,122 @@ async def test_reconcile_writes_each_unchanged_link_only_once(
 
 
 @pytest.mark.asyncio
+async def test_guest_name_change_does_not_rotate_access_link(hass, monkeypatch) -> None:
+    """Presentation-only guest updates keep an already issued bearer URL valid."""
+    manager, client = await _manager(hass, monkeypatch)
+    reservation = manager._coordinator.data.reservations[0]
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    client.async_update_reservation_custom_field.reset_mock()
+
+    reservation.guest_name = "Corrected display name"
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version
+    assert manager._token_for("reservation-1", record["version"]) == old_token
+    assert (await manager.async_get_portal(old_token)).status == 200
+    client.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_door_label_change_does_not_rotate_access_link(hass, monkeypatch) -> None:
+    """Changing a visible door name updates the page without replacing its URL."""
+    manager, client = await _manager(hass, monkeypatch)
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    client.async_update_reservation_custom_field.reset_mock()
+    mappings = {
+        "listing-1": [
+            {"entity_id": "lock.front_door", "name": "Main entrance"},
+            {"entity_id": "lock.apartment", "name": "Apartment entrance"},
+        ]
+    }
+    hass.config_entries.async_update_entry(
+        manager.entry,
+        options={
+            **manager.entry.options,
+            CONF_ACCESS_LOCK_MAPPINGS: mappings,
+        },
+    )
+
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version
+    assert manager._token_for("reservation-1", record["version"]) == old_token
+    page = await manager.async_get_portal(old_token, "en")
+    assert page.status == 200
+    assert "Open Main entrance" in page.text
+    client.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_fingerprint_migrates_without_rotating_access_link(
+    hass, monkeypatch
+) -> None:
+    """An unchanged pre-versioned record adopts the new shape in place."""
+    manager, client = await _manager(hass, monkeypatch)
+    reservation = manager._coordinator.data.reservations[0]
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    record["fingerprint"] = manager._legacy_reservation_fingerprint(reservation)
+    record.pop("fingerprint_version")
+    client.async_update_reservation_custom_field.reset_mock()
+
+    # Validation remains available during the short setup-to-reconcile window.
+    assert (await manager.async_get_portal(old_token)).status == 200
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version
+    assert record["fingerprint_version"] == access._ACCESS_FINGERPRINT_VERSION
+    assert record["fingerprint"] == manager._reservation_fingerprint(reservation)
+    assert (await manager.async_get_portal(old_token)).status == 200
+    client.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_legacy_authorization_state_rotates_access_link(
+    hass, monkeypatch
+) -> None:
+    """Legacy migration cannot preserve a token after a permission input changed."""
+    manager, client = await _manager(hass, monkeypatch)
+    reservation = manager._coordinator.data.reservations[0]
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    record["fingerprint"] = manager._legacy_reservation_fingerprint(reservation)
+    record.pop("fingerprint_version")
+    reservation.check_out_utc = (dt_util.utcnow() + timedelta(hours=2)).isoformat()
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version + 1
+    assert manager._validate_token(old_token) is None
+    client.async_update_reservation_custom_field.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_booking_time_change_still_rotates_access_link(hass, monkeypatch) -> None:
+    """Authorization-relevant timing updates still invalidate the old URL."""
+    manager, client = await _manager(hass, monkeypatch)
+    reservation = manager._coordinator.data.reservations[0]
+    record = manager._records["reservation-1"]
+    old_version = record["version"]
+    old_token = manager._token_for("reservation-1", old_version)
+    reservation.check_out_utc = (dt_util.utcnow() + timedelta(hours=2)).isoformat()
+    client.async_update_reservation_custom_field.reset_mock()
+
+    await manager.async_reconcile()
+
+    assert record["version"] == old_version + 1
+    assert manager._validate_token(old_token) is None
+    client.async_update_reservation_custom_field.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_unverified_v130_record_is_republished(hass, monkeypatch) -> None:
     """Records created before response verification receive one safe retry."""
     manager, client = await _manager(hass, monkeypatch)
@@ -746,6 +862,13 @@ async def test_expired_cache_or_changed_reservation_fails_closed(
 
     reservation.check_out_utc = (dt_util.utcnow() + timedelta(hours=2)).isoformat()
     assert (await manager.async_get_portal(token)).status == 404
+    diagnostics = manager.diagnostics()
+    assert diagnostics["last_validation_failure"] == "authorization_changed"
+    assert diagnostics["last_validation_failure_at"] is not None
+    assert diagnostics["validation_failure_counts"] == {
+        "authorization_changed": 1,
+        "stale_reservation_snapshot": 1,
+    }
 
 
 @pytest.mark.asyncio

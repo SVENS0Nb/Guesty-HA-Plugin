@@ -81,6 +81,7 @@ ACCESS_STORAGE_KEY = "guesty_access"
 ACCESS_MANAGERS = "access_managers"
 ACCESS_VIEW_REGISTERED = "access_view_registered"
 _ACCESS_FIELD_WRITE_BATCH_SIZE = 2
+_ACCESS_FINGERPRINT_VERSION = 2
 _GUESTY_RATE_LIMIT_RESERVE = 4
 
 ACCESS_PORTAL_TRANSLATIONS: dict[str, dict[str, str]] = {
@@ -250,6 +251,9 @@ class GuestyAccessManager:
         self._last_published_count = 0
         self._last_recovered_count = 0
         self._last_deferred_count = 0
+        self._last_validation_failure: str | None = None
+        self._last_validation_failure_at: str | None = None
+        self._validation_failure_counts: defaultdict[str, int] = defaultdict(int)
         self._validated_field_references: set[str] = set()
         self._listeners: set[Callable[[], None]] = set()
         self._last_action: dict[tuple[str, int], float] = {}
@@ -374,9 +378,22 @@ class GuestyAccessManager:
                 existing = records.get(reservation_id)
                 if not isinstance(existing, dict):
                     existing = {}
-                if existing.get("fingerprint") != fingerprint or existing.get(
-                    "revoked"
+                fingerprint_matches = self._record_fingerprint_matches(
+                    existing,
+                    reservation,
+                    fingerprint,
+                )
+                if (
+                    fingerprint_matches
+                    and existing.get("fingerprint_version")
+                    != _ACCESS_FINGERPRINT_VERSION
                 ):
+                    # Records from releases before fingerprint versioning also
+                    # included presentation-only guest and door names. Adopt
+                    # the authorization-only shape without changing the token.
+                    existing["fingerprint"] = fingerprint
+                    existing["fingerprint_version"] = _ACCESS_FINGERPRINT_VERSION
+                if not fingerprint_matches or existing.get("revoked"):
                     version = self._next_token_version(existing)
                     token = self._token_for(reservation_id, version)
                     existing.update(
@@ -384,6 +401,7 @@ class GuestyAccessManager:
                             "version": version,
                             "token_hash": self._token_hash(token),
                             "fingerprint": fingerprint,
+                            "fingerprint_version": _ACCESS_FINGERPRINT_VERSION,
                             "listing_id": reservation.listing_id,
                             "url_hash": None,
                             "field_synced": False,
@@ -750,6 +768,11 @@ class GuestyAccessManager:
             ),
             "verified_records": sum(
                 1 for record in records.values() if record.get("write_verified")
+            ),
+            "last_validation_failure": self._last_validation_failure,
+            "last_validation_failure_at": self._last_validation_failure_at,
+            "validation_failure_counts": dict(
+                sorted(self._validation_failure_counts.items())
             ),
         }
 
@@ -1144,45 +1167,52 @@ class GuestyAccessManager:
     ) -> tuple[str, GuestyReservation, list[dict[str, str]]] | None:
         """Validate token, current reservation state, time, and mapping."""
         if self._unloaded or not self.entry.options.get(CONF_ACCESS_ENABLED, False):
-            return None
+            return self._reject_validation("manager_unavailable")
         if len(token) < 32 or len(token) > 128:
-            return None
+            return self._reject_validation("invalid_token_format")
         token_hash = self._token_hash(token)
         reservation_id = self._token_index.get(token_hash)
         if reservation_id is None:
-            return None
+            return self._reject_validation("unknown_token")
         record = self._records.get(reservation_id)
         if (
             not isinstance(record, dict)
             or record.get("revoked")
             or not hmac.compare_digest(str(record.get("token_hash", "")), token_hash)
         ):
-            return None
+            return self._reject_validation("invalid_or_revoked_record")
 
         data = self._coordinator.data
         # A single failed poll must not revoke every issued link. Fail closed
         # only after the last confirmed snapshot exceeds the configured age.
         if data is None or self._access_data_too_old(data):
-            return None
+            return self._reject_validation("stale_reservation_snapshot")
         reservation = next(
             (item for item in data.reservations if item.id == reservation_id), None
         )
         if reservation is None or not reservation.is_active_status():
-            return None
+            return self._reject_validation("reservation_missing_or_inactive")
         doors = self._mappings.get(reservation.listing_id)
         if not doors:
-            return None
+            return self._reject_validation("listing_mapping_missing")
         try:
             fingerprint = self._reservation_fingerprint(reservation)
             start, end = self._access_window(reservation)
         except ValueError:
-            return None
-        if record.get("fingerprint") != fingerprint:
-            return None
+            return self._reject_validation("invalid_reservation_window")
+        if not self._record_fingerprint_matches(record, reservation, fingerprint):
+            return self._reject_validation("authorization_changed")
         now = dt_util.utcnow()
         if not start <= now < end:
-            return None
+            return self._reject_validation("outside_access_window")
         return reservation_id, reservation, doors
+
+    def _reject_validation(self, reason: str) -> None:
+        """Record one privacy-safe token rejection reason for diagnostics."""
+        self._last_validation_failure = reason
+        self._last_validation_failure_at = dt_util.utcnow().isoformat()
+        self._validation_failure_counts[reason] += 1
+        return None
 
     def _access_data_too_old(self, data: Any) -> bool:
         """Return whether cached reservation data is too old for door access."""
@@ -1220,7 +1250,31 @@ class GuestyAccessManager:
         return start - timedelta(minutes=early), end + timedelta(minutes=late)
 
     def _reservation_fingerprint(self, reservation: GuestyReservation) -> str:
-        """Hash every server-side permission input to invalidate stale tokens."""
+        """Hash only server-side authorization inputs for one bearer link."""
+        start, end = self._access_window(reservation)
+        mappings = self._mappings.get(reservation.listing_id, [])
+        payload = {
+            "listing_id": reservation.listing_id,
+            "active": reservation.is_active_status(),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            # Door order is authorization-relevant because the browser submits
+            # an index. Human-readable names are presentation only.
+            "doors": [door["entity_id"] for door in mappings],
+            "custom_field": str(
+                self.entry.options.get(
+                    CONF_ACCESS_CUSTOM_FIELD, DEFAULT_ACCESS_CUSTOM_FIELD
+                )
+            ).strip(),
+        }
+        return hmac.new(
+            self._secret,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _legacy_reservation_fingerprint(self, reservation: GuestyReservation) -> str:
+        """Recreate the pre-v2 presentation-sensitive fingerprint for migration."""
         start, end = self._access_window(reservation)
         mappings = self._mappings.get(reservation.listing_id, [])
         payload = {
@@ -1229,8 +1283,6 @@ class GuestyAccessManager:
             "guest_name": reservation.guest_name or "",
             "start": start.isoformat(),
             "end": end.isoformat(),
-            # Keep the legacy fingerprint shape. Additional translated labels
-            # do not rotate or republish an otherwise unchanged bearer link.
             "doors": [
                 {"entity_id": door["entity_id"], "name": door["name"]}
                 for door in mappings
@@ -1246,6 +1298,27 @@ class GuestyAccessManager:
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
             hashlib.sha256,
         ).hexdigest()
+
+    def _record_fingerprint_matches(
+        self,
+        record: Mapping[str, Any],
+        reservation: GuestyReservation,
+        current_fingerprint: str | None = None,
+    ) -> bool:
+        """Match current or exactly reproducible legacy authorization state."""
+        stored = record.get("fingerprint")
+        if not isinstance(stored, str):
+            return False
+        current = current_fingerprint or self._reservation_fingerprint(reservation)
+        version = record.get("fingerprint_version")
+        if version == _ACCESS_FINGERPRINT_VERSION:
+            return hmac.compare_digest(stored, current)
+        if version is not None:
+            return False
+        return hmac.compare_digest(stored, current) or hmac.compare_digest(
+            stored,
+            self._legacy_reservation_fingerprint(reservation),
+        )
 
     @property
     def _records(self) -> dict[str, dict[str, Any]]:

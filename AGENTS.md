@@ -451,7 +451,13 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
 - Keep link tokens unguessable and HMAC-bound to a private secret, reservation,
   permission version, and relevant inputs. Store/index only a token hash.
   Rotate when permissions, reservation timing, mapping, or field identity
-  changes. Translation-only label changes must not rotate the URL.
+  changes. Guest names and all human-readable door labels are presentation
+  data and must not rotate the URL. Migrate an exactly matching legacy
+  presentation-sensitive fingerprint in place so an upgrade does not replace
+  every existing guest link.
+- Keep public rejection pages generic. Privacy-safe diagnostics may expose only
+  bounded reason identifiers and counts, never bearer URLs, guest data, raw
+  reservation/listing IDs, or access-window timestamps tied to a request.
 - Revoke locally before Guesty field cleanup. Cleanup uses persistent backoff,
   bounded writes, and seven-day tombstones. Heal a stale custom-field ID only
   for narrowly classified field-reference failures; a generic 404 or transient
