@@ -2,728 +2,329 @@
 
 ## Purpose and authority
 
-This file is the operating contract for agents and maintainers. The canonical
-durable engineering memory is [`KNOWLEDGE.md`](KNOWLEDGE.md). Read both files
-completely before changing code, tests, configuration flows, documentation, or
-release metadata.
+This file is the concise operating contract for agents and maintainers.
+[`KNOWLEDGE.md`](KNOWLEDGE.md) is the canonical durable technical memory, and
+[`KNOWLEDGE_HISTORY.md`](KNOWLEDGE_HISTORY.md) is only its chronological audit
+trail.
 
-- The current code and regression tests are the source of truth for implemented
-  behavior. The README is the user-facing contract and must be kept aligned.
-- `KNOWLEDGE.md` records validated architecture, external API behavior, product
-  decisions, failure lessons, and retired assumptions. Safety-critical
-  invariants are intentionally summarized in this file as enforceable rules;
-  when either file changes, check the other for drift.
-- Preserve the product decisions and safety invariants below unless the user
+- Explicit current user intent defines the requested outcome. The production
+  code and regression tests define currently implemented behavior. The README
+  is the user-facing contract. Resolve disagreement between these artifacts;
+  never silently choose one.
+- Preserve the safety boundaries and product decisions below unless the user
   explicitly changes them.
-- Record durable technical knowledge in `KNOWLEDGE.md`, not in ad-hoc comments,
-  release notes, or chat-only memory.
-  Never add real credentials, tokens, reservation IDs, guest data, private URLs,
-  or details copied from diagnostic exports.
-- Update this file when the agent workflow, a mandatory safety invariant, or a
-  release requirement changes. Do not turn it into a changelog.
+- Put subsystem facts, API contracts, failure lessons, and retired assumptions
+  in `KNOWLEDGE.md`. Keep this file limited to workflow and always-on guardrails.
+- Never store credentials, tokens, PINs, bearer URLs, guest data, private URLs,
+  or real reservation/listing identifiers in repository documentation, tests,
+  fixtures, logs, or diagnostics.
 
-## Mandatory knowledge-base workflow
+## Task mode and authorization
 
-Every development, diagnosis, review, and release task must use
-`KNOWLEDGE.md` as follows:
+Classify the current request before acting. A later explicit user instruction
+may broaden the mode; an ordinary diagnostic finding does not.
 
-1. **Read before reasoning.** Read the entire current knowledge base before
-   designing or editing. Identify the entries and retired assumptions relevant
-   to the task.
-2. **Verify, do not merely trust.** For an affected fact, inspect the cited
-   production code and regression tests. Current reproducible evidence outranks
-   old prose. If code, tests, README, `AGENTS.md`, and the knowledge base
-   disagree, resolve the conflict rather than silently choosing one.
-3. **Perform a knowledge-impact check.** Before finishing, explicitly decide
-   whether the work confirmed, changed, added, or retired durable knowledge.
-   Routine refactors, release numbers, transient logs, and one-off debugging
-   details do not need entries.
-4. **Update in the same change.** When durable behavior, ownership, an external
-   API constraint, a safety boundary, or a known failure mode changes, update
-   the existing entry or add a stable new entry in `KNOWLEDGE.md` in the same
-   commit. Update matching rules here and the user-facing README when required.
-5. **Keep entries evidence-based.** Each new or materially changed entry needs
-   a stable ID, status, validation date, evidence paths or test names, the
-   validated fact, and its engineering consequence. Unverified ideas must be
-   marked `Provisional` with a concrete validation need and must not be treated
-   as an implementation contract.
-6. **Correct instead of accumulating.** Edit or retire obsolete entries; do not
-   append contradictory advice. Retired entries remain only when remembering
-   the rejected assumption prevents a likely regression, and must name their
-   replacement.
-7. **Review regularly.** Before every release, review all entries touched by the
-   release. During an explicit whole-project audit, review every active entry
-   and update the knowledge-base review register. Do not change the
-   project-wide review date after only a narrow check.
-8. **Protect secrets and privacy.** Never store credentials, tokens, PINs,
-   bearer URLs, guest names, confirmation codes, real reservation/listing IDs,
-   private endpoints, raw diagnostic payloads, or other personal data in the
-   knowledge base.
+| User request | Authorized behavior |
+| --- | --- |
+| Inspect, review, explain, or report status | Read and verify only. Do not edit, publish, or perform live writes. |
+| Diagnose | Reproduce safely and identify the cause. Do not implement the fix unless requested. |
+| Change, fix, or build | Implement the smallest complete change, add regression coverage, update affected contracts, and validate it. |
+| Test a live external write | Require explicit authorization for that live write and follow the live-test safety rules below. |
+| Publish or release | Only after an explicit publication request; follow the release sequence exactly. |
 
-Use this entry shape for new knowledge:
+If a missing decision would materially change security, data ownership, public
+behavior, or an external system, stop and ask. Otherwise make the narrowest
+reasonable in-scope assumption and state it.
+
+## Repository and worktree safety
+
+Before editing:
+
+1. Run `git status --short` and identify pre-existing changes.
+2. Preserve user-owned and unrelated changes. Never reset, checkout, overwrite,
+   or reformat them merely to simplify the task.
+3. Trace the affected path from API/model through coordinator/storage, manager,
+   entity/config flow, diagnostics, documentation, and cleanup.
+4. Identify the relevant knowledge entries using the map below.
+
+Use `rg`/`rg --files` for search and `apply_patch` for manual file edits. Do not
+use destructive Git commands unless the user explicitly requests them. Do not
+commit, push, tag, create a release, or mutate live external state merely as a
+convenient implementation or diagnostic step.
+
+## Knowledge workflow
+
+### What to read
+
+For every task:
+
+1. Read this file completely.
+2. Read the Purpose, Review metadata, Evidence model, and Knowledge index at the
+   top of `KNOWLEDGE.md`.
+3. Read every entry selected by the impact map, its direct `KB-*` references,
+   and any relevant Retired entry.
+4. Inspect the cited production code and tests before relying on the prose.
+
+Read the entire `KNOWLEDGE.md` when any of these applies:
+
+- the user requests a whole-project, security, reliability, or architecture
+  audit;
+- a release is being prepared;
+- ownership or behavior changes across three or more subsystem areas;
+- the affected scope cannot be determined safely from the index and evidence;
+- current code, tests, README, this file, and the selected entries disagree.
+
+This selective workflow is deliberate: it retains evidence-based reasoning
+without consuming the task context with unrelated subsystem history.
+
+### Impact map
+
+Review all listed knowledge areas for changed files or concerns. Update an entry
+only when durable behavior, evidence, ownership, an external contract, a safety
+boundary, or a reusable failure lesson changed.
+
+| Changed path or concern | Required knowledge review |
+| --- | --- |
+| `custom_components/guesty/api.py`, `_http.py`, Guesty OAuth/routes/pagination | `KB-GUESTY-*`, `KB-SAFE-001`, `KB-SAFE-003` |
+| `custom_components/guesty/coordinator.py`, `webhook.py`, polling/caches | `KB-ARCH-001`, `KB-GUESTY-001`, `KB-GUESTY-006`, `KB-GUESTY-007` |
+| `custom_components/guesty/models.py`, `scheduler.py`, `sensor.py`, `calendar.py` | `KB-RES-*`, `KB-SAFE-004` |
+| `custom_components/guesty/access*.py`, door-link field, public portal | `KB-ACCESS-*`, `KB-SAFE-003`, `KB-SAFE-004` |
+| `custom_components/guesty/loxone*.py`, shared PIN state, Guesty PIN mirrors | `KB-PIN-*`, `KB-LOXONE-*`, `KB-FAILOVER-001` |
+| `custom_components/guesty/ttlock*.py` | `KB-PIN-*`, `KB-TTLOCK-*`, `KB-SAFE-002`, `KB-SAFE-004` |
+| `custom_components/guesty/config_flow.py`, `const.py`, strings/translations | `KB-HA-001` and every feature area whose option contract changed |
+| `custom_components/guesty/__init__.py`, stores, diagnostics, setup/unload | `KB-ARCH-002`, `KB-ARCH-003`, `KB-SAFE-*` |
+| `.github/`, dependencies, validation scripts, release metadata | `KB-REL-001` |
+
+### Maintaining knowledge
+
+- Verify affected facts against current code and tests. Reproducible evidence
+  outranks old prose.
+- Update durable knowledge in the same change. Routine refactors, version-only
+  bumps, transient logs, and one-off debugging details do not need entries.
+- Correct or retire obsolete entries instead of appending contradictory advice.
+  IDs are permanent and must never be renumbered or reused.
+- Every entry appears exactly once in the index and has its fixed lowercase
+  anchor. Keep numeric order within each area.
+- A project-wide audit reviews every active entry and updates
+  `KNOWLEDGE_HISTORY.md`. A narrow check changes only affected entry dates and
+  must not advance the project-wide review date.
+- Run `scripts/validate_knowledge.py` after every knowledge edit. Do not weaken
+  the validator to accommodate malformed documentation.
+
+Use this entry shape:
 
 ```markdown
+<a id="kb-area-nnn"></a>
+
 ### KB-AREA-NNN — Short title
 
 - Status: Validated | Provisional | Retired
 - Last validated: YYYY-MM-DD
-- Evidence: `path`, `test_name`, or an official public specification
-- Replaces / Superseded by: optional stable knowledge ID
+- Evidence: `path`, `path::test_or_symbol`, or official public specification
+- Replaces: KB-AREA-NNN (optional for an active replacement)
+- Superseded by: KB-AREA-NNN (required for Retired)
+- Validation needed: concrete procedure (required for Provisional)
+- External status: current | deprecated compatibility | provisional contract
+- Last externally checked: YYYY-MM-DD when External status is present
 
 Fact, boundaries, and engineering consequence.
 ```
 
-## Product intent
+Retired titles state the rejected assumption, and their prose begins
+`Rejected assumption:`. External-contract entries cite an official public
+source or identify support-confirmed evidence without copying private
+correspondence or customer data. The pull-request checklist in
+`.github/pull_request_template.md` applies even outside a GitHub pull request.
 
-This is a HACS-installable Home Assistant custom integration for Guesty. Its
-primary responsibilities are:
+## Product and architecture boundaries
 
-1. Keep Guesty listings and active reservations current with low API traffic.
-2. Expose occupancy sensors and one future-reservation calendar per listing.
-3. Optionally expose current guest details after an explicit privacy opt-in.
-4. Optionally publish a secure per-reservation web page that operates one to six
-   Home Assistant `lock.*` entities.
-5. Optionally create one stable six-digit reservation PIN, synchronize it with
-   one or both independently enabled Guesty sources—native Keycode (top-level
-   `keyCode` on V2-backed reservations or `notes.keyCode` on V3-backed
-   reservations) and a configurable reservation custom field (default
-   `{{door_code}}`)—and
-   deliver it shortly before the stay to Loxone, TTLock, or both.
+This is a HACS-installable Home Assistant custom integration that maintains one
+shared Guesty listing/reservation snapshot and optionally provides occupancy,
+calendars, privacy-gated guest details, door-access links, and one stable
+six-digit reservation PIN delivered to Guesty, Loxone, TTLock, or both.
 
-All optional access systems are configured through the Home Assistant UI and
-can be enabled only for selected listings. A listing without a mapping must not
-receive that feature's side effects.
+Stable ownership:
 
-## Architecture map
+- `api.py` owns Guesty HTTP/OAuth operations; `_http.py` owns bounded response
+  reading.
+- `coordinator.py` is the only Guesty synchronization owner and merges polling
+  with signed webhook updates.
+- `models.py` owns reservation/status/time semantics; `scheduler.py` owns exact
+  local transitions.
+- `access*.py` owns the public door portal and Guesty link lifecycle.
+- `loxone.py` owns the shared PIN lifecycle as well as Loxone provisioning;
+  TTLock reuses that PIN through `ttlock*.py`.
+- `storage.py` is the privacy-filtered general cache. Private access, PIN, and
+  TTLock stores remain separate.
+- `config_flow.py` owns UI setup/reconfiguration; `__init__.py` owns
+  transactional startup and teardown.
 
-- `api.py`: shared Guesty OAuth/API client, retries, pagination, webhooks,
-  native Keycode writes, and reservation custom-field operations.
-- `_http.py`: bounded response reader shared by every external API client.
-- `coordinator.py`: the only Guesty synchronization owner; merges polling and
-  webhook updates and publishes one shared reservation/listing snapshot.
-- `models.py`: Guesty parsing, time precedence, reservation status rules,
-  occupancy, date windows, and merge behavior.
-- `storage.py`: privacy-filtered general Guesty cache. It does not own PINs.
-- `scheduler.py`: exact local check-in/check-out occupancy transitions without
-  another Guesty request.
-- `webhook.py`: signed Home Assistant webhook endpoint and remote Guesty
-  subscription lifecycle.
-- `access.py`, `access_names.py`, `access_branding.py`: guest door page,
-  localization, security controls, Guesty link publication, and cleanup.
-- `loxone.py`: authoritative shared PIN lifecycle plus Loxone provisioning.
-  Despite the historical module name, this is also the PIN source used by
-  TTLock.
-- `loxone_api.py`: HTTPS Loxone user-management client.
-- `ttlock.py`, `ttlock_api.py`: TTLock passcode lifecycle and Open Platform
-  client.
-- `sensor.py`, `calendar.py`: dynamic per-listing Home Assistant entities.
-- `config_flow.py`, `strings.json`, `translations/`: setup, reauthentication,
-  reconfiguration, options, help text, and translations.
-- `diagnostics.py`: privacy-safe operational diagnostics.
-- `tests/`: the regression contract. Every production subsystem has direct
-  tests; preserve that shape.
+Optional features are listing-scoped. A listing without an enabled mapping must
+receive no feature-specific read, write, remote object, or side effect. See
+`KB-ARCH-*`.
 
-`__init__.py` owns startup and teardown order. Partial setup must roll back all
-already-started schedulers, managers, webhooks, platforms, and background tasks.
+## Non-negotiable runtime invariants
 
-## Shared Guesty synchronization and traffic
+### Shared synchronization and external traffic
 
-- There is exactly one `GuestyApiClient`, coordinator, OAuth token lifecycle,
-  reservation cache, and normal Guesty poller per config entry. Door access,
-  Loxone, and TTLock must consume the coordinator snapshot and must not add
-  independent Guesty polling loops.
-- Default reservation polling is every 300 seconds. The normal listing safety
-  sync is daily. If a signed webhook is unavailable, listings are checked at
-  least every 15 minutes.
-- Run a daily full reservation sync. Other polls are incremental and retain a
-  five-minute overlap to avoid losing updates at cursor boundaries.
-- Signed webhooks are the fast path. Supported subscriptions are
-  `reservation.created.v2`, `reservation.updated.v2`, `listing.new`,
-  `listing.updated`, and `listing.removed`. Legacy reservation event names may
-  be accepted locally for migration but must not be requested in a new
-  subscription.
-- Verify the Guesty/Standard Webhooks HMAC, timestamp tolerance, payload size,
-  and replay ID before accepting work. Mark an event as completed only after
-  the coordinator accepts it, so Guesty can retry a failed handoff.
-- Debounce bursts. A single reservation event should use a targeted read;
-  multiple reservation events should share one incremental refresh. Apply
-  sufficient listing payloads directly; fetch only missing details. A removed
-  listing is pruned immediately. A new listing triggers reservation traffic only
-  for that listing.
-- A targeted listing or single-reservation webhook must not reset global
-  reservation cache age, the listing safety-scan timestamp, stale/degraded
-  state, or the previous poll error. Only a successful normal reservation
-  synchronization proves the complete reservation snapshot fresh, and only a
-  complete listing read advances the listing safety cursor.
-- Guesty may report an expired Bearer token as either HTTP `401` or `403`.
-  After either response, refresh the shared token exactly once and retry the
-  original request. Only rejection with the fresh token, or a permanent
-  credential rejection from the OAuth endpoint, starts Home Assistant
-  reauthentication. Transient token failures use the last valid cache in a
-  visible degraded/stale state.
-- Guesty Client ID and Client Secret are stable application credentials; the
-  derived Bearer token expires. Reuse the shared serialized token lifecycle.
-  Do not mint diagnostic tokens repeatedly because Guesty's OAuth endpoint may
-  respond with a long `Retry-After`.
-- An OAuth-endpoint `429` is a deferred retry, never a setup-time sleep loop.
-  Persist the bounded absolute cooldown in the private general store, return
-  cached data immediately as degraded when available, and make every poll or
-  restart before the deadline fail locally without another token request. With
-  no cache, persist the cooldown before the fast setup retry is raised.
-- Reauthentication with unchanged Guesty credentials must reuse the private
-  cached Bearer token, expiration, and OAuth cooldown. A changed secret for the
-  same Client ID keeps that Client ID's cooldown but never reuses its old Bearer
-  token. Credential validation must prove access to account identity, listings,
-  and reservations before accepting the entry. Derive the stable config-entry
-  identity from the issued token's `accountId`, not `/accounts/me`'s current-user
-  `_id`. When the Client ID changes, an old cached token may be decoded locally
-  only to prove the same account; it must never be sent or reused for requests.
-  A successful live coordinator sync aborts a stale Home Assistant
-  reauthentication flow; cached/degraded data alone must never clear it.
-- All OAuth clients used for this Guesty account have the same configured API
-  rights. Do not diagnose a Client-ID permission difference or recommend a
-  credential change as the root-cause fix unless the same internal reservation
-  and identical request produce concrete evidence of that difference; see
-  `KB-GUESTY-009`.
-- Reservation/listing managers must use bounded, persistent backoff. Never
-  create a rapid retry loop after an outage, rate limit, or malformed response.
-- A failed remote Guesty webhook registration must recover automatically through
-  one owned, unload-cancellable task with bounded exponential backoff. Reuse the
-  idempotent ensure/migration flow; never add blind subscription creation.
-- Preserve API headroom for normal synchronization. Guesty PIN-mirror and door-link
-  migrations are deliberately write-budgeted rather than bulk-written at once.
-  Keep the reported second/minute/hour/day remainders separate. The persistent
-  two-PIN-writes-per-30-seconds limit already protects the second window;
-  scheduling headroom is therefore derived from the longer windows so a
-  momentarily low second bucket cannot pause work until the next normal poll.
+- Exactly one Guesty client, OAuth lifecycle, coordinator, reservation cache,
+  and normal poller exist per config entry. Optional managers consume that
+  snapshot and must not add independent Guesty pollers (`KB-ARCH-001`).
+- Signed webhooks are the fast path; polling is the safety net. Targeted webhook
+  refreshes never claim the complete snapshot fresh (`KB-GUESTY-001`).
+- OAuth refresh is serialized. A `401`/`403` may refresh and retry exactly once;
+  OAuth `429` uses a persisted cooldown and cached degraded state rather than a
+  token-minting or sleep loop (`KB-GUESTY-006`).
+- Read HTTP bodies to EOF under the configured limit. Retry only safe,
+  idempotent operations with bounded backoff. Non-idempotent creates require a
+  persistent in-progress marker and remote recovery lookup (`KB-SAFE-001`,
+  `KB-SAFE-002`).
+- Preserve normal Guesty API headroom. All Guesty PIN-mirror writes share the
+  persistent maximum of two attempts per 30 seconds, including failures,
+  fallbacks, webhook passes, migrations, and restarts (`KB-PIN-003`).
 
-## HTTP and external API rules
+### Reservation, PIN, and access safety
 
-- Read every HTTP response to EOF through `_http.async_read_limited`; enforce
-  the configured hard size limit. A single `response.read(n)` is not a valid
-  replacement because `aiohttp` may return a partial fragment before EOF. This
-  previously caused valid JSON to be treated as repeatedly malformed.
-- Current body limits are 10 MiB for Guesty and 1 MiB for Loxone/TTLock.
-- Retry only operations known to be safe: transient `408`, `429`, `5xx`, and
-  transport failures use bounded exponential backoff and `Retry-After` when
-  available. Do not retry permanent errors.
-- Do not blindly retry a non-idempotent create. Webhook creation, Loxone user
-  creation, and TTLock passcode creation need a persistent in-progress marker
-  plus a remote lookup/recovery path after an ambiguous response.
-- TTLock change/delete calls require an explicit integer `errcode == 0`.
-  HTTP 200 or a JSON object without that field is not sufficient confirmation.
-- Validate all resource IDs before interpolating them into URL paths.
-- Restrict service base URLs to HTTPS. Reject credentials embedded in URLs.
-  TTLock regions use an explicit host allowlist; do not accept an arbitrary API
-  host.
-- Bound and redact error context. Preserve Guesty's `x-request-id` when
-  available, but never log OAuth tokens, bearer door links, passwords, PINs,
-  guest names, full reservation IDs, or unbounded response bodies. Use the
-  shared non-reversible reservation marker for operational logs.
-- For a Guesty support case, collect the redacted method/path/payload, response
-  status, `x-request-id`, affected reservation ID, client ID confirmation, and
-  timestamp. Never commit or paste the client secret or access token.
+- Payment state does not determine reservation activity. Access intervals are
+  half-open. Valid planned local arrival/departure overrides stale UTC values;
+  use the tested timezone/default fallback chain (`KB-RES-*`).
+- A confirmed numeric PIN is stable and never rotates automatically. Empty,
+  invalid, duplicate, sparse, or temporarily unreadable Guesty fields cannot
+  replace it. Native Keycode wins only the documented simultaneous-edit tie
+  (`KB-PIN-001`).
+- Native Guesty Keycode and the configurable custom field are independently
+  enabled mirrors. V2/V3 reads and writes remain route-matched and require exact
+  confirmation; HTTP 200 alone is not proof (`KB-GUESTY-002`,
+  `KB-GUESTY-003`, `KB-GUESTY-011`).
+- The PIN is six ASCII digits. A Guesty-only display suffix never reaches
+  Loxone or TTLock (`KB-PIN-002`).
+- Fresh source data is required to generate a PIN, infer a booking, or extend
+  access. Offline provisioning may use only a previously confirmed private PIN
+  and its exact stored interval; stored end times always retain cleanup
+  authority (`KB-SAFE-004`).
+- Door pages accept only a server-owned door index, never an entity ID. Unlock
+  is POST-only and revalidates bearer token, CSRF, reservation, mapping,
+  freshness, and time window. Public failures remain generic (`KB-ACCESS-*`).
 
-## Reservation semantics and time handling
+### Provider and failover safety
 
-- Active reservation statuses are the configured confirmed/reserved/
-  awaiting-payment/checked-in/in-house variants. Cancelled, closed, declined,
-  and expired reservations are inactive. Payment status is intentionally not a
-  criterion.
-- Future active reservations are valid input. Codes and door links can be
-  created when the reservation is first observed; remote lock-system objects
-  are deferred by their provisioning lead.
-- Occupancy and access windows are half-open: `[start, end)`.
-- Time precedence is subtle and covered by regression tests:
-  1. A valid `plannedArrival`/`plannedDeparture` combined with its localized
-     date overrides a possibly stale `checkIn`/`checkOut` UTC timestamp.
-  2. Otherwise use a valid UTC timestamp.
-  3. Otherwise combine the localized date with reservation/listing defaults.
-  4. Final defaults are 15:00 check-in and 11:00 check-out.
-- Use the listing timezone; only fall back to Home Assistant's timezone when the
-  Guesty timezone is missing or invalid.
-- Invalid intervals are skipped, not allowed to abort a complete sync.
-  Overlapping current reservations must resolve deterministically.
-- A Guesty change to date, planned arrival/departure, guest name, listing, or
-  status must be able to update or revoke already-provisioned access.
-- Keep the local transition scheduler so sensor occupancy changes exactly at
-  check-in/check-out without waiting for the next API poll.
+- Loxone and TTLock are optional delivery targets, not PIN authorities. Booking
+  time changes update existing remote access without rotating the PIN.
+- Remote collisions fail closed and never rotate a confirmed Guesty PIN.
+  Ambiguous creates recover by privacy-safe ownership marker. Modify or delete
+  only positively identified managed objects (`KB-LOXONE-*`, `KB-TTLOCK-*`).
+- TTLock refresh tokens rotate. An unchanged-account options flow uses the live
+  manager and persists its replacement token; a temporary client must not
+  consume and discard it (`KB-TTLOCK-001`).
+- TTLock's password MD5 is protocol-mandated compatibility with
+  `usedforsecurity=False`, not a general password-storage choice.
+- Backup operation is active/passive only. Exactly one Home Assistant instance
+  may write at a time (`KB-FAILOVER-001`).
 
-## Guesty dual-source PIN lifecycle
+### Privacy, configuration, and lifecycle
 
-- Every reservation PIN has two equal Guesty mirrors: Guesty's native Keycode
-  and the configurable reservation custom field (default `{{door_code}}`).
-  The native mirror has two backing-model routes: V2 top-level `keyCode` for
-  legacy/channel-imported reservations and V3 `notes.keyCode` for V3-created
-  reservations. Resolve the custom field by safe ID, name, or `{{variable}}`.
-  The separate door-access URL custom field remains a different data path.
-  Operators may enable either mirror independently, but a configured PIN
-  provider requires at least one. A disabled mirror is excluded from reads,
-  writes, conflict selection, retries, and aggregate readiness; preserve its
-  private baseline so re-enabling can reconcile without rotating the PIN.
-  Preserve a legacy `loxone_custom_field` selection until the next successful
-  options save migrates it to `pin_custom_field`; never silently replace a
-  user's prior non-default field during an upgrade.
-- Persist a confirmed baseline independently for both PIN mirrors. If both are
-  empty, generate once. If exactly one is populated, adopt it and fill only the
-  empty mirror. If both match, do not write. If exactly one changes from its
-  confirmed baseline, that user edit becomes canonical and propagates to the
-  other mirror and providers. Emptying either or both mirrors restores the
-  saved confirmed PIN; it does not delete access.
-- Native Keycode is the deterministic authority only when both enabled mirrors
-  change simultaneously to different populated values or an initial mismatch
-  has no trustworthy ordering. Normalize that Keycode into the custom mirror.
-  A stale mirror whose propagation is explicitly pending or failed remains
-  excluded from this tie-break so it cannot revert a newer confirmed edit.
-- An explicitly invalid or duplicate Guesty value is never accepted as the new
-  PIN. Restore the reservation's last safe confirmed PIN to every enabled
-  mirror. If a newly observed reservation has no saved PIN yet, generate one
-  unique PIN once and publish it through the normal bounded queue. A confirmed
-  PIN never rotates automatically.
-- Provider delivery may proceed when either Guesty mirror has confirmed the
-  canonical PIN. Track errors, retry timestamps, and synchronization state per
-  mirror so a failing native endpoint cannot block a healthy custom field (or
-  vice versa). A stale failed mirror must never become authoritative merely
-  because its propagation retry is pending.
-- V3-backed native writes use
-  `PUT /v1/reservations-v3/{reservationId}/notes` with the minimal payload
-  `{"notes":{"keyCode":"..."}}`. V2-backed/legacy/channel writes use
-  `PUT /v1/reservations/{reservationId}` with the separately support-confirmed
-  minimal top-level payload `{"keyCode":"..."}`. A nested `notes` payload on
-  the V2 updater is a silent no-op and is forbidden. Treat either route as
-  successful only after an exact response or bounded route-matched read-back;
-  HTTP success alone is never sufficient. Cache a confirmed route per
-  reservation, never account-wide. See `KB-GUESTY-003` and `KB-GUESTY-011`.
-- Keep the base V2 reservation projection free of `keyCode` and `customFields`.
-  During the same coordinator refresh, request one minimal V2 PIN projection
-  containing only `_id`, `listingId`, and the enabled PIN sources, filtered to
-  listings mapped to Loxone or TTLock. Continue the bounded V3
-  `GET /v1/reservations-v3` enrichment for active mapped reservations so
-  V3-backed `notes.keyCode` is observed. This is enrichment inside the shared
-  coordinator, not another poller. Disabled sources and unmapped listings must
-  cause no PIN-field traffic. Guesty's V2 projection may omit an empty requested
-  `keyCode`; the returned exact reservation still records that the V2 surface
-  was observed, without guessing the backing model. When the paired V3 result
-  returns that same reservation without `notes`, classify it as V2-backed. A
-  reservation missing entirely from either result remains unreadable. A
-  populated, explicit V2 Keycode must not be erased by an empty/sparse alternate
-  V3 projection. A v3 reservation
-  may identify itself with `reservationId`, `_id`, or `id`; accept a top-level
-  array or one reservation object and associate only an exact requested ID.
-  The endpoint accepts at most ten reservation IDs per request. Enrich only
-  active reservations for mapped listings during the shared poll/webhook flow.
-  When native Keycode synchronization is disabled, skip this enrichment
-  entirely, including startup and webhook-triggered v3 Keycode reads.
-- PIN enrichment is optional to occupancy, calendars, dates, status, and access
-  cleanup. A failed PIN projection must not discard an otherwise successful
-  base reservation refresh or fan out into one exact read per reservation.
-  A returned PIN row that omits requested `customFields`, or a requested row
-  missing entirely, is an affected unreadable source rather than permission for
-  a per-reservation fallback read. Mark it unreadable for that snapshot and retry
-  only through the next shared refresh. Persist a non-secret retry marker so that
-  refresh is a full reservation read even across restart, and clear it only
-  after a successful full PIN enrichment. Never generate or overwrite a source
-  that could not be read unless another populated mirror or a confirmed
-  private baseline safely establishes the canonical PIN.
-- Guesty's returned Keycode and configured custom field are reconciled through
-  their per-source baselines. A valid, unique manual change in either field
-  must propagate to the other field and existing Loxone/TTLock objects.
-- An omitted `notes` projection means “not observed,” not “the user deleted the
-  Keycode.” A requested V3 reservation missing from the result is temporarily
-  unreadable. A returned exact V3 reservation without `notes` selects the V2
-  route only when the same refresh successfully observed that reservation's V2
-  Keycode surface; otherwise it is also unreadable. Use the persistent full
-  enrichment retry for genuine unreadability. Never rotate or overwrite a
-  privately cached PIN solely because a sparse response omitted `notes`.
-- A sparse `notes` projection must not strand an explicitly pending native
-  Keycode publication. After bounded backoff, retry the exact stable private PIN
-  for a failed initial write, source migration, or configured suffix change;
-  never rotate merely because the projection is absent.
-- Explicitly empty, invalid, or duplicate values are repaired through the
-  persistent Guesty write budget. One or two empty mirrors receive the saved
-  PIN. Invalid input receives the saved PIN. Duplicate ownership is
-  deterministic: the healthy established reservation keeps its code and the
-  edited reservation receives its own saved PIN again. Only when that
-  reservation has no saved safe PIN yet may the integration generate one new
-  unique PIN. Existing provider access remains active while the saved value is
-  restored.
-- The actual PIN is exactly six ASCII digits. Generated codes use
-  `secrets.randbelow`, the configured one- or two-digit ASCII prefix, reject weak
-  sequences, and exclude every known active/private/rejected code.
-- A listing may append up to eight printable non-digit display characters such
-  as `#`, `*`, or `☑️`. Guesty receives, for example, `723456#`; Loxone and
-  TTLock always receive only `723456`. Changing the suffix rewrites the Guesty
-  display without rotating the numeric PIN.
-- Use one persistent global limit of at most two Guesty PIN-mirror write attempts
-  in any 30-second window. Normal queue passes, reservation-specific retries,
-  webhook-triggered passes, and restarts share this limit. Failed and ambiguous
-  PUTs consume a slot. Native V2, native V3, and custom-field PUTs consume the
-  same slots. Reserve two persistent slots before an unknown V3 route may fall
-  back to V2, and refund only a demonstrably unused reservation after a
-  confirmed one-attempt result.
-  Within one newly generated reservation, confirm one Guesty mirror before
-  spending another slot on its redundant mirror. Across reservations, however,
-  current and nearest stays retain priority for both their first publication
-  and redundancy backfill; a distant or already ended booking must never hold
-  back a nearer stay. Once the configured access window has ended, exclude the
-  reservation from PIN generation, Guesty mirroring, conflict ownership, and
-  write-queue priority even if Guesty still reports an active status. Preserve
-  the normal Loxone, TTLock, and private-state cleanup path.
-  An application-wide failure of the
-  dedicated notes route may stop the current batch so identical failures do not
-  waste the second slot or Guesty's normal synchronization headroom.
-- Budget each persistent PUT slot as an envelope of the PUT plus up to three
-  bounded confirmation reads. Recalculate Guesty's reported long-window
-  headroom immediately before every PUT; require eight remaining requests for
-  one slot and twelve for two while preserving the four-request normal-traffic
-  reserve. If even one envelope does not fit, wait until the next configured
-  reservation refresh rather than scheduling an immediate no-traffic loop.
-  PIN-mirror PUTs and their confirmation/route-discovery GETs must disable
-  internal authentication and transport retries. A rejected token invalidates
-  itself so the next separately budgeted attempt refreshes first; no request in
-  the write envelope may be replayed invisibly.
-- Every PIN-mirror path must consume that same write budget, including
-  sparse cached snapshots and one-time migrations from private stored PINs.
-  Never bypass the queue merely because Guesty omitted the `notes` projection.
-- Deferring a due reservation-specific failure because the global limit is full
-  must preserve its retry count and failure reason; global queueing may move the
-  next retry later but must not turn a real failure into a generic queued state.
-- Loxone and TTLock collisions never rotate an already confirmed Guesty PIN.
-  Delete any tentative remote object, expose a conflict, and use persistent
-  retry backoff until a manual Guesty edit supplies a different PIN.
-- A 404 from the dedicated v3 notes route is not proof that the reservation is
-  missing when an exact v3 read still returns it. Preserve the original
-  `x-request-id`, classify the reservation as V2-backed, and use the validated
-  top-level V2 Keycode update if a second persistent write slot was reserved.
-  Otherwise cache V2 for the next bounded retry. A failed or ambiguous fallback
-  consumes its reserved slots. Account-wide authentication, permission,
-  transport, or payload errors may stop the batch to avoid unnecessary traffic.
-  A retry-state migration may seed the V2 route only from the proven
-  `guesty_keycode_endpoint_unavailable` classification; a generic rejection is
-  requeued but remains route-unknown. Route discovery with insufficient
-  fallback capacity must use the next shared write slot, not generic
-  five-minute error backoff.
-- Native Keycode failures log only the hashed reservation marker, stable
-  operation/reason, safe endpoint label, HTTP status, bounded `x-request-id`,
-  retry count/delay, and available rate-limit headroom. A successful write may
-  log the marker and retry count, but never the PIN or full reservation ID.
-- Manual or agent-driven live Keycode tests use both
-  `scripts.guesty_live_write_guard.GuestyLiveTokenCache` and
-  `GuestyLiveWriteGuard`; direct unguarded PUTs to the live notes endpoint are
-  forbidden. Resolve the OAuth token through the private persistent cache
-  before preflight so failed filters, script restarts, and separate diagnostic
-  processes reuse the same still-valid token. Arm the write guard only after all
-  read-only preflight work has completed and the target and payload are frozen.
-  The first attempt always waits a full 30 seconds after arming. A test run may
-  consume at most two attempts, and a second attempt requires analysis of the
-  first result plus another full 30-second wait. Failed, timed-out, ambiguous,
-  and rejected PUTs all consume an attempt. The guard persists the last permit
-  before network I/O so separate processes cannot bypass the spacing rule.
-  The token cache is credential-fingerprint-bound, locked across processes,
-  atomic, mode `0600`, and fail-closed when corrupt. Never bypass or delete it
-  merely to make a retry mint another token. This stricter diagnostic rule
-  supplements, but does not change, the integration runtime's own persistent
-  token lifecycle and write budget.
-- The privacy-filtered general cache never persists PIN fields. The private PIN
-  store owns plaintext only while needed. Remove plaintext locally at
-  cancellation/access end before attempting remote cleanup. Both Guesty fields
-  remain as booking documentation.
-- Guesty PIN, Loxone, and TTLock status sensors report delivery state,
-  counts, times, and safe error reasons only. They never expose the PIN.
+- Private stores remain `private=True`, atomic, defensively loaded, and
+  separated by purpose. The general cache never owns PINs or bearer tokens
+  (`KB-ARCH-003`).
+- Diagnostics are built from a reviewed safe allowlist. Logs and diagnostics
+  never expose credentials, PINs, door links, guest data, full reservation IDs,
+  remote IDs, or unbounded response bodies (`KB-SAFE-003`).
+- Config and options flows remain UI-driven. Blank secrets preserve the stored
+  value only for an unchanged identity. Frontend schemas must serialize through
+  Home Assistant's custom serializer and deliberately handle stale extra keys
+  (`KB-HA-001`).
+- Startup, reload, setup failure, unload, and integration removal cancel every
+  owned task, timer, listener, and retry worker. Partial setup rolls back all
+  previously started resources (`KB-ARCH-002`).
+- Credential updates have exactly one reload owner. Do not combine the update
+  listener with another update-and-reload helper.
 
-## Guest door-access web page
+## Live external testing
 
-- This feature is independent of Keycode/Loxone/TTLock and may be enabled for
-  selected listings only.
-- Publish one opaque bearer URL per eligible reservation to the configured
-  Guesty reservation custom field. Resolve field names/IDs safely and confirm
-  writes with bounded read-back retries for Guesty's eventual consistency.
-- A link can show one to six configured Home Assistant `lock.*` entities. Omit
-  unused slots. The browser supplies only a door index; the server owns the
-  entity mapping and must never accept an arbitrary entity ID from the client.
-- The portal supports German, English, Spanish, and French from
-  `Accept-Language`, with English fallback. Door names may be translated per
-  listing. Keep the established UI wording and capitalization, including
-  “Door Access” and “Access Unavailable.”
-- On successful unlock, keep all buttons usable and show a localized transient
-  notification for five seconds. Do not require a page reload.
-- GET renders only and must never unlock. Unlock requires POST, a current
-  time-bucket CSRF nonce, a bounded request body, a five-second per-door
-  cooldown, at most ten actions per minute per door, and a 15-second service
-  timeout.
-- Revalidate token, reservation fingerprint, active status, mapping, time
-  window, and snapshot freshness for every action. Allowed time is
-  `[check-in - early offset, check-out + late offset)`. A single failed poll may
-  retain the last safe state; beyond the configured stale threshold fail closed.
-- Keep link tokens unguessable and HMAC-bound to a private secret, reservation,
-  permission version, and relevant inputs. Store/index only a token hash.
-  Rotate when permissions, reservation timing, mapping, or field identity
-  changes. Guest names and all human-readable door labels are presentation
-  data and must not rotate the URL. Migrate an exactly matching legacy
-  presentation-sensitive fingerprint in place so an upgrade does not replace
-  every existing guest link.
-- Keep public rejection pages generic. Privacy-safe diagnostics may expose only
-  bounded reason identifiers and counts, never bearer URLs, guest data, raw
-  reservation/listing IDs, or access-window timestamps tied to a request.
-- Revoke locally before Guesty field cleanup. Cleanup uses persistent backoff,
-  bounded writes, and seven-day tombstones. Heal a stale custom-field ID only
-  for narrowly classified field-reference failures; a generic 404 or transient
-  failure must not cause an endless rotate/recreate loop.
-- A locally confirmed door link is not permanent proof of Guesty's current
-  field value. Re-read current stays every normal reservation interval,
-  bookings starting within 24 hours hourly, and more distant stays daily. Audit
-  at most two links per pass with normal API headroom reserved. If Guesty is
-  empty or contains another instance's/older URL, republish the current URL
-  without rotating its still-valid token. An `unknown_token` request may queue
-  one current-stay audit, but that public trigger must be rate-limited and must
-  never create request-amplification traffic. A failed read preserves the last
-  locally confirmed link and uses persistent backoff.
-- External Home Assistant, logo, and favicon URLs must be credential-free HTTPS.
-  Keep branding origins tightly scoped in CSP. Reverse proxies must not cache
-  `/api/guesty/access/` and should redact token-bearing paths from logs.
-- Fire only privacy-safe audit events. Never include guest names or bearer
-  tokens in the access event.
+Live external writes are never inferred from a diagnosis or test request that
+can be satisfied locally. Obtain explicit authorization for the specific live
+mutation, freeze its target and payload after read-only preflight, and never use
+customer data in repository artifacts.
 
-## Loxone invariants
+Every agent-driven Guesty reservation write—V2 Keycode, V3 notes, reservation
+custom field, or any future write route—must use both
+`GuestyLiveTokenCache` and `GuestyLiveWriteGuard` from
+`scripts/guesty_live_write_guard.py`:
 
-- Loxone is optional per listing. A listing maps to one Miniserver and one or
-  more normal user groups. Groups with Config or user-management privileges and
-  built-in/administrative groups are not selectable.
-- Use a dedicated least-privilege service account with user-management rights,
-  never an administrator's normal account. Miniserver or reverse-proxy access
-  must be HTTPS.
-- A future reservation gets its Guesty Keycode immediately, but its Loxone user
-  is created only inside the configured provisioning lead (default six hours
-  before the allowed access start). Validity is exactly the shared early/late
-  access window, with timespan user state and remote auto-delete.
-- After that complete access window ends, the booking is cleanup-only even if
-  Guesty has not yet changed its status. Do not generate or mirror another PIN
-  for it, but always retain the remote-user and private-state cleanup duties.
-- Preserve the stable reservation-derived user UUID and numeric PIN across time
-  changes. Update validity, name, or groups in place. If a stay moves back
-  outside the lead, remove the user and recreate it later with the same Guesty
-  PIN. On a server/listing move, clean the old target before provisioning the
-  new one.
-- Guest name may be sent only when the global guest-details privacy option is
-  enabled. Otherwise use the booking ID as the remote label.
-- Loxone collision results such as `201` and `409` are not success. Delete any
-  tentative user, retain the confirmed Guesty PIN unchanged, and expose a
-  backed-off conflict until the user changes the Keycode in Guesty.
-- Persist a private connection snapshot only while required to clean a remote
-  user after configuration changes. On cancellation, remove plaintext first
-  and retain only a code-free cleanup tombstone if deletion fails.
-- Stale Guesty data never permits code generation or access extension. With the
-  default offline option enabled, a provider may create/update access only from
-  a previously Guesty-confirmed private PIN snapshot and exactly its stored
-  start/end window. Strict offline mode disables even that grant. The stored
-  end time must trigger cleanup in both modes.
+- reuse one credential-bound private token instead of repeatedly minting OAuth
+  tokens;
+- arm only after preflight; the first attempt waits 30 seconds;
+- allow at most two attempts per run, with diagnosis and another 30-second wait
+  before the second;
+- count failed, rejected, timed-out, and ambiguous writes as attempts;
+- never delete or bypass guard state to force another attempt.
 
-## TTLock invariants
-
-- TTLock is an optional independent destination that reuses the shared Guesty
-  reservation and numeric PIN. It must not create another Guesty poller or a
-  second PIN lifecycle.
-- Support only configured Open Platform regions and compatible V4 locks with
-  `keyboardPwdVersion=4` and `hasGateway=1`. A listing may map to one to six
-  locks.
-- The TTLock App password is used once for OAuth and is not stored. Access and
-  refresh tokens live in the private store and are bound to the matching region,
-  client ID, and username. Blank secrets during reconfiguration mean “keep the
-  existing secret”; never put stored secrets back into UI fields.
-- TTLock refresh tokens rotate. Repeated options-flow validation for an unchanged
-  account must use the live manager session and persist any rotated token before
-  returning. A successful password-based repair must update the live client and
-  private store and immediately release `authentication_failed` retry backoff.
-  Never let a temporary config-flow client consume the worker's refresh token
-  without handing the replacement back.
-- TTLock's OAuth protocol requires an MD5 digest of the app password. Keep the
-  narrowly scoped `usedforsecurity=False` implementation and its explanation;
-  do not replace it as a generic password-hashing choice or expose the password.
-- Provision only within the configured lead, using the shared early/late
-  validity window. Booking time changes update existing passcodes without PIN
-  rotation. Moving a stay outside the lead removes the remote passcode and adds
-  it later with the same Guesty PIN.
-- Persist the current desired Guesty access-window fingerprint separately from
-  each lock's remotely confirmed window. A recently verified passcode is ready
-  only while both match; any fresh booking-time change must bypass the normal
-  30-minute verification shortcut until TTLock confirms the new period.
-- When TTLock is enabled or repaired after a stay has already started, clamp a
-  previously undelivered lock's remote start to the first reconciliation time
-  and persist that per-lock value. Reuse it across retries and restarts so the
-  start never drifts forward; never extend the confirmed checkout end. Preserve
-  the original start of an already confirmed healthy passcode during upgrades.
-- Track every lock independently. Persist partial successes so one offline
-  gateway causes targeted retry, not duplicate creation on successful locks.
-- Before add, check for code conflicts. A remote conflict deletes any tentative
-  managed passcode and enters backoff; it never requests an automatic Guesty
-  PIN rotation.
-- Use a privacy-safe hashed reservation marker for ambiguous-create recovery and
-  ownership checks. Before change/delete, verify that the remote passcode ID
-  still has the expected marker. Never alter foreign or manually renamed codes.
-- Reconcile drift no more often than every 30 minutes and coalesce passcode
-  reads per lock. During a Guesty outage, use only an enabled confirmed private
-  snapshot and its exact stored window; never derive a TTLock extension from a
-  stale reservation projection. Cleanup still runs at the stored end time.
-- Disabling, remapping, cancellation, or integration removal deletes only
-  confirmed managed passcodes. After best-effort removal, do not orphan
-  unreachable OAuth credentials in a store with no future retry owner.
-
-## Privacy, storage, and diagnostics
-
-- Guest names and confirmation codes are hidden and not persisted by default.
-  They may be exposed only after explicit opt-in and must remain unrecorded
-  entity attributes where applicable.
-- The current-guest sensor and door-link sensor are disabled by default. Future
-  reservation calendars remain useful without guest PII.
-- Every Home Assistant `Store` containing private state must remain
-  `private=True` with atomic writes and validate loaded structures defensively.
-- Credentials belong in config-entry/private storage only. Never place them in
-  entity state, diagnostics, events, markers, log messages, or README examples.
-- Diagnostics hash listing IDs and report operational state only. Preserve the
-  explicit redaction/removal of Guesty credentials, webhook identifiers and
-  secrets, access mappings/fields, Loxone servers, TTLock accounts/tokens,
-  remote IDs, PINs, names, and confirmation codes.
-- Build diagnostic options from a reviewed safe allowlist. Never copy all
-  config-entry options and then try to subtract known secrets: newly introduced
-  options remain private until explicitly approved for diagnostics.
-
-## Home Assistant lifecycle, entities, and configuration
-
-- Create occupancy sensor, calendar, and applicable disabled-by-default
-  diagnostic entities for each listing. Add newly discovered listings exactly
-  once and remove deleted listings from runtime and the entity registry.
-- Occupancy is only `vacant`/`occupied`; the calendar contains current and
-  future active bookings. Calendar and current-guest content obey the privacy
-  option.
-- Keep config and options flows fully UI-driven with short helpful descriptions
-  and official setup links. Preserve values across multi-step forms and
-  migrations.
-- Use `vol.Schema` with deliberate extra-key handling in repeated/stale frontend
-  submissions. Applying Home Assistant's suggested-value helper can rebuild a
-  schema with `PREVENT_EXTRA`; restore `REMOVE_EXTRA` where the flow relies on
-  it. This previously produced “extra keys not allowed” and “Unknown error”
-  failures in Loxone/TTLock setup.
-- Every schema returned to the frontend must be convertible by
-  `voluptuous_serialize` with Home Assistant's custom serializer. Do not place
-  plain custom Python validator functions directly in a UI schema; use
-  serializable Voluptuous validators/selectors and perform extra normalization
-  inside the flow step. Keep a conversion regression test for every root or
-  multi-step form.
-- Empty password/client-secret fields on an unchanged identity preserve the
-  stored value. A changed identity requires fresh validation. Guesty credential
-  reconfiguration must verify the issued token's stable `accountId` against the
-  previous account identity, rather than comparing API-user IDs, and preserve
-  all options/mappings/private state.
-- A config-entry credential update has exactly one reload owner. For a loaded
-  entry the registered update listener performs the reload; for an entry that
-  is not loaded the config flow schedules it explicitly. Never combine the
-  listener with `async_update_reload_and_abort`, which can reload twice.
-- Keep setup/unload cancellation-safe. Managers own their tasks, timers, and
-  listeners and must cancel them on unload. No background task should survive a
-  failed setup or reload. The exact occupancy transition callback is an owned
-  task too, not an untracked fire-and-forget coroutine.
-- The bundled brand asset is user-provided and should not be regenerated or
-  replaced casually. Home Assistant integration branding and the HACS catalog
-  icon have separate metadata/cache paths; do not assume one automatically
-  fixes the other.
-
-## Availability and failover
-
-- Network and API outages are expected. Continue automatically after recovery
-  with bounded backoff and the last safe snapshot; never require a manual reload
-  for a normal transient outage.
-- Stale source data must never generate a PIN, infer a booking, or extend a
-  confirmed window. The optional offline path may use only a previously
-  confirmed PIN and exact stored interval; previously stored end times always
-  continue to revoke/clean up access.
-- Supported backup design is active/passive only. Run exactly one Home Assistant
-  instance as the active writer. On deliberate failover, the new instance
-  adopts the stable value from the matching Guesty PIN mirrors and repairs an
-  empty mirror; it may overwrite the old door-link custom field with its own
-  link. Door-link continuity is less important than PIN continuity.
-- Do not promise active/active behavior or use a third shared custom field to
-  coordinate writers. The PIN mirrors are business data, not a writer lease.
-  Parallel writers can create competing URLs, remote
-  objects, PIN conflicts, and unnecessary API traffic.
+Live Loxone, TTLock, lock, webhook, or other destructive external operations
+also require explicit authorization and the narrowest possible target. Prefer
+local mocks and regression tests.
 
 ## Change and regression discipline
 
-Before editing, trace the entire affected path: API/model → coordinator/storage
-→ manager → entity/config flow → diagnostics/documentation. Preserve
-backward-compatible config-entry and private-store migrations.
+For every bug fix:
 
-When a release changes how a persisted failure is resolved, increment the
-corresponding retry-state migration version and add a fixture using the exact
-previous version. Corrected code alone does not clear stored future retry
-timestamps. A migration may clear obsolete retry metadata and requeue the exact
-stored operation, but must preserve PINs, tokens, remote ownership, cleanup
-state, and all global traffic limits.
-
-For every bug:
-
-1. Add or update a focused regression test that reproduces the failure.
+1. Add or update a focused test that reproduces the old failure.
 2. Fix the smallest responsible layer without bypassing the invariants above.
-3. Test ambiguous network outcomes, stale data, cancellation/unload, and
-   cleanup when the change touches access control or external writes.
-4. Verify no new secret or PII appears in logs, state, diagnostics, events, or
-   persisted general cache.
+3. When access control, persistence, or external writes are affected, cover
+   ambiguous outcomes, stale data, restart/unload, partial success, and cleanup.
+4. Preserve backward-compatible config-entry/private-store migrations.
+5. Verify no new secret or PII reaches logs, state, diagnostics, events, or the
+   general cache.
 
-High-risk regression areas include:
+When corrected code must reinterpret persisted failures, increment the relevant
+retry-state migration version and test a fixture from the exact prior version.
+Never clear stored retry state by sacrificing PINs, tokens, ownership, cleanup,
+or global traffic limits.
 
-- planned Guesty times overriding stale UTC values;
-- sparse responses omitting `notes` or `customFields`;
-- fragmented HTTP bodies and size limits;
-- OAuth refresh stampedes and late `401` responses;
-- non-idempotent create recovery;
-- duplicate PIN ownership and immutable confirmed PIN handling;
-- webhook-created PINs must be allocated once in private state after a verified
-  source read, must not be written before the persisted one-minute boundary,
-  retry only on minute boundaries through minute five, and then return to the
-  ordinary persistent backoff without bypassing the global two-PUT/30-second
-  budget or rotating the allocated PIN;
-- booking/listing/mapping changes after provisioning;
-- partial multi-lock success and foreign-object ownership checks;
-- repeated options-form submissions and blank-secret preservation;
-- webhook signing-secret migration without delete/create loops;
-- task/timer cleanup during reload, failed setup, and integration removal.
+High-risk areas requiring direct regression coverage include sparse Guesty
+fields, planned-time precedence, fragmented/oversized HTTP bodies, OAuth
+stampedes, non-idempotent recovery, immutable confirmed PINs, webhook one-minute
+PIN publication, booking/mapping changes after provisioning, multi-lock partial
+success, options-form secret preservation, and cancellation-safe teardown.
 
-## Validation
+## Validation profiles
 
-Use the repository virtual environment when available. A complete validation
-before a release is:
+Use the shared runner so local instructions and CI cannot drift:
 
 ```bash
-.venv/bin/python -m pytest -W error \
-  --cov=custom_components/guesty \
-  --cov-report=term-missing \
-  --cov-fail-under=80
-.venv/bin/ruff check custom_components scripts tests
-.venv/bin/ruff format --check custom_components scripts tests
-.venv/bin/python -m compileall -q custom_components scripts tests
-.venv/bin/bandit -q -r custom_components/guesty -ll
-.venv/bin/python -m pip_audit -r requirements-runtime.txt
-.venv/bin/python -m pip check
-git diff --check
+# During iteration: inferred/explicit affected tests, Ruff, compile, knowledge,
+# and diff checks. At least one existing path or pytest node is required.
+.venv/bin/python scripts/validate_project.py focused \
+  custom_components/guesty/api.py tests/test_api.py::test_name
+
+# Before handing off any completed code change: complete tests and static checks,
+# knowledge validation, repository-owned JSON parsing, and diff checks.
+.venv/bin/python scripts/validate_project.py standard
+
+# Before publication and after cross-cutting/security-sensitive changes: standard
+# checks plus coverage floor, Bandit, runtime dependency audit, and pip check.
+.venv/bin/python scripts/validate_project.py release
 ```
 
-Also parse every JSON file. CI runs the tests and static checks on Python 3.13
-and 3.14. The integration intentionally has no third-party runtime dependency;
-Home Assistant supplies `aiohttp` and `voluptuous`.
+Documentation-only changes run the focused profile with the changed document;
+knowledge changes must also run `tests/test_knowledge_validation.py`. The JSON
+validator checks only tracked and unignored new repository JSON files; it never
+walks `.venv`, `.git`, caches, or build directories.
 
-## Documentation and release rules
+CI runs the release profile on Python 3.13 and 3.14. Do not weaken a check or
+coverage floor to make unrelated failures disappear. Fix the cause or report
+the genuine blocker.
+
+## Documentation and release
 
 - Update README, config-flow strings, German/English Home Assistant
-  translations, tests, this file, and affected `KNOWLEDGE.md` entries whenever
-  the user-facing contract changes. The guest portal itself must retain German,
-  English, Spanish, and French.
-- When documenting times, use the actual tested precedence in this file. Do not
-  reintroduce the older “UTC always wins over planned time” description.
-- Do not publish, push, tag, or create a GitHub release merely because code was
-  changed. Publication requires an explicit user request.
-- For an explicit HACS release: choose and apply the semantic version in
-  `custom_components/guesty/manifest.json`, run the complete validation, commit
-  and push `main`, wait for both Python validation jobs and security/CodeQL
-  checks to pass, then create the matching `vX.Y.Z` GitHub release/tag.
-- Verify that the release tag points to the intended commit and that the tagged
-  manifest contains the same version. HACS discovers releases from that tag;
-  a local commit or manifest bump alone is not a publication.
+  translations, tests, and affected knowledge entries whenever the user-facing
+  contract changes. The guest portal retains German, English, Spanish, and
+  French.
+- Do not publish merely because implementation is complete. Publication needs
+  an explicit user request.
+- For an authorized HACS release: choose the semantic version, update
+  `custom_components/guesty/manifest.json` and the knowledge baseline, run the
+  release profile, commit and push `main`, wait for Python and CodeQL/security
+  checks, then create the matching `vX.Y.Z` GitHub release/tag.
+- Verify the release tag points to the intended commit and its manifest has the
+  same version. A local commit or version bump alone is not a publication.
