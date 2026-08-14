@@ -117,7 +117,7 @@
       },
       "loxone": {
         "title": "Loxone Reservierungs-PINs",
-        "description": "Pro Reservierung wird ein stabiler sechsstelliger Code erzeugt und über die in den allgemeinen Optionen aktivierten Guesty-PIN-Quellen synchronisiert. Das native Keycode und das konfigurierbare Reservierungs-Custom-Field können einzeln oder gemeinsam verwendet werden; gültige manuelle Änderungen in einer aktiven Quelle werden mit Loxone und TTLock synchronisiert. Sobald Guesty einen Code bestätigt hat, wird er nie automatisch geändert. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
+        "description": "Pro Reservierung wird ein stabiler sechsstelliger Code erzeugt und über die in den allgemeinen Optionen aktivierten Guesty-PIN-Quellen synchronisiert. Das native Keycode und das konfigurierbare Reservierungs-Custom-Field können einzeln oder gemeinsam verwendet werden. Eine gültige manuelle Änderung in nur einer Quelle wird übertragen; unterscheiden sich beide gleichzeitig, gewinnt das native Keycode. Leere, ungültige oder doppelte Eingaben werden mit dem gespeicherten bestätigten Code repariert. Der Loxone-Benutzer wird erst kurz vor Zugangsbeginn angelegt und nach Zugangsende automatisch gelöscht. Es gelten dieselben Früh-/Spät-Zeiten wie für die Türlinks.",
         "data": {
           "loxone_provision_lead_minutes": "Loxone-Benutzer vor Zugangsbeginn anlegen (Minuten)",
           "loxone_code_prefix": "Reservierter PIN-Präfix (1–2 Ziffern)",

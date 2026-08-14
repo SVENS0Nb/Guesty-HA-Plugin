@@ -24,6 +24,7 @@ from custom_components.guesty.const import (
     CONF_CLIENT_SECRET,
     CONF_LOXONE_ENABLED,
     CONF_LOXONE_LISTING_MAPPINGS,
+    CONF_PIN_CUSTOM_ENABLED,
     CONF_PIN_NATIVE_ENABLED,
     CONF_TTLOCK_ENABLED,
     CONF_TTLOCK_LISTING_MAPPINGS,
@@ -401,6 +402,9 @@ async def test_duplicate_reservation_webhooks_are_coalesced(hass, monkeypatch) -
 
     instance._async_apply_reservation_webhook.assert_awaited_once_with(
         "65f19af19824d7e6ff848f11"
+    )
+    assert (
+        instance.reservation_webhook_received_at("65f19af19824d7e6ff848f11") is not None
     )
 
 
@@ -959,6 +963,160 @@ async def test_targeted_webhook_enriches_mapped_reservation_from_v3(hass) -> Non
     client.async_get_reservation_key_codes.assert_awaited_once_with({reservation_id})
     assert instance.data.reservations[0].key_code == "788888"
     assert instance.data.reservations[0].key_code_observed is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_webhook_exposes_custom_field_change(hass) -> None:
+    """A manual custom-field edit reaches PIN reconciliation immediately."""
+    reservation_id = "507f1f77bcf86cd799439011"
+    base = _reservation(reservation_id)
+    enriched = _reservation(reservation_id)
+    enriched.custom_fields = {"field-id": "734567"}
+    enriched.custom_fields_observed = True
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(side_effect=[base, enriched]),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_CLIENT_ID: "client", CONF_CLIENT_SECRET: "secret"},
+        options={
+            CONF_LOXONE_ENABLED: True,
+            CONF_LOXONE_LISTING_MAPPINGS: {"listing-1": {}},
+            CONF_PIN_NATIVE_ENABLED: False,
+            CONF_PIN_CUSTOM_ENABLED: True,
+        },
+    )
+    instance = _coordinator(hass, client=client, storage=storage, entry=entry)
+
+    await instance._async_apply_reservation_webhook(reservation_id)
+
+    assert instance.data.reservations[0].custom_fields == {"field-id": "734567"}
+    assert instance.data.reservations[0].custom_fields_observed is True
+    assert client.async_get_reservation.await_args_list == [
+        call(reservation_id),
+        call(
+            reservation_id,
+            include_key_code=False,
+            include_custom_fields=True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_webhook_prunes_without_pin_enrichment(hass) -> None:
+    """A cancellation takes the shortest path to provider cleanup."""
+    reservation_id = "507f1f77bcf86cd799439011"
+    active = _reservation(reservation_id)
+    canceled = _reservation(reservation_id)
+    canceled.status = "canceled"
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    cache["reservations"] = [active.to_dict()]
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(return_value=canceled),
+        async_get_reservation_key_codes=AsyncMock(),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+    listener = MagicMock()
+    remove_listener = instance.async_add_listener(listener)
+
+    await instance._async_apply_reservation_webhook(reservation_id)
+
+    assert instance.data.reservations == []
+    client.async_get_reservation.assert_awaited_once_with(reservation_id)
+    client.async_get_reservation_key_codes.assert_not_awaited()
+    listener.assert_called_once_with()
+    remove_listener()
+
+
+@pytest.mark.asyncio
+async def test_targeted_pin_enrichment_failure_preserves_cancellation_fields(
+    hass,
+) -> None:
+    """A PIN-only failure cannot discard a fresh reservation update."""
+    reservation_id = "507f1f77bcf86cd799439011"
+    reservation = _reservation(reservation_id)
+    reservation.planned_arrival = "13:30"
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(
+            side_effect=[
+                reservation,
+                GuestyRetryableError("PIN projection temporarily unavailable"),
+            ]
+        ),
+        async_get_reservation_key_codes=AsyncMock(return_value={}),
+    )
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(
+        hass,
+        client=client,
+        storage=storage,
+        entry=_mapped_entry(),
+    )
+
+    await instance._async_apply_reservation_webhook(reservation_id)
+
+    current = instance.data.reservations[0]
+    assert current.planned_arrival == "13:30"
+    assert current.key_code_read_failed is True
+    assert current.custom_fields_read_failed is True
+    assert storage.async_save.await_args.args[0]["pin_enrichment_retry_needed"] is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_reservation_error_falls_back_to_shared_refresh(hass) -> None:
+    """A failed exact read requests one normal coordinator refresh."""
+    client = SimpleNamespace(
+        async_get_reservation=AsyncMock(
+            side_effect=GuestyRetryableError("temporary outage")
+        )
+    )
+    instance = _coordinator(hass, client=client)
+    instance.async_refresh = AsyncMock()
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    instance.async_refresh.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_missing_targeted_reservation_is_removed_then_refreshed(hass) -> None:
+    """A transient 404 removes stale access and still schedules a safety read."""
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    cache["reservations"] = [_reservation().to_dict()]
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    client = SimpleNamespace(async_get_reservation=AsyncMock(return_value=None))
+    instance = _coordinator(hass, client=client, storage=storage)
+    instance.async_refresh = AsyncMock()
+
+    await instance._async_apply_reservation_webhook("reservation-1")
+
+    assert instance.data.reservations == []
+    instance.async_refresh.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

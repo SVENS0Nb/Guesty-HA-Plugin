@@ -263,14 +263,23 @@ Vor der Aktivierung sollte in Guesty unter **Account settings → Custom fields 
 Reservations** ein Textfeld mit der Variable `{{door_code}}` vorhanden sein.
 Ist bereits ein anderes Reservierungsfeld eingerichtet, wird stattdessen dessen
 Name, Variable oder ID in Home Assistant eingetragen. Ein bereits gefülltes
-Feld wird nicht überschrieben: Sein gültiger eindeutiger PIN wird übernommen
-und in den leeren zweiten Spiegel übertragen.
+Feld wird übernommen und in den leeren zweiten Spiegel übertragen. Sind beide
+aktivierten Felder unterschiedlich befüllt, entscheidet die unten beschriebene
+Änderungslogik eindeutig, welcher Wert beibehalten wird.
 
 Die Funktion prüft keinen Zahlungsstatus. Sie arbeitet mit denselben aktiven
 Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
-`awaiting_payment`, `checked_in` und entsprechende Guesty-Varianten). Dadurch
-wird der Code auch für eine zukünftige Reservierung unmittelbar nach Webhook
-oder spätestens beim nächsten normalen Reservierungsabgleich erzeugt. Der
+`awaiting_payment`, `checked_in` und entsprechende Guesty-Varianten). Nach
+einem verifizierten Webhook-Abgleich wird der Code für eine neue zukünftige
+Reservierung unmittelbar im privaten Home-Assistant-Speicher reserviert; ohne
+Webhook entsteht er spätestens beim nächsten normalen Reservierungsabgleich.
+Bei einem neuen Webhook-PIN wartet die Integration vor dem ersten Guesty-PUT
+bewusst eine Minute, damit Guestys Buchungsmodell vollständig verfügbar wird.
+Bleibt die Veröffentlichung erfolglos, folgen weitere persistente Versuche an
+den Minutenmarken zwei, drei, vier und fünf. Danach greift wieder der normale
+traffic-schonende Fehler- und Warteschlangen-Backoff. Ein
+Home-Assistant-Neustart setzt weder den reservierten PIN noch dieses Zeitfenster
+zurück. Der
 PIN-Prozess ignoriert eine Buchung vollständig, sobald ihr konfigurierter
 Zugangszeitraum einschließlich Nachlauf beendet ist, selbst wenn Guesty ihren
 Status noch nicht aktualisiert hat. Die notwendige Löschung bereits angelegter
@@ -296,9 +305,11 @@ tägliche Vollabgleich in von Guesty erlaubten Zehner-Batches gelesen. Schlägt
 nur eine optionale PIN-Abfrage fehl, bleiben Buchungszeiten, Status, Kalender
 und notwendige Zugangslöschungen aktuell. Das Plugin erzeugt oder überschreibt
 dann keinen möglicherweise bereits vorhandenen Code blind, sondern versucht
-die PIN-Abfrage beim nächsten gemeinsamen Abgleich erneut. Guesty-Schreibversuche beider
-Spiegel teilen sich ein persistentes globales Limit von höchstens zwei PUTs je
-30 Sekunden. Jeder Schreibplatz berücksichtigt zusätzlich bis zu drei
+die PIN-Abfrage beim nächsten gemeinsamen Abgleich erneut.
+Guesty-Schreibversuche beider Spiegel teilen sich auch im fünfminütigen
+Webhook-Schnellfenster ein persistentes globales Limit von höchstens zwei PUTs
+je 30 Sekunden. Es entstehen keine zusätzlichen Poller oder ungebremsten
+Schreibschleifen. Jeder Schreibplatz berücksichtigt zusätzlich bis zu drei
 Bestätigungsabfragen und wird unmittelbar vor dem Schreiben noch einmal gegen
 das gemeldete API-Limit geprüft. Für eine unbekannte Reservierung wird zuerst
 V3 verwendet. Antwortet der V3-Notizenpfad mit 404, obwohl genau diese
@@ -412,8 +423,11 @@ erlaubten Türen müssen deshalb über die Gruppen-/Bausteinrechte begrenzt werd
 
 #### 5. Funktion prüfen
 
-1. Eine zukünftige Testreservierung anlegen. Kurz nach Webhook beziehungsweise
-   spätestens nach dem normalen Abgleich müssen alle in den allgemeinen
+1. Eine zukünftige Testreservierung anlegen. Direkt nach dem gezielten
+   Webhook-Abgleich muss bereits ein stabiler PIN intern vorhanden sein. Der
+   erste Guesty-Schreibversuch erfolgt nach einer Minute; bei einem temporären
+   Fehler folgen Versuche bis einschließlich Minute fünf, danach die normale
+   Warteschlange. Spätestens nach erfolgreicher Veröffentlichung müssen alle in den allgemeinen
    Optionen **aktivierten** Guesty-PIN-Quellen denselben sechsstelligen Wert
    anzeigen. Deaktivierte Quellen werden bewusst weder gelesen noch
    beschrieben. Bei der erstmaligen
@@ -455,18 +469,33 @@ abgelehnt.
 - Für jeden Spiegel speichert die Integration separat den zuletzt bestätigten
   Wert. Wird genau eines der Felder manuell geändert, ist diese Änderung der
   neue Richtwert: Der andere Guesty-Spiegel sowie bereits angelegte Loxone- und
-  TTLock-Zugänge werden angeglichen. Das ausdrückliche Leeren nur eines
-  Spiegels löscht keinen Zugang, sondern stellt den bestätigten Wert wieder her.
-- Werden beide Felder gleichzeitig auf verschiedene Werte geändert oder sind
-  sie bei der erstmaligen Übernahme widersprüchlich, schreibt die Integration
-  keinen Wert blind zurück. Bestehende Loxone- und TTLock-Zugänge werden
-  gesperrt beziehungsweise entfernt und der Status zeigt `Konflikt`. Ebenso
-  werden ungültige oder doppelt verwendete PINs fail-closed behandelt.
+  TTLock-Zugänge werden angeglichen. Werden beide Felder gleichzeitig auf
+  unterschiedliche gültige Werte geändert oder sind sie bei der erstmaligen
+  Übernahme widersprüchlich, hat Guestys natives **Keycode** Vorrang und wird in
+  das Custom Field übertragen. Eine nachweislich noch ausstehende alte
+  Spiegel-Schreiboperation kann dabei keinen neueren bestätigten Wert
+  zurückdrehen.
+- Das ausdrückliche Leeren eines oder beider Spiegel löscht keinen Zugang:
+  Beide Felder werden wieder mit dem privat gespeicherten bestätigten Code
+  gefüllt. Auch ein ungültiger oder bereits für eine andere aktive Reservierung
+  verwendeter Eintrag wird verworfen und durch den gespeicherten Code dieser
+  Reservierung ersetzt. Gibt es für eine neue Reservierung noch keinen
+  gespeicherten Code, erzeugt die Integration einmalig einen neuen eindeutigen
+  PIN.
 - Sobald mindestens einer der beiden Guesty-Spiegel den eindeutigen PIN
   bestätigt hat, kann die zeitlich begrenzte Zustellung fortfahren. Ein Fehler
   des nativen Keycode-Endpunkts blockiert daher das funktionierende Custom
   Field nicht – und umgekehrt. Der zweite Spiegel wird mit persistentem Backoff
   nachgezogen.
+- Für eine neue, über Webhook gemeldete Reservierung erzeugt die Integration
+  den PIN nur dann sofort intern, wenn mindestens eine aktivierte Quelle
+  erfolgreich gelesen wurde und keine aktivierte Quelle bereits einen Wert
+  liefert. Der erste PUT bleibt bis Minute eins gesperrt. Fehlversuche werden
+  bis Minute fünf minutengenau wieder eingeplant; das globale Limit von zwei
+  PUTs je 30 Sekunden und Guestys gemeldete API-Reserve haben weiterhin Vorrang.
+  Nach dem fünften Minutenfenster beginnt der bestehende normale Backoff. Diese
+  Zeitdaten und der PIN liegen im privaten atomaren Speicher und überleben einen
+  Neustart.
 - Ein konfigurierter Bestätigungszusatz gehört nur zur Guesty-Anzeige und nie
   zum eigentlichen Zugangscode. Beim Lesen trennt die Integration einen kurzen
   nichtnumerischen Zusatz sicher vom sechsstelligen PIN. Wird der Zusatz in den
@@ -474,9 +503,11 @@ abgelehnt.
   neuen Anzeigeformat neu, ohne den PIN in Loxone oder TTLock zu ändern.
 - Wird ein manuell eingetragener Code bereits von einer anderen bekannten
   aktiven Guesty-Buchung verwendet, behält die bisherige Buchung ihren Zugang.
-  Die Buchung mit dem duplizierten Eintrag wird gesperrt; die Integration
-  verändert keinen der beiden Guesty-Codes. Nach einer manuellen Änderung auf
-  einen eindeutigen Wert wird die Bereitstellung automatisch fortgesetzt.
+  Bei der Buchung mit dem duplizierten Eintrag stellt die Integration den zuvor
+  gespeicherten eigenen Code in beiden Guesty-Feldern wieder her. Für eine noch
+  nie bestätigte neue Reservierung wird stattdessen ein neuer eindeutiger Code
+  erzeugt. Die Wiederherstellung unterliegt demselben persistenten Limit von
+  höchstens zwei Guesty-PUTs je 30 Sekunden.
 - Eine Kollision mit einem ausschließlich in Loxone vorhandenen Code kann die
   Loxone-API erst beim tatsächlichen Zuweisen erkennen. Bei zukünftigen
   Buchungen erfolgt diese Prüfung daher erst innerhalb des konfigurierten
@@ -754,7 +785,14 @@ flowchart TD
    `reservation.created.v2` und `reservation.updated.v2` werden nach einer
    kurzen 0,75-s-Sammelphase verarbeitet. Die Integration prüft die von Guesty
    bereitgestellte HMAC-Signatur; Duplikate und Ereignis-Bursts erzeugen dadurch
-   möglichst wenige API-Aufrufe. Bestehende Abonnements ohne Signatur-Secret
+   möglichst wenige API-Aufrufe. `reservation.updated.v2` deckt sowohl manuelle
+   Änderungen an Keycode beziehungsweise dem konfigurierten PIN-Custom-Field als
+   auch Statusänderungen wie eine Stornierung ab. Nach dem Ereignis liest die
+   Integration die betroffene Reservierung gezielt neu. Eine Stornierung entfernt
+   sie sofort aus dem aktiven Snapshot und stößt damit die Löschung der verwalteten
+   Loxone- und TTLock-Zugänge an. Webhook-Echos eigener bestätigter Feldschreibvorgänge
+   werden anhand der gespeicherten Spiegelwerte als bereits synchron erkannt und
+   lösen keinen weiteren PUT aus. Bestehende Abonnements ohne Signatur-Secret
    werden einmalig sicher neu erstellt; schlägt auch danach der Secret-Abruf
    fehl, bleibt der Polling-Fallback aktiv, ohne eine Neuanlage-Schleife.
    Vorübergehende Registrierungsfehler werden mit begrenztem exponentiellem

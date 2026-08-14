@@ -143,10 +143,14 @@ for a disabled provider must not trigger an unnecessary startup full sync.
 ### KB-GUESTY-001 — Polling, full sync, and webhook traffic model
 
 - Status: Validated
-- Last validated: 2026-07-29
+- Last validated: 2026-08-14
 - Evidence: `custom_components/guesty/const.py`,
   `custom_components/guesty/coordinator.py`,
-  `tests/test_coordinator.py`
+  `tests/test_coordinator.py::test_targeted_webhook_exposes_custom_field_change`,
+  `tests/test_coordinator.py::test_cancellation_webhook_prunes_without_pin_enrichment`,
+  `tests/test_loxone.py::test_native_write_webhook_echo_does_not_create_write_loop`,
+  [Guesty reservation webhooks](https://open-api-docs.guesty.com/docs/webhooks-reservations),
+  [Guesty webhook v2 events](https://open-api-docs.guesty.com/changelog/2026-03-12)
 
 The default reservation poll is 300 seconds. Reservation polls are incremental
 with a five-minute overlap, plus a daily full reservation sync. Listing safety
@@ -159,6 +163,18 @@ Webhooks are the fast path: one reservation event uses a targeted read, bursts
 are debounced/coalesced, sufficient listing payloads are applied directly,
 missing details alone are fetched, removed listings are pruned immediately, and
 a new listing requests reservations only for that listing.
+
+Guesty exposes reservation alterations through the general
+`reservation.updated.v2` event rather than separate Keycode, custom-field, or
+cancellation event types. A targeted refresh therefore reads both enabled PIN
+mirrors for an active mapped reservation, allowing a manual edit to reach PIN
+reconciliation and existing Loxone/TTLock objects. An inactive status is merged
+out immediately after the base reservation read and deliberately skips optional
+PIN enrichment, shortening the path to provider cleanup. Guesty can also emit
+this event for the integration's own confirmed PIN PUT. Per-source confirmed
+baselines make that read-back idempotent; equal values perform no further PUT,
+while duplicate deliveries are coalesced. The normal poll remains the safety
+net because webhook delivery is not an exactly-once or hard real-time contract.
 
 A targeted listing or reservation update does not prove that the complete
 reservation snapshot is fresh. It therefore preserves the last successful
@@ -272,12 +288,12 @@ only when the same refresh also observed that exact reservation through the V2
 Keycode projection; without that pair it remains unreadable. The same distinction
 applies to a sparse reservation custom-field projection: an omitted requested
 `customFields` container is marked unreadable and retried by the shared full
-refresh, never by one exact request per reservation. An explicit invalid value
-fails closed. An explicitly empty value
-in only one mirror is repaired from the other confirmed mirror; two empty
-changed mirrors are ambiguous and fail closed according to `KB-PIN-001`. An
-explicitly populated top-level V2 `keyCode` must not be erased merely because
-the alternate V3 projection is empty or sparse.
+refresh, never by one exact request per reservation. An explicitly empty or
+invalid value is different from an omitted projection: it is observed input
+and is repaired from the reservation's saved confirmed PIN according to
+`KB-PIN-001`. This applies to one or both mirrors. An explicitly populated
+top-level V2 `keyCode` must not be erased merely because the alternate V3
+projection is empty or sparse.
 
 ### KB-GUESTY-005 — Door links use reservation custom fields, not Keycode
 
@@ -732,12 +748,18 @@ are available only after explicit privacy opt-in.
 ### KB-PIN-001 — Native Keycode and a custom field are reconciled mirrors
 
 - Status: Validated
-- Last validated: 2026-08-04
+- Last validated: 2026-08-13
 - Evidence: `custom_components/guesty/loxone.py`,
   `tests/test_loxone.py::test_existing_custom_field_pin_is_adopted_and_fills_native`,
   `tests/test_loxone.py::test_custom_only_mode_ignores_native_keycode_completely`,
   `tests/test_loxone.py::test_native_only_mode_ignores_custom_field_completely`,
   `tests/test_loxone.py::test_confirmed_v2_route_is_cached_while_custom_mirror_stays_active`,
+  `tests/test_loxone.py::test_simultaneous_different_manual_edits_prefer_native_keycode`,
+  `tests/test_loxone.py::test_both_empty_guesty_mirrors_restore_saved_code`,
+  `tests/test_loxone.py::test_queued_saved_pin_repair_keeps_existing_provider_access`,
+  `tests/test_loxone.py::test_invalid_guesty_edit_restores_saved_code`,
+  `tests/test_loxone.py::test_manual_duplicate_restores_editor_previous_saved_code`,
+  `tests/test_loxone.py::test_persisted_legacy_duplicate_conflict_restores_source_baseline`,
   `tests/test_config_flow.py::test_options_flow_preserves_legacy_pin_custom_field_suggestion`,
   manual-source edit, mismatch, sparse-response, and retry tests
 
@@ -761,23 +783,29 @@ the shared `pin_custom_field` key and removes the legacy key.
 The deterministic merge rules are:
 
 1. Both empty and no confirmed private PIN: generate one PIN once.
-2. Exactly one populated: adopt it and fill only the empty mirror.
+2. Exactly one populated and no confirmed private PIN: adopt it and fill only
+   the empty mirror.
 3. Both equal: adopt without a write.
 4. Exactly one differs from its source baseline: treat that valid unique manual
    edit as canonical and propagate it to the other mirror and providers.
-5. One explicitly emptied while the other retains the canonical value: restore
-   the empty mirror; do not delete or rotate the PIN.
-6. Both changed to different values, or an unexplained initial mismatch: fail
-   closed and write neither field.
-7. Invalid, duplicate, or both-confirmed-and-emptied values: fail closed.
+5. One or both explicitly emptied after confirmation: restore the saved PIN to
+   every enabled mirror; do not delete or rotate it.
+6. Both changed to different values, or an unexplained initial mismatch: native
+   Keycode is authoritative and is propagated to the custom mirror. A mirror
+   that is provably stale because its write is pending or failed cannot use this
+   tie-break to revert a newer confirmed edit.
+7. Invalid or duplicate input: reject that input and restore the reservation's
+   last safe confirmed PIN. The established owner of a duplicate keeps its
+   value. If a newly observed reservation has no safe stored PIN yet, generate
+   one unique PIN once.
 
 Once either mirror has confirmed the canonical six digits, Loxone/TTLock may
 proceed. Failure of one Guesty endpoint does not block the other successful
 mirror. The failed mirror is retried with bounded persistent backoff, and its
 old value cannot be mistaken for a later manual edit. Confirmed digits never
-rotate automatically. Duplicate ownership remains deterministic: the first
-healthy established reservation keeps delivery; later duplicates stay blocked
-until manually corrected in Guesty.
+rotate automatically. Empty/invalid/duplicate repair and ordinary propagation
+share the global Guesty write budget, so recovery cannot create a write burst.
+Existing provider access remains on the saved PIN while Guesty is repaired.
 
 ### KB-PIN-002 — Generated PINs and display suffixes are separate
 
@@ -855,6 +883,38 @@ pass may have reduced it. When no envelope fits, managers wait at least until
 the next configured reservation poll instead of creating an immediate
 no-traffic loop. A later response without valid long-window headers clears
 obsolete headroom rather than retaining a stale block indefinitely.
+
+### KB-PIN-006 — New webhook PINs use a durable five-minute publication window
+
+- Status: Validated
+- Last validated: 2026-08-14
+- Evidence: `custom_components/guesty/coordinator.py`,
+  `custom_components/guesty/loxone.py`,
+  `tests/test_coordinator.py::test_duplicate_reservation_webhooks_are_coalesced`,
+  `tests/test_loxone.py::test_webhook_pin_is_persisted_immediately_but_first_written_after_one_minute`,
+  `tests/test_loxone.py::test_webhook_pin_fast_retry_runs_each_minute_then_uses_normal_backoff`,
+  `tests/test_loxone.py::test_webhook_pin_first_write_delay_survives_manager_restart`
+
+After a verified reservation webhook has been fetched and at least one enabled
+PIN source has been successfully observed empty, a new unique PIN is allocated
+immediately in the private atomic PIN store. A failed or unread source still
+blocks blind generation under `KB-PIN-001`; an already populated source is
+adopted instead of being replaced. Existing confirmed reservations and ordinary
+poll discoveries keep their established reconciliation behavior.
+
+The first Guesty PUT for that newly staged PIN is persistently deferred until
+one minute after webhook receipt. If publication fails, the affected mirror is
+retried on the next absolute minute boundary through minute five. A failure at
+or after the fifth-minute boundary starts the ordinary persistent failure
+backoff at count one; fast-window failures do not inflate that later backoff.
+Home Assistant reloads retain the PIN, first-write boundary, and retry window.
+Successful confirmation of every enabled mirror clears the temporary schedule.
+
+Native Keycode and custom-field writes remain independent mirrors and continue
+to share `KB-PIN-003`: no webhook path may exceed two Guesty PUT attempts in any
+30-second window or consume Guesty's reserved API headroom. When traffic or API
+headroom cannot support a minute boundary, the global limiter may postpone it;
+the fast window never authorizes a write burst or a second poller.
 
 ### KB-PIN-004 — Plaintext lifetime is deliberately bounded
 
@@ -1281,7 +1341,9 @@ validate its own native field: project the separate top-level `keyCode` instead.
 
 Automatic rotation after a duplicate, remote collision, sparse response, or
 temporary Guesty error is unsafe because the guest may already have received
-the confirmed code. Fail closed and wait for a manual Guesty correction.
+the confirmed code. Guesty-side empty, invalid, and duplicate input is now
+repaired with that same confirmed code according to `KB-PIN-001`; provider-side
+collisions still fail closed without generating a replacement.
 
 ### KB-RET-004 — UTC timestamps are not always the highest-priority times
 
@@ -1314,16 +1376,20 @@ and the controlled live test validated the different top-level
 ### KB-REL-001 — Supported validation baseline
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-08-14
 - Evidence: `.github/workflows/validate.yml`, `requirements-test.txt`,
-  `custom_components/guesty/manifest.json`
+  `custom_components/guesty/manifest.json`, full local 483-test coverage run
 
 The integration targets Home Assistant 2025.12 or newer and currently has no
 third-party runtime dependency; Home Assistant supplies `aiohttp` and
 `voluptuous`. CI validates Python 3.13 and 3.14. A full local release check runs
-pytest with warnings as errors and at least 65% coverage, Ruff check/format,
+pytest with warnings as errors and at least 80% coverage, Ruff check/format,
 compileall, Bandit, runtime dependency audit, `pip check`, JSON parsing, and
 `git diff --check`.
+
+The enforced coverage floor is 80%. Prefer behavior-oriented regression tests
+for lifecycle cleanup, webhook authentication and deduplication, coordinator
+fallbacks, and external-provider error classification over line-only tests.
 
 `pytest-homeassistant-custom-component` pins a matching Home Assistant and
 pytest version exactly. Those packages form an isolated development/test
@@ -1367,3 +1433,6 @@ tag points to the same commit and manifest version.
 | 2026-08-04 | PIN mirror queue starvation diagnosis and remediation | Live read-only diagnostics showed all 41 native mirrors confirmed while all 41 custom mirrors remained queued despite ample API headroom. Excluded already-ended active-status reservations from PIN processing and made current and nearest stays finish redundancy backfill before more distant bookings; remote cleanup remains intact. |
 | 2026-08-04 | TTLock booking-window confirmation remediation | Bound every ready/verified TTLock passcode to the current desired Guesty access-window fingerprint, made planned arrival/departure replacements immediately pending until exact remote confirmation, preserved current-stay start clamping, and added safe pending-window diagnostics. |
 | 2026-08-07 | Door-link stability remediation | Removed guest names and visible door labels from authorization fingerprints, migrated unchanged legacy records without token rotation, retained rotation for timing and mapping changes, and added privacy-safe validation diagnostics. |
+| 2026-08-13 | Focused dual-source PIN precedence and repair review | Made native Keycode the deterministic simultaneous-edit tie-breaker, restored both empty/invalid/duplicate mirrors from the saved PIN, generated only when no safe prior PIN exists, and preserved the shared write budget and stale-mirror protection. |
+| 2026-08-14 | Focused webhook PIN latency and retry review | Allocated verified new-booking PINs immediately in private state, deferred the first Guesty PUT for one minute, added durable minute-boundary retries through minute five, preserved restart continuity and the global two-PUT/30-second budget, then returned failures to normal backoff. |
+| 2026-08-14 | Risk-based coverage hardening | Added direct regression coverage for targeted-refresh fallback and deletion, cancellation-safe enrichment failure, webhook signature and body limits, entry cleanup, Loxone protocol failures, and TTLock authentication, pagination, refresh, and error classification; raised the enforced project floor from 65% to 80%. |

@@ -9,7 +9,12 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.guesty as guesty_init
-from custom_components.guesty import async_setup_entry, async_unload_entry
+from custom_components.guesty import (
+    async_remove_entry,
+    async_setup_entry,
+    async_unload_entry,
+)
+from custom_components.guesty.api import GuestyApiError
 from custom_components.guesty.const import (
     CONF_ACCESS_TOKEN,
     CONF_CLIENT_ID,
@@ -19,6 +24,7 @@ from custom_components.guesty.const import (
     CONF_PIN_CUSTOM_ENABLED,
     CONF_PIN_NATIVE_ENABLED,
     CONF_TOKEN_EXPIRES_AT,
+    CONF_GUESTY_WEBHOOK_ID,
     CONF_WEBHOOK_ID,
     DOMAIN,
 )
@@ -340,7 +346,16 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
         async_shutdown=AsyncMock(),
     )
     coordinator = SimpleNamespace(async_shutdown=AsyncMock())
-    entry.runtime_data = SimpleNamespace(scheduler=scheduler, coordinator=coordinator)
+    access_manager = SimpleNamespace(async_unload=AsyncMock())
+    loxone_manager = SimpleNamespace(async_unload=AsyncMock())
+    ttlock_manager = SimpleNamespace(async_unload=AsyncMock())
+    entry.runtime_data = SimpleNamespace(
+        scheduler=scheduler,
+        coordinator=coordinator,
+        access_manager=access_manager,
+        loxone_manager=loxone_manager,
+        ttlock_manager=ttlock_manager,
+    )
     unregister = MagicMock()
     monkeypatch.setattr(guesty_init.ha_webhook, "async_unregister", unregister)
     monkeypatch.setattr(
@@ -353,4 +368,87 @@ async def test_unload_only_removes_local_webhook(hass, monkeypatch) -> None:
 
     scheduler.async_shutdown.assert_awaited_once_with()
     coordinator.async_shutdown.assert_awaited_once_with()
+    access_manager.async_unload.assert_awaited_once_with()
+    loxone_manager.async_unload.assert_awaited_once_with()
+    ttlock_manager.async_unload.assert_awaited_once_with()
     unregister.assert_called_once_with(hass, "local-webhook")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_failure", [False, True])
+async def test_remove_entry_cleans_every_private_and_remote_resource(
+    hass, monkeypatch, remote_failure
+) -> None:
+    """Integration removal is complete even when remote cleanup is best effort."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_CLIENT_ID: "client",
+            CONF_CLIENT_SECRET: "secret",
+            CONF_GUESTY_WEBHOOK_ID: "remote-webhook",
+        },
+    )
+    entry.add_to_hass(hass)
+    storage = SimpleNamespace(
+        async_load=AsyncMock(
+            return_value={
+                "access_token": "cached-token",
+                "token_expires_at": 123.0,
+                "token_retry_at": 456.0,
+            }
+        ),
+        async_remove=AsyncMock(),
+    )
+    access_storage = SimpleNamespace(
+        async_load=AsyncMock(
+            return_value={
+                "records": {
+                    "reservation-1": {
+                        "field_synced": True,
+                        "field_id": "field-1",
+                    },
+                    "unsynced": {"field_synced": False, "field_id": "field-2"},
+                }
+            }
+        ),
+        async_remove=AsyncMock(),
+    )
+    side_effect = (
+        GuestyApiError("temporary cleanup failure") if remote_failure else None
+    )
+    client = SimpleNamespace(
+        async_unregister_webhook=AsyncMock(side_effect=side_effect),
+        async_delete_reservation_custom_field=AsyncMock(side_effect=side_effect),
+    )
+    from_hass = MagicMock(return_value=client)
+    remove_loxone = AsyncMock(return_value=not remote_failure)
+    remove_ttlock = AsyncMock(return_value=not remote_failure)
+
+    monkeypatch.setattr(guesty_init, "GuestyStorage", lambda *_args: storage)
+    monkeypatch.setattr(
+        guesty_init, "GuestyAccessStorage", lambda *_args: access_storage
+    )
+    monkeypatch.setattr(guesty_init.GuestyApiClient, "from_hass", from_hass)
+    monkeypatch.setattr(guesty_init, "async_remove_stored_loxone_users", remove_loxone)
+    monkeypatch.setattr(
+        guesty_init, "async_remove_stored_ttlock_passcodes", remove_ttlock
+    )
+
+    await async_remove_entry(hass, entry)
+
+    from_hass.assert_called_once_with(
+        hass,
+        "client",
+        "secret",
+        "cached-token",
+        123.0,
+        456.0,
+    )
+    client.async_unregister_webhook.assert_awaited_once_with("remote-webhook")
+    client.async_delete_reservation_custom_field.assert_awaited_once_with(
+        "reservation-1", "field-1"
+    )
+    storage.async_remove.assert_awaited_once_with()
+    access_storage.async_remove.assert_awaited_once_with()
+    remove_loxone.assert_awaited_once_with(hass, entry)
+    remove_ttlock.assert_awaited_once_with(hass, entry)

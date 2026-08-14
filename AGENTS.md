@@ -268,12 +268,18 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   empty, generate once. If exactly one is populated, adopt it and fill only the
   empty mirror. If both match, do not write. If exactly one changes from its
   confirmed baseline, that user edit becomes canonical and propagates to the
-  other mirror and providers. Emptying only one mirror restores it; it does not
-  delete a confirmed PIN.
-- If both mirrors change simultaneously to different values, or two populated
-  mirrors disagree without a private baseline that safely orders them, fail
-  closed and do not overwrite either field. Invalid and duplicate values are
-  also fail-closed. A confirmed PIN never rotates automatically.
+  other mirror and providers. Emptying either or both mirrors restores the
+  saved confirmed PIN; it does not delete access.
+- Native Keycode is the deterministic authority only when both enabled mirrors
+  change simultaneously to different populated values or an initial mismatch
+  has no trustworthy ordering. Normalize that Keycode into the custom mirror.
+  A stale mirror whose propagation is explicitly pending or failed remains
+  excluded from this tie-break so it cannot revert a newer confirmed edit.
+- An explicitly invalid or duplicate Guesty value is never accepted as the new
+  PIN. Restore the reservation's last safe confirmed PIN to every enabled
+  mirror. If a newly observed reservation has no saved PIN yet, generate one
+  unique PIN once and publish it through the normal bounded queue. A confirmed
+  PIN never rotates automatically.
 - Provider delivery may proceed when either Guesty mirror has confirmed the
   canonical PIN. Track errors, retry timestamps, and synchronization state per
   mirror so a failing native endpoint cannot block a healthy custom field (or
@@ -333,13 +339,14 @@ already-started schedulers, managers, webhooks, platforms, and background tasks.
   Keycode publication. After bounded backoff, retry the exact stable private PIN
   for a failed initial write, source migration, or configured suffix change;
   never rotate merely because the projection is absent.
-- An explicitly invalid or duplicate value is fail-closed. Two explicitly empty
-  mirrors after confirmation are also ambiguous and fail closed. One empty
-  mirror is repaired from the other confirmed source. A new reservation whose
-  two observed sources are initially empty may receive its first generated PIN.
-- Duplicate ownership is deterministic. The first healthy established
-  reservation keeps remote delivery; later duplicates stay blocked until a
-  user supplies a unique code in Guesty.
+- Explicitly empty, invalid, or duplicate values are repaired through the
+  persistent Guesty write budget. One or two empty mirrors receive the saved
+  PIN. Invalid input receives the saved PIN. Duplicate ownership is
+  deterministic: the healthy established reservation keeps its code and the
+  edited reservation receives its own saved PIN again. Only when that
+  reservation has no saved safe PIN yet may the integration generate one new
+  unique PIN. Existing provider access remains active while the saved value is
+  restored.
 - The actual PIN is exactly six ASCII digits. Generated codes use
   `secrets.randbelow`, the configured one- or two-digit ASCII prefix, reject weak
   sequences, and exclude every known active/private/rejected code.
@@ -669,6 +676,11 @@ High-risk regression areas include:
 - OAuth refresh stampedes and late `401` responses;
 - non-idempotent create recovery;
 - duplicate PIN ownership and immutable confirmed PIN handling;
+- webhook-created PINs must be allocated once in private state after a verified
+  source read, must not be written before the persisted one-minute boundary,
+  retry only on minute boundaries through minute five, and then return to the
+  ordinary persistent backoff without bypassing the global two-PUT/30-second
+  budget or rotating the allocated PIN;
 - booking/listing/mapping changes after provisioning;
 - partial multi-lock success and foreign-object ownership checks;
 - repeated options-form submissions and blank-secret preservation;
@@ -684,7 +696,7 @@ before a release is:
 .venv/bin/python -m pytest -W error \
   --cov=custom_components/guesty \
   --cov-report=term-missing \
-  --cov-fail-under=65
+  --cov-fail-under=80
 .venv/bin/ruff check custom_components scripts tests
 .venv/bin/ruff format --check custom_components scripts tests
 .venv/bin/python -m compileall -q custom_components scripts tests

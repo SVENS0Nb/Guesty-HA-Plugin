@@ -93,6 +93,13 @@ _GUESTY_REQUESTS_PER_WRITE_SLOT = 4
 _GUESTY_WRITE_ATTEMPTS_KEY = "guesty_write_attempts"
 _LEGACY_GUESTY_KEYCODE_WRITE_ROUTE_KEY = "guesty_keycode_write_route"
 _GUESTY_SYNC_QUEUED = "guesty_sync_queued"
+_WEBHOOK_PIN_FIRST_WRITE_DELAY = timedelta(minutes=1)
+_WEBHOOK_PIN_FAST_RETRY_WINDOW = timedelta(minutes=5)
+_WEBHOOK_PIN_RETRY_INTERVAL = timedelta(minutes=1)
+_WEBHOOK_PIN_RECEIVED_AT_KEY = "webhook_pin_received_at"
+_WEBHOOK_PIN_FIRST_WRITE_AT_KEY = "webhook_pin_first_write_at"
+_WEBHOOK_PIN_FAST_RETRY_UNTIL_KEY = "webhook_pin_fast_retry_until"
+_WEBHOOK_PIN_FAST_FAILURES_KEY = "webhook_pin_fast_failures"
 _GUESTY_KEYCODE_SOURCE = "notes.keyCode"
 _GUESTY_NATIVE_WRITE_ROUTE_KEY = "native_write_route"
 _GUESTY_NATIVE_OPERATION = "guesty_native"
@@ -1214,35 +1221,6 @@ class GuestyLoxoneManager:
             return display
         return self._guesty_code_value(code, listing_id)
 
-    async def _async_mark_dual_source_conflict(
-        self,
-        record: dict[str, Any],
-        now: datetime,
-        reason: str,
-    ) -> None:
-        """Revoke provider delivery without changing either Guesty field."""
-        if self._retry_is_deferred(record, "cleanup", now):
-            record["conflict"] = True
-            record["field_synced"] = False
-            record["last_error"] = "source_change_cleanup_failed"
-            return
-        try:
-            await self._async_delete_remote_user(record)
-        except (LoxoneApiError, LoxoneAuthError):
-            record["conflict"] = True
-            record["field_synced"] = False
-            record["last_error"] = "source_change_cleanup_failed"
-            self._record_retry_failure(record, "cleanup", now)
-            await self._storage.async_save(self._data)
-            raise
-        self._clear_retry(record, "cleanup")
-        record["field_synced"] = False
-        record["code_set"] = False
-        record["conflict"] = True
-        record["last_error"] = reason
-        self._clear_retry(record, "loxone")
-        await self._storage.async_save(self._data)
-
     def _select_dual_source_value(
         self,
         reservation: GuestyReservation,
@@ -1252,8 +1230,8 @@ class GuestyLoxoneManager:
         native_value: str | None,
         custom_observed: bool,
         custom_value: str | None,
-    ) -> tuple[str | None, str | None]:
-        """Choose one deterministic display value or return a conflict reason."""
+    ) -> str:
+        """Choose one deterministic value, with native Keycode as tie-breaker."""
         canonical = self._canonical_display_value(record, reservation.listing_id)
         native_has_baseline = "native_baseline_value" in record
         custom_has_baseline = "custom_baseline_value" in record
@@ -1270,18 +1248,31 @@ class GuestyLoxoneManager:
 
         if native_changed and custom_changed:
             if native_value and native_value == custom_value:
-                return native_value, None
-            # Emptying one mirror never deletes a confirmed access code, but a
-            # simultaneous different edit cannot be ordered safely.
-            if native_value is None and custom_value == canonical:
-                return canonical, None
-            if custom_value is None and native_value == canonical:
-                return canonical, None
-            return None, "guesty_pin_sources_changed"
+                return native_value
+            # When both mirrors were edited during the same Guesty version,
+            # native Keycode is the explicit product-level tie-breaker. An
+            # empty native value cannot delete an established PIN, so retain
+            # the private canonical value before considering the custom field.
+            return (
+                native_value
+                or canonical
+                or custom_value
+                or self._new_code_value(reservation.listing_id)
+            )
         if native_changed:
-            return native_value or custom_value or canonical, None
+            return (
+                native_value
+                or canonical
+                or custom_value
+                or self._new_code_value(reservation.listing_id)
+            )
         if custom_changed:
-            return custom_value or native_value or canonical, None
+            return (
+                custom_value
+                or canonical
+                or native_value
+                or self._new_code_value(reservation.listing_id)
+            )
 
         populated = [
             value
@@ -1292,12 +1283,14 @@ class GuestyLoxoneManager:
             if observed and value is not None
         ]
         if populated and all(value == populated[0] for value in populated):
-            return populated[0], None
+            return populated[0]
         if len(populated) == 1:
-            return populated[0], None
+            return populated[0]
         if len(populated) > 1:
-            # A pre-upgrade private value is a safe baseline. If exactly one
-            # Guesty source still matches it, the other value is the edit.
+            # A failed or queued stale mirror must not supersede a successful
+            # manual edit merely because native Keycode is the normal
+            # tie-breaker. Outside that narrowly proven propagation state,
+            # native Keycode wins every unexplained mismatch.
             matching = [value == canonical for value in populated]
             if canonical is not None and matching.count(True) == 1:
                 mismatching_index = matching.index(False)
@@ -1308,13 +1301,214 @@ class GuestyLoxoneManager:
                     # A previously failed or queued mirror still contains its
                     # old confirmed baseline; it cannot become a new manual
                     # edit merely because its propagation retry is pending.
-                    return canonical, None
-                return populated[mismatching_index], None
-            return None, "guesty_pin_sources_mismatch"
+                    return canonical
+            if native_observed and native_value is not None:
+                return native_value
+            return (
+                custom_value
+                or canonical
+                or self._new_code_value(reservation.listing_id)
+            )
         if canonical is not None:
-            return canonical, None
+            return canonical
+        return self._new_code_value(reservation.listing_id)
+
+    def _new_code_value(self, listing_id: str) -> str:
+        """Generate one unique PIN and return its Guesty-facing value."""
         code = self._generate_code()
-        return self._guesty_code_value(code, reservation.listing_id), None
+        self._last_generated += 1
+        return self._guesty_code_value(code, listing_id)
+
+    def _reservation_webhook_received_at(self, reservation_id: str) -> datetime | None:
+        """Return one recent coordinator webhook timestamp when available."""
+        getter = getattr(self._coordinator, "reservation_webhook_received_at", None)
+        if not callable(getter):
+            return None
+        received_at = getter(reservation_id)
+        if not isinstance(received_at, datetime) or received_at.utcoffset() is None:
+            return None
+        return received_at
+
+    @staticmethod
+    def _stored_datetime(record: Mapping[str, Any], key: str) -> datetime | None:
+        """Parse one timezone-aware private-state timestamp."""
+        value = record.get(key)
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = dt_util.parse_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed is None or parsed.utcoffset() is None:
+            return None
+        return parsed
+
+    def _next_webhook_pin_retry_at(
+        self,
+        record: Mapping[str, Any],
+        now: datetime,
+    ) -> datetime | None:
+        """Return the next minute boundary inside a new-booking fast window."""
+        received_at = self._stored_datetime(record, _WEBHOOK_PIN_RECEIVED_AT_KEY)
+        retry_until = self._stored_datetime(
+            record,
+            _WEBHOOK_PIN_FAST_RETRY_UNTIL_KEY,
+        )
+        if received_at is None or retry_until is None or now >= retry_until:
+            return None
+        elapsed = max(0, (now - received_at).total_seconds())
+        interval_seconds = _WEBHOOK_PIN_RETRY_INTERVAL.total_seconds()
+        boundary = int(elapsed // interval_seconds) + 1
+        retry_at = received_at + _WEBHOOK_PIN_RETRY_INTERVAL * boundary
+        return retry_at if retry_at <= retry_until else None
+
+    def _clear_webhook_pin_fast_state(self, record: dict[str, Any]) -> None:
+        """Clear the temporary webhook publication schedule after completion."""
+        for key in (
+            _WEBHOOK_PIN_RECEIVED_AT_KEY,
+            _WEBHOOK_PIN_FIRST_WRITE_AT_KEY,
+            _WEBHOOK_PIN_FAST_RETRY_UNTIL_KEY,
+            _WEBHOOK_PIN_FAST_FAILURES_KEY,
+        ):
+            record.pop(key, None)
+
+    def _webhook_pin_sources_synced(
+        self,
+        record: Mapping[str, Any],
+        desired: str,
+    ) -> bool:
+        """Return whether every enabled Guesty mirror confirms the staged PIN."""
+        enabled_sources = []
+        if self._native_pin_enabled:
+            enabled_sources.append("native")
+        if self._custom_pin_enabled:
+            enabled_sources.append("custom")
+        return bool(enabled_sources) and all(
+            record.get(f"{source}_synced") is True
+            and record.get(f"{source}_baseline_value") == desired
+            for source in enabled_sources
+        )
+
+    async def _async_stage_webhook_pin(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        now: datetime,
+        *,
+        native_observed: bool,
+        native_value: str | None,
+        custom_observed: bool,
+        custom_value: str | None,
+    ) -> datetime | None:
+        """Persist a new webhook PIN now while deferring its first Guesty PUT."""
+        if self._canonical_display_value(record, reservation.listing_id) is not None:
+            return self._stored_datetime(record, _WEBHOOK_PIN_FIRST_WRITE_AT_KEY)
+        received_at = self._reservation_webhook_received_at(reservation.id)
+        if received_at is None:
+            return None
+        observed_sources = [
+            (native_observed, native_value)
+            for enabled in (self._native_pin_enabled,)
+            if enabled
+        ] + [
+            (custom_observed, custom_value)
+            for enabled in (self._custom_pin_enabled,)
+            if enabled
+        ]
+        if any(observed and value is not None for observed, value in observed_sources):
+            return None
+        # Match the normal first-code safety gate: at least one configured
+        # mirror must have been read successfully before a private PIN is born.
+        if not any(observed for observed, _value in observed_sources):
+            return None
+
+        desired = self._new_code_value(reservation.listing_id)
+        await self._async_adopt_canonical_value(
+            record,
+            desired,
+            reservation.listing_id,
+        )
+        first_write_at = received_at + _WEBHOOK_PIN_FIRST_WRITE_DELAY
+        retry_until = received_at + _WEBHOOK_PIN_FAST_RETRY_WINDOW
+        record[_WEBHOOK_PIN_RECEIVED_AT_KEY] = received_at.isoformat()
+        record[_WEBHOOK_PIN_FIRST_WRITE_AT_KEY] = first_write_at.isoformat()
+        record[_WEBHOOK_PIN_FAST_RETRY_UNTIL_KEY] = retry_until.isoformat()
+        record[_WEBHOOK_PIN_FAST_FAILURES_KEY] = 0
+        for enabled, source, operation in (
+            (self._native_pin_enabled, "native", _GUESTY_NATIVE_OPERATION),
+            (self._custom_pin_enabled, "custom", _GUESTY_CUSTOM_OPERATION),
+        ):
+            if not enabled:
+                continue
+            record[f"{source}_synced"] = False
+            record[f"{source}_last_error"] = _GUESTY_SYNC_QUEUED
+            self._clear_retry(record, operation)
+            record[f"{operation}_retry_at"] = first_write_at.isoformat()
+        self._refresh_guesty_aggregate_state(record)
+        await self._storage.async_save(self._data)
+        _LOGGER.info(
+            "Staged Guesty reservation PIN after webhook marker=%s "
+            "first_write_in_seconds=%s",
+            self._reservation_marker(reservation.id),
+            max(0, int((first_write_at - now).total_seconds())),
+        )
+        return first_write_at
+
+    def _stored_repair_values(
+        self,
+        record: Mapping[str, Any],
+        listing_id: str,
+    ) -> list[str]:
+        """Return prior confirmed values suitable for repairing Guesty input."""
+        canonical = self._canonical_display_value(record, listing_id)
+        raw_candidates: list[Any] = []
+        if record.get("last_error") == "guesty_duplicate_keycode":
+            # Releases through v2.4.3 retained the rejected duplicate in the
+            # aggregate code fields. The per-source baselines still contain
+            # the last safe value and must therefore be preferred once.
+            raw_candidates.extend(
+                (
+                    record.get("native_baseline_value"),
+                    record.get("custom_baseline_value"),
+                )
+            )
+        raw_candidates.extend(
+            (
+                canonical,
+                record.get("native_baseline_value"),
+                record.get("custom_baseline_value"),
+            )
+        )
+        values: list[str] = []
+        for candidate in raw_candidates:
+            code = self._parse_guesty_code(candidate)
+            if code is None:
+                continue
+            value = self._guesty_code_value(code, listing_id)
+            if value not in values:
+                values.append(value)
+        return values
+
+    def _repair_guesty_value(
+        self,
+        record: Mapping[str, Any],
+        reservation: GuestyReservation,
+        *,
+        rejected_code: str | None,
+        custom_field_id: str | None,
+    ) -> tuple[str, bool]:
+        """Restore the last safe PIN, or generate one when none exists yet."""
+        for value in self._stored_repair_values(record, reservation.listing_id):
+            code = self._parse_guesty_code(value)
+            if code is None or code == rejected_code:
+                continue
+            if not self._code_is_used_elsewhere(
+                code,
+                reservation.id,
+                custom_field_id=custom_field_id,
+            ):
+                return value, False
+        return self._new_code_value(reservation.listing_id), True
 
     async def _async_adopt_canonical_value(
         self,
@@ -1335,6 +1529,7 @@ class GuestyLoxoneManager:
         if changed:
             record["code_set"] = False
             record.pop("provisioned_at", None)
+            record.pop("repair_confirmation_pending", None)
             self._clear_retry(record, "loxone")
         if changed or display_changed:
             for key in (
@@ -1352,21 +1547,6 @@ class GuestyLoxoneManager:
         }:
             record.pop("last_error", None)
         await self._storage.async_save(self._data)
-
-    def _retain_conflicting_value(
-        self,
-        record: dict[str, Any],
-        value: str,
-        listing_id: str,
-    ) -> None:
-        """Retain an observed but unsafe value for diagnosis without provisioning it."""
-        code = self._parse_guesty_code(value)
-        if code is None:
-            return
-        record["code"] = code
-        record["guesty_display_value"] = value
-        record["guesty_confirmed_code"] = code
-        record["guesty_suffix"] = self._guesty_code_suffix(listing_id)
 
     def _refresh_guesty_aggregate_state(self, record: dict[str, Any]) -> None:
         """Maintain backward-compatible aggregate status from both mirrors."""
@@ -1389,9 +1569,16 @@ class GuestyLoxoneManager:
         else:
             self._clear_retry(record, "guesty")
 
+        source_confirmed = any(
+            record.get(f"{source}_synced") for source, _op in enabled_sources
+        )
+        repair_confirmation_pending = bool(
+            record.get("repair_confirmation_pending")
+            and self._confirmed_guesty_code(record) == record.get("code")
+        )
         record["field_synced"] = bool(
             not record.get("conflict")
-            and any(record.get(f"{source}_synced") for source, _op in enabled_sources)
+            and (source_confirmed or repair_confirmation_pending)
             and isinstance(record.get("code"), str)
         )
         if record.get("conflict"):
@@ -1409,7 +1596,7 @@ class GuestyLoxoneManager:
         )
         if real_error is not None:
             record["last_error"] = real_error
-        elif retry_times and not record.get("field_synced"):
+        elif retry_times and not source_confirmed:
             record["last_error"] = _GUESTY_SYNC_QUEUED
         elif record.get("last_error") == _GUESTY_SYNC_QUEUED or str(
             record.get("last_error", "")
@@ -1425,6 +1612,12 @@ class GuestyLoxoneManager:
     ) -> datetime:
         """Queue one mirror write under the shared persistent traffic limit."""
         retry_at = self._next_guesty_write_at(now)
+        fast_retry_at = self._next_webhook_pin_retry_at(record, now)
+        if fast_retry_at is not None:
+            # A fresh webhook gets one attempt per minute, never an extra
+            # sub-minute burst. The global limiter may still postpone this
+            # boundary when Guesty headroom is exhausted.
+            retry_at = max(retry_at, fast_retry_at)
         if retry_at <= now:
             retry_at = now + timedelta(seconds=_GUESTY_MIN_WRITE_SPACING_SECONDS)
         current = self._retry_at(record, operation)
@@ -1449,6 +1642,25 @@ class GuestyLoxoneManager:
             retry_at = current
         self._refresh_guesty_aggregate_state(record)
         return retry_at
+
+    def _record_guesty_mirror_failure_retry(
+        self,
+        record: dict[str, Any],
+        operation: str,
+        now: datetime,
+    ) -> None:
+        """Use minute retries for a fresh webhook, then normal backoff."""
+        fast_retry_at = self._next_webhook_pin_retry_at(record, now)
+        if fast_retry_at is None:
+            self._record_retry_failure(record, operation, now)
+            return
+        self._clear_retry(record, operation)
+        record[f"{operation}_retry_at"] = fast_retry_at.isoformat()
+        try:
+            failures = max(int(record.get(_WEBHOOK_PIN_FAST_FAILURES_KEY, 0)), 0)
+        except (TypeError, ValueError):
+            failures = 0
+        record[_WEBHOOK_PIN_FAST_FAILURES_KEY] = min(failures + 1, 5)
 
     async def _async_write_native_mirror(
         self,
@@ -1708,7 +1920,7 @@ class GuestyLoxoneManager:
                 self._data.pop(_RESOLVED_PIN_FIELD_KEY, None)
             record[f"{source}_last_error"] = reason
             record[f"{source}_synced"] = False
-            self._record_retry_failure(record, operation, now)
+            self._record_guesty_mirror_failure_retry(record, operation, now)
             retry_at = self._retry_at(record, operation)
             if self._guesty_error_stops_write_batch(err):
                 self._guesty_writes_remaining = 0
@@ -1852,7 +2064,26 @@ class GuestyLoxoneManager:
             await self._storage.async_save(self._data)
             return errors, next_run
 
-        desired, conflict = self._select_dual_source_value(
+        webhook_first_write_at = await self._async_stage_webhook_pin(
+            reservation,
+            record,
+            now,
+            native_observed=native_observed,
+            native_value=native_value,
+            custom_observed=custom_observed,
+            custom_value=custom_value,
+        )
+        if webhook_first_write_at is not None and now < webhook_first_write_at:
+            record["source_last_updated_at"] = reservation.last_updated_at
+            if custom_field_id is not None:
+                record["custom_field_id"] = custom_field_id
+                record["custom_source_last_updated_at"] = reservation.last_updated_at
+            self._refresh_guesty_aggregate_state(record)
+            await self._storage.async_save(self._data)
+            return errors, self._earlier(next_run, webhook_first_write_at)
+
+        generated_during_repair = False
+        desired = self._select_dual_source_value(
             reservation,
             record,
             native_observed=native_observed,
@@ -1860,22 +2091,23 @@ class GuestyLoxoneManager:
             custom_observed=custom_observed,
             custom_value=custom_value,
         )
-        if conflict is not None or desired is None:
-            await self._async_mark_dual_source_conflict(
-                record,
-                now,
-                conflict or "guesty_pin_sources_mismatch",
-            )
-            return [conflict or "guesty_pin_sources_mismatch"], next_run
         configured_suffix = self._guesty_code_suffix(reservation.listing_id)
         code = self._parse_guesty_code(desired)
         if code is None:
-            await self._async_mark_dual_source_conflict(
+            desired, generated_during_repair = self._repair_guesty_value(
                 record,
-                now,
-                "invalid_existing_keycode",
+                reservation,
+                rejected_code=None,
+                custom_field_id=custom_field_id,
             )
-            return ["invalid_existing_keycode"], next_run
+            code = self._parse_guesty_code(desired)
+            _LOGGER.info(
+                "Restoring Guesty reservation PIN mirrors marker=%s "
+                "reason=invalid_value",
+                self._reservation_marker(reservation.id),
+            )
+        if code is None:  # Defensive: generated and stored values are validated.
+            raise ValueError("Could not repair invalid Guesty PIN")
         # The configurable suffix is presentation metadata for the guest, not
         # part of the six-digit provider PIN. Normalize both mirrors without
         # ever rotating that PIN.
@@ -1885,17 +2117,22 @@ class GuestyLoxoneManager:
             reservation.id,
             custom_field_id=custom_field_id,
         ):
-            self._retain_conflicting_value(
+            desired, generated_during_repair = self._repair_guesty_value(
                 record,
-                desired,
-                reservation.listing_id,
+                reservation,
+                rejected_code=code,
+                custom_field_id=custom_field_id,
             )
-            await self._async_mark_dual_source_conflict(
-                record,
-                now,
-                "guesty_duplicate_keycode",
+            repaired_code = self._parse_guesty_code(desired)
+            if repaired_code is None:
+                raise ValueError("Could not repair duplicate Guesty PIN")
+            code = repaired_code
+            desired = f"{code}{configured_suffix}"
+            _LOGGER.info(
+                "Restoring Guesty reservation PIN mirrors marker=%s "
+                "reason=duplicate_value",
+                self._reservation_marker(reservation.id),
             )
-            return ["guesty_duplicate_keycode"], next_run
 
         if (
             record.get("replacement_pending") is True
@@ -1905,11 +2142,34 @@ class GuestyLoxoneManager:
             record["native_baseline_value"] = desired
             record["native_synced"] = True
 
+        confirmed_repair_value = bool(
+            not generated_during_repair
+            and (
+                (record.get("field_synced") is True and record.get("code") == code)
+                or any(
+                    self._parse_guesty_code(record.get(f"{source}_baseline_value"))
+                    == code
+                    for source in ("native", "custom")
+                )
+            )
+            and any(
+                observed and current != desired
+                for observed, current in (
+                    (native_observed, native_value),
+                    (custom_observed, custom_value),
+                )
+            )
+        )
         await self._async_adopt_canonical_value(
             record,
             desired,
             reservation.listing_id,
         )
+        if confirmed_repair_value:
+            # The guest may already rely on this previously confirmed code.
+            # A queued or failed Guesty repair must not revoke healthy provider
+            # access while the same stable value is being republished.
+            record["repair_confirmation_pending"] = True
         record["source_last_updated_at"] = reservation.last_updated_at
         if custom_field_id is not None:
             record["custom_field_id"] = custom_field_id
@@ -1921,15 +2181,18 @@ class GuestyLoxoneManager:
         # Keep the established native route first. A failed native write does
         # not prevent the custom mirror from succeeding on a later write slot.
         generated_new_value = bool(
-            not native_value
-            and not custom_value
-            and not any(
-                f"{source}_baseline_value" in record
-                for source, enabled in (
-                    ("native", native_enabled),
-                    ("custom", custom_enabled),
+            generated_during_repair
+            or (
+                not native_value
+                and not custom_value
+                and not any(
+                    f"{source}_baseline_value" in record
+                    for source, enabled in (
+                        ("native", native_enabled),
+                        ("custom", custom_enabled),
+                    )
+                    if enabled
                 )
-                if enabled
             )
         )
         mirrors: list[tuple[str, str, bool, str | None, str | None]] = []
@@ -2001,6 +2264,14 @@ class GuestyLoxoneManager:
             if retry_at is not None:
                 next_run = self._earlier(next_run, retry_at)
 
+        if any(
+            record.get(f"{source}_synced") is True
+            and record.get(f"{source}_baseline_value") == desired
+            for source, _operation, _observed, _current, _field_id in mirrors
+        ):
+            record.pop("repair_confirmation_pending", None)
+        if self._webhook_pin_sources_synced(record, desired):
+            self._clear_webhook_pin_fast_state(record)
         self._refresh_guesty_aggregate_state(record)
         await self._storage.async_save(self._data)
         return errors, next_run

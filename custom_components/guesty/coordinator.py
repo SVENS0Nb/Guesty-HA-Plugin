@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
@@ -67,6 +67,7 @@ from .storage import GuestyStorage
 _LOGGER = logging.getLogger(__name__)
 INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=5)
 _PIN_ENRICHMENT_RETRY_KEY = "pin_enrichment_retry_needed"
+_RECENT_WEBHOOK_RETENTION = timedelta(minutes=10)
 
 
 def _is_full_reservation_sync_due(last_full_sync: str | None) -> bool:
@@ -122,6 +123,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._webhook_active = False
         self._pending_reservation_ids: set[str] = set()
         self._pending_listing_payloads: dict[str, dict[str, Any]] = {}
+        self._recent_reservation_webhooks: dict[str, datetime] = {}
         self._webhook_batch_task: asyncio.Task[None] | None = None
         self._webhook_registration_task: asyncio.Task[None] | None = None
         self._unloaded = False
@@ -498,6 +500,14 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     "Ignoring Guesty reservation webhook without a valid id"
                 )
                 return
+            now = dt_util.utcnow()
+            cutoff = now - _RECENT_WEBHOOK_RETENTION
+            self._recent_reservation_webhooks = {
+                item_id: received_at
+                for item_id, received_at in self._recent_reservation_webhooks.items()
+                if received_at >= cutoff
+            }
+            self._recent_reservation_webhooks[reservation_id] = now
             self._pending_reservation_ids.add(reservation_id)
         else:
             listing_id = self._listing_id_from_webhook(payload)
@@ -506,6 +516,17 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             self._pending_listing_payloads[key] = payload
 
         self._ensure_webhook_batch_task()
+
+    def reservation_webhook_received_at(self, reservation_id: str) -> datetime | None:
+        """Return the recent verified handoff time for one reservation event."""
+        received_at = self._recent_reservation_webhooks.get(reservation_id)
+        if received_at is None:
+            return None
+        now = dt_util.utcnow()
+        if received_at < now - _RECENT_WEBHOOK_RETENTION or received_at > now:
+            self._recent_reservation_webhooks.pop(reservation_id, None)
+            return None
+        return received_at
 
     def _ensure_webhook_batch_task(self) -> None:
         """Own exactly one batch worker without creating per-event waiters."""
@@ -558,6 +579,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._unloaded = True
         self._pending_reservation_ids.clear()
         self._pending_listing_payloads.clear()
+        self._recent_reservation_webhooks.clear()
         for task in (
             self._webhook_batch_task,
             self._webhook_registration_task,
@@ -730,7 +752,10 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             reservation = await self._client.async_get_reservation(reservation_id)
             if reservation is not None:
                 pin_listing_ids = self._pin_provider_listing_ids()
-                if reservation.listing_id in pin_listing_ids:
+                if (
+                    reservation.is_active_status()
+                    and reservation.listing_id in pin_listing_ids
+                ):
                     try:
                         enriched = await self._client.async_get_reservation(
                             reservation_id,

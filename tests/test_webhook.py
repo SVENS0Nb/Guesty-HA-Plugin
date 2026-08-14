@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiohttp import web
 from homeassistant.helpers.network import NoURLAvailableError
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -43,6 +44,30 @@ def _signed_request(payload, *, message_id="msg-1", timestamp=None):
     signed = f"{message_id}.{timestamp}.".encode() + body
     signature = base64.b64encode(
         hmac.new(_SIGNING_KEY, signed, hashlib.sha256).digest()
+    ).decode()
+    return SimpleNamespace(
+        content_length=len(body),
+        read=AsyncMock(return_value=body),
+        headers={
+            "webhook-id": message_id,
+            "webhook-timestamp": str(timestamp),
+            "webhook-signature": f"v1,{signature}",
+        },
+    )
+
+
+def _signed_body_request(
+    body: bytes,
+    *,
+    message_id: str = "msg-raw",
+    timestamp: int | None = None,
+    key: bytes = _SIGNING_KEY,
+):
+    """Return a request with an explicitly supplied raw signed body."""
+    timestamp = int(time.time()) if timestamp is None else timestamp
+    signed = f"{message_id}.{timestamp}.".encode() + body
+    signature = base64.b64encode(
+        hmac.new(key, signed, hashlib.sha256).digest()
     ).decode()
     return SimpleNamespace(
         content_length=len(body),
@@ -127,6 +152,92 @@ async def test_invalid_and_oversized_payloads_are_rejected(hass, monkeypatch) ->
 
     assert invalid_response.status == 400
     assert oversized_response.status == 413
+    coordinator.async_handle_webhook.assert_not_awaited()
+
+
+def test_signature_rejects_incomplete_headers_timestamp_and_short_secret() -> None:
+    """Malformed authentication metadata always fails closed."""
+    body = b"{}"
+    assert guesty_webhook.verify_webhook_signature({}, body, TEST_SECRET) is None
+    headers = {
+        "webhook-id": "msg",
+        "webhook-timestamp": "not-a-number",
+        "webhook-signature": "v1,unused",
+    }
+    assert guesty_webhook.verify_webhook_signature(headers, body, TEST_SECRET) is None
+    headers["webhook-timestamp"] = str(int(time.time()))
+    assert guesty_webhook.verify_webhook_signature(headers, body, "short") is None
+
+
+def test_signature_supports_long_legacy_plaintext_secret() -> None:
+    """A sufficiently strong pre-prefix secret remains migration-compatible."""
+    secret = "legacy-secret-that-is-not-base64!"
+    request = _signed_body_request(b"{}", key=secret.encode())
+
+    assert (
+        guesty_webhook.verify_webhook_signature(
+            request.headers,
+            b"{}",
+            secret,
+        )
+        == "msg-raw"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_and_stream_size_failures_are_rejected(
+    hass, monkeypatch
+) -> None:
+    """The endpoint rejects unverifiable or over-limit streamed requests."""
+    handlers = _capture_registry(monkeypatch)
+    coordinator = SimpleNamespace(async_handle_webhook=AsyncMock())
+    missing_secret_entry = _entry(hass, {CONF_GUESTY_WEBHOOK_SECRET: ""})
+    webhook_id = await guesty_webhook.async_setup_webhook(
+        hass, missing_secret_entry, coordinator
+    )
+    ordinary = _signed_request({"event": "reservation.updated.v2"})
+
+    assert (await handlers[webhook_id](hass, webhook_id, ordinary)).status == 503
+
+    signed_entry = _entry(hass)
+    webhook_id = await guesty_webhook.async_setup_webhook(
+        hass, signed_entry, coordinator
+    )
+    read_rejected = SimpleNamespace(
+        content_length=None,
+        read=AsyncMock(
+            side_effect=web.HTTPRequestEntityTooLarge(max_size=1, actual_size=2)
+        ),
+        headers={},
+    )
+    streamed_oversize = SimpleNamespace(
+        content_length=None,
+        read=AsyncMock(return_value=b"x" * (guesty_webhook.MAX_WEBHOOK_BODY_BYTES + 1)),
+        headers={},
+    )
+
+    assert (await handlers[webhook_id](hass, webhook_id, read_rejected)).status == 413
+    assert (
+        await handlers[webhook_id](hass, webhook_id, streamed_oversize)
+    ).status == 413
+    coordinator.async_handle_webhook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signed_invalid_json_is_rejected(hass, monkeypatch) -> None:
+    """Valid authentication never makes malformed JSON acceptable."""
+    handlers = _capture_registry(monkeypatch)
+    entry = _entry(hass)
+    coordinator = SimpleNamespace(async_handle_webhook=AsyncMock())
+    webhook_id = await guesty_webhook.async_setup_webhook(hass, entry, coordinator)
+
+    response = await handlers[webhook_id](
+        hass,
+        webhook_id,
+        _signed_body_request(b"{not-json"),
+    )
+
+    assert response.status == 400
     coordinator.async_handle_webhook.assert_not_awaited()
 
 

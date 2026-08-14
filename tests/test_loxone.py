@@ -147,7 +147,8 @@ def _manager(
         data=SimpleNamespace(
             listings={"listing-1": _listing()},
             reservations=[reservation],
-        )
+        ),
+        reservation_webhook_received_at=MagicMock(return_value=None),
     )
     guesty_client = SimpleNamespace(
         async_resolve_custom_field=AsyncMock(return_value=PIN_FIELD_ID),
@@ -181,6 +182,151 @@ def _manager(
     )
     monkeypatch.setattr(loxone.dt_util, "utcnow", lambda: NOW)
     return manager, coordinator, guesty_client, remote
+
+
+@pytest.mark.asyncio
+async def test_webhook_pin_is_persisted_immediately_but_first_written_after_one_minute(
+    hass, monkeypatch
+) -> None:
+    """A fresh webhook separates durable PIN allocation from Guesty writes."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    coordinator.reservation_webhook_received_at.return_value = NOW
+
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    code = record["code"]
+    assert len(code) == 6 and code.isdigit()
+    assert record["field_synced"] is False
+    assert (
+        record["webhook_pin_first_write_at"] == (NOW + timedelta(minutes=1)).isoformat()
+    )
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_add_or_update_user.assert_not_awaited()
+    manager._schedule_at.assert_called_with(NOW + timedelta(minutes=1))
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=59),
+    )
+    await manager.async_reconcile()
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(minutes=1),
+    )
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        code,
+    )
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    assert record["field_synced"] is True
+    assert (
+        record["webhook_pin_first_write_at"] == (NOW + timedelta(minutes=1)).isoformat()
+    )
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(minutes=2),
+    )
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        code,
+    )
+    assert record["field_synced"] is True
+    assert "webhook_pin_received_at" not in record
+    assert manager._last_generated == 0
+
+
+@pytest.mark.asyncio
+async def test_webhook_pin_fast_retry_runs_each_minute_then_uses_normal_backoff(
+    hass, monkeypatch
+) -> None:
+    """Minutes one through five retry before ordinary failure timing resumes."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    options = _options()
+    options[CONF_PIN_CUSTOM_ENABLED] = False
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        options=options,
+    )
+    coordinator.reservation_webhook_received_at.return_value = NOW
+    guesty_client.async_update_reservation_key_code.side_effect = GuestyPermissionError(
+        "temporary test failure"
+    )
+
+    await manager.async_reconcile()
+    assert guesty_client.async_update_reservation_key_code.await_count == 0
+
+    for minute in range(1, 6):
+        current = NOW + timedelta(minutes=minute)
+        monkeypatch.setattr(loxone.dt_util, "utcnow", lambda current=current: current)
+        await manager.async_reconcile()
+        assert guesty_client.async_update_reservation_key_code.await_count == minute
+        record = manager._records[reservation.id]
+        expected_retry = current + timedelta(minutes=1 if minute < 5 else 5)
+        assert record["guesty_native_retry_at"] == expected_retry.isoformat()
+
+    record = manager._records[reservation.id]
+    assert record["webhook_pin_fast_failures"] == 4
+    assert record["guesty_native_retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_pin_first_write_delay_survives_manager_restart(
+    hass, monkeypatch
+) -> None:
+    """Private staged state prevents an early PUT after a Home Assistant reload."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=1),
+        check_out=NOW + timedelta(days=2),
+    )
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    coordinator.reservation_webhook_received_at.return_value = NOW
+    await manager.async_reconcile()
+    staged_data = manager._data
+
+    restarted, restarted_coordinator, restarted_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    restarted._data = staged_data
+    restarted_coordinator.reservation_webhook_received_at.return_value = None
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=30),
+    )
+
+    await restarted.async_reconcile()
+
+    restarted_client.async_update_reservation_key_code.assert_not_awaited()
+    restarted_client.async_update_reservation_custom_field.assert_not_awaited()
+    restarted._schedule_at.assert_called_with(NOW + timedelta(minutes=1))
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1636,6 +1782,68 @@ async def test_existing_native_pin_fills_custom_field_without_rotation(
         "712345",
     )
 
+    # Guesty emits reservation.updated for the integration's own confirmed PUT.
+    # A targeted read-back with the same values must be an idempotent no-op.
+    echoed = _reservation(
+        reservation_id=reservation.id,
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="712345",
+    )
+    echoed.last_updated_at = "2026-07-14T12:01:00+00:00"
+    _coordinator.data.reservations = [echoed]
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "712345",
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_write_webhook_echo_does_not_create_write_loop(
+    hass, monkeypatch
+) -> None:
+    """The reservation.updated echo of our native PUT is a no-op."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="734567",
+    )
+    reservation.key_code = None
+    reservation.key_code_observed = True
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, reservation
+    )
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        "734567",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+
+    echoed = _reservation(
+        reservation_id=reservation.id,
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="734567",
+    )
+    echoed.last_updated_at = "2026-07-14T12:01:00+00:00"
+    coordinator.data.reservations = [echoed]
+
+    await manager.async_reconcile()
+
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        "734567",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_matching_dual_sources_need_no_guesty_write(hass, monkeypatch) -> None:
@@ -1902,10 +2110,10 @@ async def test_failed_secondary_propagation_cannot_revert_canonical_pin(
 
 
 @pytest.mark.asyncio
-async def test_simultaneous_different_manual_edits_fail_closed(
+async def test_simultaneous_different_manual_edits_prefer_native_keycode(
     hass, monkeypatch
 ) -> None:
-    """Conflicting simultaneous source edits never trigger a blind overwrite."""
+    """Native Keycode deterministically wins simultaneous different edits."""
     reservation = _reservation(
         check_in=NOW + timedelta(hours=5),
         check_out=NOW + timedelta(days=2),
@@ -1922,20 +2130,27 @@ async def test_simultaneous_different_manual_edits_fail_closed(
     await manager.async_reconcile()
 
     record = manager._records[reservation.id]
-    assert record["code"] == "712345"
-    assert record["conflict"] is True
-    assert record["last_error"] == "guesty_pin_sources_changed"
-    assert record["field_synced"] is False
+    assert record["code"] == "723456"
+    assert record.get("conflict") is None
+    assert record["field_synced"] is True
     guesty_client.async_update_reservation_key_code.assert_not_awaited()
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
-    remote.async_delete_user.assert_awaited_once_with("user-uuid")
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "723456",
+    )
+    remote.async_delete_user.assert_not_awaited()
+    assert remote.async_set_access_code.await_args_list == [
+        call("user-uuid", "712345"),
+        call("user-uuid", "723456"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_unexplained_initial_dual_source_mismatch_fails_closed(
+async def test_unexplained_initial_dual_source_mismatch_prefers_native_keycode(
     hass, monkeypatch
 ) -> None:
-    """Two different initial values are retained in Guesty for manual review."""
+    """Native Keycode seeds an unexplained initial two-source mismatch."""
     reservation = _reservation(
         check_in=NOW + timedelta(hours=5),
         check_out=NOW + timedelta(days=2),
@@ -1949,12 +2164,16 @@ async def test_unexplained_initial_dual_source_mismatch_fails_closed(
     await manager.async_reconcile()
 
     record = manager._records[reservation.id]
-    assert record["conflict"] is True
-    assert record["last_error"] == "guesty_pin_sources_mismatch"
-    assert record["field_synced"] is False
+    assert record["code"] == "712345"
+    assert record.get("conflict") is None
+    assert record["field_synced"] is True
     guesty_client.async_update_reservation_key_code.assert_not_awaited()
-    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
-    remote.async_add_or_update_user.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "712345",
+    )
+    remote.async_set_access_code.assert_awaited_once_with("user-uuid", "712345")
 
 
 @pytest.mark.asyncio
@@ -2287,10 +2506,10 @@ async def test_sparse_snapshot_cancels_legacy_rotation_without_false_deletion(
 
 
 @pytest.mark.asyncio
-async def test_duplicate_guesty_codes_are_blocked_without_rewriting_guesty(
+async def test_initial_duplicate_without_stored_pin_gets_unique_replacement(
     hass, monkeypatch
 ) -> None:
-    """A duplicate observed in Guesty is fail-closed and remains unchanged."""
+    """A new duplicate gets a generated value when no saved PIN can restore it."""
     first = _reservation(
         check_in=NOW + timedelta(days=10),
         check_out=NOW + timedelta(days=12),
@@ -2307,21 +2526,36 @@ async def test_duplicate_guesty_codes_are_blocked_without_rewriting_guesty(
     coordinator.data.reservations.append(second)
 
     await manager.async_reconcile()
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=31),
+    )
+    await manager.async_reconcile()
 
     assert manager._records[first.id]["code"] == "799999"
     assert manager._records[first.id].get("conflict") is None
-    assert manager._records[second.id]["code"] == "799999"
-    assert manager._records[second.id]["conflict"] is True
-    assert manager._records[second.id]["last_error"] == "guesty_duplicate_keycode"
-    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    replacement = manager._records[second.id]["code"]
+    assert replacement != "799999"
+    assert len(replacement) == 6 and replacement.isdigit()
+    assert manager._records[second.id].get("conflict") is None
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        second.id,
+        replacement,
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        second.id,
+        PIN_FIELD_ID,
+        replacement,
+    )
     remote.async_add_or_update_user.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_manual_duplicate_blocks_new_editor_without_changing_code(
+async def test_manual_duplicate_restores_editor_previous_saved_code(
     hass, monkeypatch
 ) -> None:
-    """A manual duplicate stays in Guesty but never reaches an access provider."""
+    """A manual duplicate is overwritten with that reservation's saved PIN."""
     established = _reservation(
         check_in=NOW + timedelta(days=10),
         check_out=NOW + timedelta(days=12),
@@ -2360,10 +2594,78 @@ async def test_manual_duplicate_blocks_new_editor_without_changing_code(
 
     assert manager._records[established.id]["code"] == "711111"
     assert manager._records[established.id].get("conflict") is None
-    assert manager._records[edited.id]["code"] == "711111"
-    assert manager._records[edited.id]["guesty_confirmed_code"] == "711111"
-    assert manager._records[edited.id]["last_error"] == "guesty_duplicate_keycode"
-    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    assert manager._records[edited.id]["code"] == "722222"
+    assert manager._records[edited.id]["guesty_confirmed_code"] == "722222"
+    assert manager._records[edited.id].get("conflict") is None
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        edited.id,
+        "722222",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        edited.id,
+        PIN_FIELD_ID,
+        "722222",
+    )
+
+
+@pytest.mark.asyncio
+async def test_persisted_legacy_duplicate_conflict_restores_source_baseline(
+    hass, monkeypatch
+) -> None:
+    """A v2.4.3 duplicate record recovers its safe per-source baseline."""
+    established = _reservation(
+        check_in=NOW + timedelta(days=10),
+        check_out=NOW + timedelta(days=12),
+        key_code="711111",
+        reservation_id="reservation-1",
+    )
+    edited = _reservation(
+        check_in=NOW + timedelta(days=13),
+        check_out=NOW + timedelta(days=15),
+        key_code="711111",
+        reservation_id="reservation-2",
+    )
+    manager, coordinator, guesty_client, _remote = _manager(
+        hass, monkeypatch, established
+    )
+    coordinator.data.reservations.append(edited)
+    manager._records[established.id] = {
+        "code": "711111",
+        "guesty_confirmed_code": "711111",
+        "native_baseline_value": "711111",
+        "custom_baseline_value": "711111",
+        "native_synced": True,
+        "custom_synced": True,
+        "field_synced": True,
+    }
+    manager._records[edited.id] = {
+        "code": "711111",
+        "guesty_confirmed_code": "711111",
+        "guesty_display_value": "711111",
+        "native_baseline_value": "722222",
+        "custom_baseline_value": "722222",
+        "native_synced": False,
+        "custom_synced": False,
+        "field_synced": False,
+        "conflict": True,
+        "last_error": "guesty_duplicate_keycode",
+    }
+
+    await manager.async_reconcile()
+
+    record = manager._records[edited.id]
+    assert record["code"] == "722222"
+    assert record["guesty_confirmed_code"] == "722222"
+    assert record.get("conflict") is None
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        edited.id,
+        "722222",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        edited.id,
+        PIN_FIELD_ID,
+        "722222",
+    )
 
 
 def test_only_guesty_source_conflicts_block_other_pin_providers(
@@ -2777,10 +3079,99 @@ async def test_empty_guesty_mirror_is_restored_from_other_source(
 
 
 @pytest.mark.asyncio
-async def test_invalid_guesty_edit_revokes_without_replacement(
+async def test_both_empty_guesty_mirrors_restore_saved_code(hass, monkeypatch) -> None:
+    """Clearing both mirrors restores the saved PIN without revoking access."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+
+    reservation.key_code = ""
+    reservation.custom_fields[PIN_FIELD_ID] = ""
+    reservation.key_code_observed = True
+    reservation.custom_fields_observed = True
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["guesty_confirmed_code"] == "712345"
+    assert record["field_synced"] is True
+    assert record.get("conflict") is None
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        "712345",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "712345",
+    )
+    remote.async_delete_user.assert_not_awaited()
+    assert remote.async_set_access_code.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_saved_pin_repair_keeps_existing_provider_access(
     hass, monkeypatch
 ) -> None:
-    """An invalid manual value revokes access but cannot rotate the PIN."""
+    """The shared Guesty write limit cannot revoke an already confirmed PIN."""
+    reservation = _reservation(
+        check_in=NOW + timedelta(hours=5),
+        check_out=NOW + timedelta(days=2),
+        key_code="712345",
+    )
+    manager, _coordinator, guesty_client, remote = _manager(
+        hass, monkeypatch, reservation
+    )
+    await manager.async_reconcile()
+    manager._data["guesty_write_attempts"] = [NOW.isoformat(), NOW.isoformat()]
+
+    reservation.key_code = ""
+    reservation.custom_fields[PIN_FIELD_ID] = ""
+    reservation.key_code_observed = True
+    reservation.custom_fields_observed = True
+    reservation.last_updated_at = "2026-07-14T12:01:00+00:00"
+    await manager.async_reconcile()
+
+    record = manager._records[reservation.id]
+    assert record["code"] == "712345"
+    assert record["field_synced"] is True
+    assert record["repair_confirmation_pending"] is True
+    assert manager.reservation_pin_snapshot(reservation.id)["field_synced"] is True
+    guesty_client.async_update_reservation_key_code.assert_not_awaited()
+    guesty_client.async_update_reservation_custom_field.assert_not_awaited()
+    remote.async_delete_user.assert_not_awaited()
+    assert remote.async_set_access_code.await_count == 1
+
+    monkeypatch.setattr(
+        loxone.dt_util,
+        "utcnow",
+        lambda: NOW + timedelta(seconds=31),
+    )
+    await manager.async_reconcile()
+
+    assert record["field_synced"] is True
+    assert "repair_confirmation_pending" not in record
+    guesty_client.async_update_reservation_key_code.assert_awaited_once_with(
+        reservation.id,
+        "712345",
+    )
+    guesty_client.async_update_reservation_custom_field.assert_awaited_once_with(
+        reservation.id,
+        PIN_FIELD_ID,
+        "712345",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_guesty_edit_restores_saved_code(hass, monkeypatch) -> None:
+    """An invalid manual value is overwritten with the last saved PIN."""
     reservation = _reservation(
         check_in=NOW + timedelta(hours=5),
         check_out=NOW + timedelta(days=2),
@@ -2797,11 +3188,15 @@ async def test_invalid_guesty_edit_revokes_without_replacement(
 
     record = manager._records[reservation.id]
     assert record["code"] == old_code
-    remote.async_delete_user.assert_awaited_once_with("user-uuid")
-    assert guesty_client.async_update_reservation_key_code.await_count == 1
-    assert record["field_synced"] is False
-    assert record["conflict"] is True
-    assert record["last_error"] == "invalid_existing_keycode"
+    assert record["guesty_confirmed_code"] == old_code
+    remote.async_delete_user.assert_not_awaited()
+    assert guesty_client.async_update_reservation_key_code.await_count == 2
+    assert guesty_client.async_update_reservation_key_code.await_args.args == (
+        reservation.id,
+        old_code,
+    )
+    assert record["field_synced"] is True
+    assert record.get("conflict") is None
 
 
 @pytest.mark.asyncio
