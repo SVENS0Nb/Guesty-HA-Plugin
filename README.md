@@ -273,6 +273,12 @@ Reservierungsstatus wie Kalender und Türlink (`confirmed`, `reserved`,
 einem verifizierten Webhook-Abgleich wird der Code für eine neue zukünftige
 Reservierung unmittelbar im privaten Home-Assistant-Speicher reserviert; ohne
 Webhook entsteht er spätestens beim nächsten normalen Reservierungsabgleich.
+Der verifizierte Reservierungs-Webhook wird vor der HTTP-Bestätigung zusätzlich
+dauerhaft zwischengespeichert. Ein Home-Assistant-Neustart, ein vorübergehender
+Guesty-Fehler oder eine in Guesty noch nicht sichtbare neue Buchung verliert
+den Auftrag dadurch nicht. Jede betroffene Reservierung wird gezielt gelesen;
+Fehlschläge werden in den ersten fünf Minuten an den Minutenmarken und danach
+im normalen Abgleichstakt wiederholt.
 Bei einem neuen Webhook-PIN wartet die Integration vor dem ersten Guesty-PUT
 bewusst eine Minute, damit Guestys Buchungsmodell vollständig verfügbar wird.
 Bleibt die Veröffentlichung erfolglos, folgen weitere persistente Versuche an
@@ -309,7 +315,12 @@ die PIN-Abfrage beim nächsten gemeinsamen Abgleich erneut.
 Guesty-Schreibversuche beider Spiegel teilen sich auch im fünfminütigen
 Webhook-Schnellfenster ein persistentes globales Limit von höchstens zwei PUTs
 je 30 Sekunden. Es entstehen keine zusätzlichen Poller oder ungebremsten
-Schreibschleifen. Jeder Schreibplatz berücksichtigt zusätzlich bis zu drei
+Schreibschleifen. Aktuelle Aufenthalte, Webhook-/manuelle Änderungen und die
+erste Guesty-Bestätigung jeder Buchung werden vor nachrangigen zweiten Spiegeln
+bearbeitet; lange wartende Einträge werden schrittweise hochgestuft. Der
+komplette Guesty-Schritt wird vor Loxone-Netzwerkzugriffen gespeichert, sodass
+ein langsamer oder ausgefallener Miniserver keinen anderen Guesty-Code
+aufhalten kann. Jeder Schreibplatz berücksichtigt zusätzlich bis zu drei
 Bestätigungsabfragen und wird unmittelbar vor dem Schreiben noch einmal gegen
 das gemeldete API-Limit geprüft. Für eine unbekannte Reservierung wird zuerst
 V3 verwendet. Antwortet der V3-Notizenpfad mit 404, obwohl genau diese
@@ -631,14 +642,18 @@ ist dafür nicht erforderlich.
   angelegter verwalteter Passcode wird entfernt. Der Status bleibt mit Backoff
   auf `Konflikt`, bis in Guesty manuell ein anderer Code eingetragen wurde.
 - Bei mehreren Schlössern werden erfolgreiche Einzeloperationen sofort
-  gespeichert. Ein ausgefallenes Gateway führt deshalb nicht zur doppelten
-  Anlage auf bereits erfolgreichen Schlössern. Der Status lautet bis zur
-  vollständigen Zustellung `Teilweise` oder `Gateway offline`.
+  gespeichert. Jedes Schloss hat eine eigene Fehlergrenze: Ein ausgefallenes
+  Gateway oder eine Kollision blockiert spätere zugeordnete Schlösser nicht und
+  führt nicht zur doppelten Anlage auf bereits erfolgreichen Schlössern. Der
+  Status lautet bis zur vollständigen Zustellung `Teilweise` oder
+  `Gateway offline`.
 - Transportfehler, Rate-Limits und Offline-Gateways verwenden ein persistentes,
   begrenztes exponentielles Backoff. Nach einer Netzwerkunterbrechung wird die
   Arbeit automatisch fortgesetzt; es gibt keine schnelle Wiederholungsschleife.
 - Bei einer erfolgreichen erneuten TTLock-Anmeldung werden rotierte OAuth-Tokens
-  sofort privat gespeichert und an den laufenden Abgleich übergeben. Wegen
+  sofort an der Token-Grenze privat gespeichert und an den laufenden Abgleich
+  übergeben. Gleichzeitige Ablaufprüfungen erzeugen dabei nur einen neuen
+  Token. Wegen
   `Authentifizierung fehlgeschlagen` wartende Reservierungen werden unmittelbar
   erneut eingeplant; dafür ist weder eine neue PIN noch ein erneuter Check-in
   erforderlich.
@@ -784,20 +799,27 @@ flowchart TD
 2. **Webhooks** – Guestys aktuelle Reservierungsereignisse
    `reservation.created.v2` und `reservation.updated.v2` werden nach einer
    kurzen 0,75-s-Sammelphase verarbeitet. Die Integration prüft die von Guesty
-   bereitgestellte HMAC-Signatur; Duplikate und Ereignis-Bursts erzeugen dadurch
-   möglichst wenige API-Aufrufe. `reservation.updated.v2` deckt sowohl manuelle
+   bereitgestellte HMAC-Signatur und speichert jeden akzeptierten
+   Reservierungsauftrag atomar, bevor sie ihn bestätigt. Duplikate derselben
+   Reservierung werden zusammengeführt, verschiedene Reservierungen in einem
+   Burst behalten jedoch jeweils ihren gezielten Abruf. Die Warteschlange
+   überlebt Neustarts und wird von neuem, dringendem Webhook-Verkehr sofort
+   geweckt. `reservation.updated.v2` deckt sowohl manuelle
    Änderungen an Keycode beziehungsweise dem konfigurierten PIN-Custom-Field als
    auch Statusänderungen wie eine Stornierung ab. Nach dem Ereignis liest die
-   Integration die betroffene Reservierung gezielt neu. Eine Stornierung entfernt
-   sie sofort aus dem aktiven Snapshot und stößt damit die Löschung der verwalteten
-   Loxone- und TTLock-Zugänge an. Webhook-Echos eigener bestätigter Feldschreibvorgänge
+   Integration die betroffene Reservierung gezielt neu. Ein signierter
+   Inaktiv-/Storno-Status entfernt sie bereits vor diesem Bestätigungsabruf aus
+   dem aktiven Snapshot und stößt damit die Löschung der verwalteten Loxone- und
+   TTLock-Zugänge an. Webhook-Echos eigener bestätigter Feldschreibvorgänge
    werden anhand der gespeicherten Spiegelwerte als bereits synchron erkannt und
    lösen keinen weiteren PUT aus. Bestehende Abonnements ohne Signatur-Secret
    werden einmalig sicher neu erstellt; schlägt auch danach der Secret-Abruf
    fehl, bleibt der Polling-Fallback aktiv, ohne eine Neuanlage-Schleife.
    Vorübergehende Registrierungsfehler werden mit begrenztem exponentiellem
    Backoff automatisch erneut geprüft; ein Home-Assistant-Neustart ist dafür
-   nicht erforderlich.
+   nicht erforderlich. Eine aktive Remote-Registrierung wird stündlich
+   kontrolliert. Ist sie unverändert, erzeugt diese Prüfung weder eine
+   Konfigurationsänderung noch einen Reload.
 3. **Scheduler** – Belegung wechselt punktgenau bei Check-in/out
 4. **Täglicher Vollsync** – verhindert Drift im Cache
 

@@ -260,9 +260,12 @@ async def async_register_guesty_webhook(
         CONF_GUESTY_WEBHOOK_SECRET: webhook_secret,
     }
     updated_data.pop(CONF_GUESTY_WEBHOOK_SECRET_MIGRATION_ID, None)
-    hass.config_entries.async_update_entry(
-        entry,
-        data=updated_data,
-    )
+    if updated_data != entry.data:
+        # The hourly health check must not emit a config-entry update (and
+        # potentially a reload) when the remote subscription is unchanged.
+        hass.config_entries.async_update_entry(
+            entry,
+            data=updated_data,
+        )
     _LOGGER.info("Guesty webhook registered successfully")
     return guesty_webhook_id

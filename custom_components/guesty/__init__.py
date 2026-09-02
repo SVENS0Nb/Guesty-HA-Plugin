@@ -169,8 +169,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
                 hass, entry, client, webhook_id
             )
             coordinator.set_webhook_active(guesty_webhook_id is not None)
-            if guesty_webhook_id is None:
-                coordinator.async_start_webhook_registration_recovery(webhook_id)
+            coordinator.async_start_webhook_registration_recovery(webhook_id)
 
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

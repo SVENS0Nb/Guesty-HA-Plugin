@@ -948,6 +948,38 @@ async def test_partial_gateway_failure_keeps_successful_lock_for_targeted_retry(
 
 
 @pytest.mark.asyncio
+async def test_first_offline_lock_does_not_block_later_mapped_locks(
+    hass, monkeypatch
+) -> None:
+    """Lock delivery errors are isolated within one reservation mapping."""
+    reservation = _reservation()
+    entry = MockConfigEntry(domain=DOMAIN, options=_options([101, 102, 103]))
+    entry.add_to_hass(hass)
+    manager, _coordinator, _pin_manager, remote = _manager(
+        hass,
+        monkeypatch,
+        reservation,
+        entry=entry,
+    )
+    original_add = remote.async_add_passcode.side_effect
+
+    async def _fail_first_lock(**kwargs):
+        if kwargs["lock_id"] == 101:
+            raise TTLockGatewayError("offline")
+        return await original_add(**kwargs)
+
+    remote.async_add_passcode.side_effect = _fail_first_lock
+
+    await manager.async_reconcile()
+
+    locks = manager._records[reservation.id]["locks"]
+    assert "keyboard_pwd_id" not in locks["101"]
+    assert locks["101"]["last_error"] == "gateway_unavailable"
+    assert isinstance(locks["102"]["keyboard_pwd_id"], int)
+    assert isinstance(locks["103"]["keyboard_pwd_id"], int)
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_add_response_recovers_by_private_reservation_marker(
     hass, monkeypatch
 ) -> None:
@@ -1153,6 +1185,34 @@ def test_private_tokens_are_used_only_for_the_matching_ttlock_account(
 
     assert account[CONF_TTLOCK_ACCESS_TOKEN] == "current-private-access"
     assert account[CONF_TTLOCK_REFRESH_TOKEN] == "current-private-refresh"
+
+
+@pytest.mark.asyncio
+async def test_live_token_callback_persists_before_reconcile_completion(
+    hass, monkeypatch
+) -> None:
+    """Rotated live tokens are durable independently of provider outcome."""
+    manager, _coordinator, _pin_manager, _remote = _manager(
+        hass, monkeypatch, _reservation()
+    )
+    key = manager._account_key(manager._account)
+
+    await manager._async_persist_token_update(
+        key,
+        {
+            CONF_TTLOCK_ACCESS_TOKEN: "new-access",
+            CONF_TTLOCK_REFRESH_TOKEN: "new-refresh",
+            CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-20T12:00:00+00:00",
+        },
+    )
+
+    assert manager._data["tokens"] == {
+        "account_key": key,
+        CONF_TTLOCK_ACCESS_TOKEN: "new-access",
+        CONF_TTLOCK_REFRESH_TOKEN: "new-refresh",
+        CONF_TTLOCK_TOKEN_EXPIRES_AT: "2026-10-20T12:00:00+00:00",
+    }
+    manager._storage.async_save.assert_awaited_once_with(manager._data)
 
 
 @pytest.mark.asyncio

@@ -343,6 +343,7 @@ class GuestyApiClient:
         pin_read_failed = False
         pin_source_ids: set[str] = set()
         pin_custom_fields_unreadable_ids: set[str] = set()
+        pin_custom_fields_omitted_ids: set[str] = set()
         if pin_ids and (include_key_code or include_custom_fields):
             pin_fields = [RESERVATION_PIN_FIELDS]
             if include_key_code:
@@ -404,10 +405,15 @@ class GuestyApiClient:
                         target["customFields"] = raw_custom_fields
                     else:
                         pin_custom_fields_unreadable_ids.add(reservation_id)
+                        pin_custom_fields_omitted_ids.add(reservation_id)
 
         reservations: list[GuestyReservation] = []
         for item in raw_reservations:
-            reservation = GuestyReservation.from_api(item)
+            try:
+                reservation = GuestyReservation.from_api(item)
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring an invalid Guesty reservation response")
+                continue
             if reservation:
                 source_missing = bool(
                     pin_ids
@@ -430,6 +436,9 @@ class GuestyApiClient:
                     and reservation.listing_id in pin_ids
                 ):
                     reservation.custom_fields_read_failed = True
+                    reservation.custom_fields_projection_omitted = (
+                        reservation.id in pin_custom_fields_omitted_ids
+                    )
                 reservations.append(reservation)
         return reservations
 
@@ -456,22 +465,26 @@ class GuestyApiClient:
             )
         except GuestyNotFoundError:
             return None
-        if isinstance(data, dict):
-            prepared = dict(data)
-            if include_key_code:
-                # See the collection read above: an exact V2 result with an
-                # omitted requested Keycode represents an observed empty V2
-                # surface, not a failed read.
-                prepared.setdefault("keyCode", None)
+        if not isinstance(data, dict):
+            raise GuestyApiError("Guesty returned an invalid reservation response")
+        prepared = dict(data)
+        if include_key_code:
+            # See the collection read above: an exact V2 result with an
+            # omitted requested Keycode represents an observed empty V2
+            # surface, not a failed read.
+            prepared.setdefault("keyCode", None)
+        try:
             reservation = GuestyReservation.from_api(prepared)
-            if (
-                reservation is not None
-                and include_custom_fields
-                and not isinstance(data.get("customFields"), list)
-            ):
-                reservation.custom_fields_read_failed = True
-            return reservation
-        return None
+        except (KeyError, TypeError, ValueError) as err:
+            raise GuestyApiError(
+                "Guesty returned an invalid reservation response"
+            ) from err
+        if reservation is None:
+            raise GuestyApiError("Guesty returned an invalid reservation response")
+        if include_custom_fields and not isinstance(data.get("customFields"), list):
+            reservation.custom_fields_read_failed = True
+            reservation.custom_fields_projection_omitted = True
+        return reservation
 
     async def async_get_reservation_key_codes(
         self,
@@ -1298,7 +1311,21 @@ class GuestyApiClient:
         for _page_number in range(API_MAX_PAGES):
             query["skip"] = str(skip)
             page = await self._async_request("GET", path, params=query)
+            if isinstance(page, list):
+                raw_items = page
+            elif isinstance(page, dict) and "results" in page:
+                raw_items = page.get("results")
+                if not isinstance(raw_items, list):
+                    raise GuestyApiError(
+                        "Guesty returned an invalid paginated response"
+                    )
+            else:
+                raise GuestyApiError("Guesty returned an invalid paginated response")
             items = self._normalize_results(page)
+            if raw_items and not items:
+                raise GuestyApiError(
+                    "Guesty returned no valid objects in a populated page"
+                )
             if not items:
                 break
 

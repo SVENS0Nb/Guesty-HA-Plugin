@@ -194,7 +194,14 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
         occupancy={},
     )
     entry.runtime_data = SimpleNamespace(
-        coordinator=SimpleNamespace(data=data),
+        coordinator=SimpleNamespace(
+            data=data,
+            webhook_diagnostics=lambda: {
+                "pending_reservations": 1,
+                "oldest_pending_received_at": "2026-09-02T12:00:00+00:00",
+                "last_failure_reason": "reservation_not_visible",
+            },
+        ),
         client=SimpleNamespace(
             token_expires_at=1234,
             last_rate_limit_remaining=8,
@@ -229,6 +236,11 @@ async def test_diagnostics_hash_listing_ids_and_omit_private_text(hass) -> None:
     serialized = str(diagnostics)
 
     assert diagnostics["sync"]["has_last_error"] is True
+    assert diagnostics["sync"]["webhook_queue"] == {
+        "pending_reservations": 1,
+        "oldest_pending_received_at": "2026-09-02T12:00:00+00:00",
+        "last_failure_reason": "reservation_not_visible",
+    }
     assert diagnostics["listings"][0]["id_hash"] != listing.id
     assert "Private address" not in serialized
     assert "Private nickname" not in serialized

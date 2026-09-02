@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -100,6 +101,7 @@ class TTLockApiClient:
         access_token: str = "",
         refresh_token: str = "",
         token_expires_at: str | None = None,
+        token_updated: Callable[[dict[str, str]], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize the client without retaining the TTLock account password."""
         self._session = session
@@ -111,6 +113,7 @@ class TTLockApiClient:
         self.access_token = access_token.strip()
         self.refresh_token = refresh_token.strip()
         self.token_expires_at = token_expires_at
+        self._token_updated = token_updated
         self._token_lock = asyncio.Lock()
         if not self.client_id or not self.client_secret:
             raise ValueError("TTLock client ID and client secret are required")
@@ -138,10 +141,13 @@ class TTLockApiClient:
         )
         self.username = username
         self._apply_token_response(payload)
+        await self._async_notify_token_updated()
 
-    async def async_refresh_access_token(self) -> None:
+    async def async_refresh_access_token(self, *, force: bool = True) -> None:
         """Refresh an expired or nearly expired TTLock access token."""
         async with self._token_lock:
+            if not force and not self._token_needs_refresh():
+                return
             if not self.refresh_token:
                 raise TTLockAuthError("TTLock refresh token is unavailable")
             payload = await self._async_token_request(
@@ -153,6 +159,7 @@ class TTLockApiClient:
                 }
             )
             self._apply_token_response(payload)
+            await self._async_notify_token_updated()
 
     def token_snapshot(self) -> dict[str, str]:
         """Return token state for the integration's private store."""
@@ -161,6 +168,11 @@ class TTLockApiClient:
             "refresh_token": self.refresh_token,
             "token_expires_at": self.token_expires_at or "",
         }
+
+    async def _async_notify_token_updated(self) -> None:
+        """Persist a rotated token before any later operation can fail."""
+        if self._token_updated is not None:
+            await self._token_updated(self.token_snapshot())
 
     async def async_list_locks(self) -> list[dict[str, Any]]:
         """Return all locks owned by the configured TTLock App account."""
@@ -280,7 +292,7 @@ class TTLockApiClient:
     ) -> dict[str, Any]:
         """Run one authenticated TTLock API request."""
         if self._token_needs_refresh() and self.refresh_token:
-            await self.async_refresh_access_token()
+            await self.async_refresh_access_token(force=False)
         if not self.access_token:
             raise TTLockAuthError("TTLock access token is unavailable")
         request_form = {

@@ -73,6 +73,10 @@ def _empty_cache() -> dict:
         "last_full_reservation_sync": None,
         "last_incremental_sync": None,
         "last_error": None,
+        "pending_reservation_webhooks": {},
+        "last_webhook_received_at": None,
+        "last_webhook_processed_at": None,
+        "last_webhook_failure_reason": None,
     }
 
 
@@ -84,11 +88,15 @@ def _coordinator(
 ) -> GuestyDataUpdateCoordinator:
     entry = entry or _entry()
     entry.add_to_hass(hass)
+    storage = storage or SimpleNamespace(
+        async_load=AsyncMock(return_value=_empty_cache()),
+        async_save=AsyncMock(),
+    )
     return GuestyDataUpdateCoordinator(
         hass,
         entry,
         client or SimpleNamespace(),
-        storage or SimpleNamespace(),
+        storage,
     )
 
 
@@ -389,7 +397,7 @@ async def test_duplicate_reservation_webhooks_are_coalesced(hass, monkeypatch) -
         "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
     )
     instance = _coordinator(hass)
-    instance._async_apply_reservation_webhook = AsyncMock()
+    instance._async_apply_reservation_webhook = AsyncMock(return_value=(True, None))
     payload = {
         "event": "reservation.updated",
         "reservation": {"_id": "65f19af19824d7e6ff848f11"},
@@ -409,6 +417,210 @@ async def test_duplicate_reservation_webhooks_are_coalesced(hass, monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_reservation_webhook_is_durable_before_worker_runs(
+    hass, monkeypatch
+) -> None:
+    """A verified handoff reaches atomic storage before HTTP acknowledgement."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 3600
+    )
+    cache = _empty_cache()
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+
+    await instance.async_handle_webhook(
+        {
+            "event": "reservation.updated",
+            "reservation": {"_id": "reservation-1"},
+        }
+    )
+
+    record = cache["pending_reservation_webhooks"]["reservation-1"]
+    assert record["generation"] == 1
+    assert record["attempt_count"] == 0
+    assert instance.webhook_diagnostics()["pending_reservations"] == 1
+    assert "reservation-1" not in str(instance.webhook_diagnostics())
+    storage.async_save.assert_awaited()
+    await instance.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_webhook_retry_state_survives_normal_poll_interval(
+    hass, monkeypatch
+) -> None:
+    """A failed targeted read is persisted for a one-minute fast retry."""
+    cache = _empty_cache()
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+    received_at = NOW
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+
+    await instance._async_persist_reservation_webhook(
+        "reservation-1",
+        received_at,
+        inactive_hint=False,
+    )
+    await instance._async_update_webhook_queue_result(
+        "reservation-1",
+        expected_generation=1,
+        success=False,
+        reason="reservation_not_visible",
+    )
+
+    record = cache["pending_reservation_webhooks"]["reservation-1"]
+    assert record["attempt_count"] == 1
+    assert record["next_attempt_at"] == (received_at + timedelta(minutes=1)).isoformat()
+    assert cache["last_webhook_failure_reason"] == "reservation_not_visible"
+
+
+@pytest.mark.asyncio
+async def test_newer_webhook_generation_owns_inflight_queue_result(hass) -> None:
+    """An older targeted result cannot complete a newer verified change."""
+    cache = _empty_cache()
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+
+    await instance._async_persist_reservation_webhook(
+        "reservation-1", NOW, inactive_hint=False
+    )
+    await instance._async_persist_reservation_webhook(
+        "reservation-1", NOW + timedelta(seconds=1), inactive_hint=False
+    )
+    await instance._async_update_webhook_queue_result(
+        "reservation-1",
+        expected_generation=1,
+        success=True,
+        reason=None,
+    )
+
+    record = cache["pending_reservation_webhooks"]["reservation-1"]
+    assert record["generation"] == 2
+    assert record["next_attempt_at"] == (NOW + timedelta(seconds=1)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_pending_webhook_queue_resumes_after_restart(hass, monkeypatch) -> None:
+    """Cached verified work starts one owned worker after Home Assistant reload."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.dt_util.utcnow", lambda: NOW
+    )
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 3600
+    )
+    cache = _empty_cache()
+    cache["pending_reservation_webhooks"] = {
+        "reservation-1": {
+            "received_at": NOW.isoformat(),
+            "next_attempt_at": (NOW + timedelta(minutes=1)).isoformat(),
+            "attempt_count": 1,
+            "generation": 2,
+            "inactive_hint": False,
+        }
+    }
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+
+    await instance.async_load_cached_data()
+
+    assert instance.webhook_diagnostics()["pending_reservations"] == 1
+    assert instance.reservation_webhook_received_at("reservation-1") == NOW
+    assert instance._webhook_batch_task is not None
+    await instance.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_webhook_wakes_worker_waiting_for_later_retry(
+    hass, monkeypatch
+) -> None:
+    """Fresh work is not delayed by an older item's minute-scale wait."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
+    )
+    now = datetime.now(timezone.utc)
+    cache = _empty_cache()
+    cache["pending_reservation_webhooks"] = {
+        "reservation-old": {
+            "received_at": now.isoformat(),
+            "next_attempt_at": (now + timedelta(minutes=5)).isoformat(),
+            "attempt_count": 5,
+            "generation": 1,
+            "inactive_hint": False,
+        }
+    }
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+    instance._async_apply_reservation_webhook = AsyncMock(return_value=(True, None))
+    instance._restore_webhook_queue_state(cache)
+    await asyncio.sleep(0.01)
+
+    await instance.async_handle_webhook(
+        {
+            "event": "reservation.updated",
+            "reservation": {"_id": "reservation-new"},
+        }
+    )
+    for _ in range(20):
+        if any(
+            item.args == ("reservation-new",)
+            for item in instance._async_apply_reservation_webhook.await_args_list
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    instance._async_apply_reservation_webhook.assert_any_await("reservation-new")
+    await instance.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_signed_cancellation_revokes_cached_reservation_before_api_read(
+    hass, monkeypatch
+) -> None:
+    """A signed inactive hint exposes cleanup immediately and confirms later."""
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 3600
+    )
+    cache = _empty_cache()
+    cache["listings"] = {"listing-1": _listing().to_dict()}
+    cache["reservations"] = [_reservation().to_dict()]
+    storage = SimpleNamespace(
+        async_load=AsyncMock(return_value=cache),
+        async_save=AsyncMock(),
+    )
+    instance = _coordinator(hass, storage=storage)
+    await instance.async_load_cached_data()
+
+    await instance.async_handle_webhook(
+        {
+            "event": "reservation.updated",
+            "reservation": {"_id": "reservation-1", "status": "canceled"},
+        }
+    )
+
+    assert instance.data.reservations == []
+    assert (
+        cache["pending_reservation_webhooks"]["reservation-1"]["inactive_hint"] is True
+    )
+    await instance.async_shutdown()
+
+
+@pytest.mark.asyncio
 async def test_webhook_arriving_mid_fetch_is_replayed(hass, monkeypatch) -> None:
     """A later change to the same reservation cannot be lost during an API call."""
     monkeypatch.setattr(
@@ -419,12 +631,13 @@ async def test_webhook_arriving_mid_fetch_is_replayed(hass, monkeypatch) -> None
     release = asyncio.Event()
     calls = 0
 
-    async def apply_reservation(reservation_id: str) -> None:
+    async def apply_reservation(reservation_id: str) -> tuple[bool, None]:
         nonlocal calls
         calls += 1
         if calls == 1:
             started.set()
             await release.wait()
+        return True, None
 
     instance._async_apply_reservation_webhook = apply_reservation
     payload = {
@@ -443,16 +656,16 @@ async def test_webhook_arriving_mid_fetch_is_replayed(hass, monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_reservation_burst_uses_one_incremental_refresh(
+async def test_reservation_burst_preserves_each_targeted_refresh(
     hass, monkeypatch
 ) -> None:
-    """Bulk edits use one filtered sync instead of one API call per reservation."""
+    """Bulk edits preserve one targeted refresh for every reservation."""
     monkeypatch.setattr(
         "custom_components.guesty.coordinator.WEBHOOK_DEBOUNCE_SECONDS", 0
     )
     instance = _coordinator(hass)
     instance.async_refresh = AsyncMock()
-    instance._async_apply_reservation_webhook = AsyncMock()
+    instance._async_apply_reservation_webhook = AsyncMock(return_value=(True, None))
 
     await asyncio.gather(
         instance.async_handle_webhook(
@@ -464,8 +677,12 @@ async def test_reservation_burst_uses_one_incremental_refresh(
     )
     await _wait_webhook_worker(instance)
 
-    instance.async_refresh.assert_awaited_once_with()
-    instance._async_apply_reservation_webhook.assert_not_awaited()
+    instance.async_refresh.assert_not_awaited()
+    assert instance._async_apply_reservation_webhook.await_count == 2
+    assert {
+        call.args[0]
+        for call in instance._async_apply_reservation_webhook.await_args_list
+    } == {"res-1", "res-2"}
 
 
 @pytest.mark.asyncio
@@ -519,6 +736,8 @@ async def test_webhook_registration_recovers_with_bounded_backoff(
 
     async def _sleep(delay: float) -> None:
         delays.append(delay)
+        if delay == 3600:
+            await asyncio.Event().wait()
         await real_sleep(0)
 
     register = AsyncMock(side_effect=[None, "remote-webhook"])
@@ -534,11 +753,13 @@ async def test_webhook_registration_recovers_with_bounded_backoff(
     instance.async_start_webhook_registration_recovery("local-webhook")
     task = instance._webhook_registration_task
     assert task is not None
-    await task
+    while register.await_count < 2 or len(delays) < 3:
+        await real_sleep(0)
 
-    assert delays == [300, 600]
+    assert delays[:3] == [300, 600, 3600]
     assert register.await_count == 2
     assert instance._webhook_active is True
+    await instance.async_shutdown()
     assert instance._webhook_registration_task is None
 
 
@@ -606,13 +827,14 @@ def _reservation(
     *,
     key_code: str | None = None,
 ) -> GuestyReservation:
+    today = datetime.now(timezone.utc).date()
     return GuestyReservation(
         id=reservation_id,
         listing_id="listing-1",
         status="confirmed",
         confirmation_code=None,
-        check_in_date="2026-07-14",
-        check_out_date="2026-07-16",
+        check_in_date=(today + timedelta(days=1)).isoformat(),
+        check_out_date=(today + timedelta(days=3)).isoformat(),
         check_in_utc=None,
         check_out_utc=None,
         planned_arrival=None,
@@ -1084,8 +1306,8 @@ async def test_targeted_pin_enrichment_failure_preserves_cancellation_fields(
 
 
 @pytest.mark.asyncio
-async def test_targeted_reservation_error_falls_back_to_shared_refresh(hass) -> None:
-    """A failed exact read requests one normal coordinator refresh."""
+async def test_targeted_reservation_error_stays_in_targeted_retry_queue(hass) -> None:
+    """A failed exact read reports retry without starting an account scan."""
     client = SimpleNamespace(
         async_get_reservation=AsyncMock(
             side_effect=GuestyRetryableError("temporary outage")
@@ -1094,14 +1316,17 @@ async def test_targeted_reservation_error_falls_back_to_shared_refresh(hass) -> 
     instance = _coordinator(hass, client=client)
     instance.async_refresh = AsyncMock()
 
-    await instance._async_apply_reservation_webhook("reservation-1")
+    result = await instance._async_apply_reservation_webhook("reservation-1")
 
-    instance.async_refresh.assert_awaited_once_with()
+    assert result == (False, "api_unavailable")
+    instance.async_refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_missing_targeted_reservation_is_removed_then_refreshed(hass) -> None:
-    """A transient 404 removes stale access and still schedules a safety read."""
+async def test_missing_targeted_reservation_preserves_cache_for_targeted_retry(
+    hass,
+) -> None:
+    """An eventually-consistent 404 cannot erase a prior safe snapshot."""
     cache = _empty_cache()
     cache["listings"] = {"listing-1": _listing().to_dict()}
     cache["reservations"] = [_reservation().to_dict()]
@@ -1113,10 +1338,12 @@ async def test_missing_targeted_reservation_is_removed_then_refreshed(hass) -> N
     instance = _coordinator(hass, client=client, storage=storage)
     instance.async_refresh = AsyncMock()
 
-    await instance._async_apply_reservation_webhook("reservation-1")
+    result = await instance._async_apply_reservation_webhook("reservation-1")
 
-    assert instance.data.reservations == []
-    instance.async_refresh.assert_awaited_once_with()
+    assert result == (False, "reservation_not_visible")
+    assert instance.data is None
+    assert cache["reservations"] == [_reservation().to_dict()]
+    instance.async_refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio

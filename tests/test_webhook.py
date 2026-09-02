@@ -323,6 +323,8 @@ async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None
         async_ensure_webhook=AsyncMock(return_value="remote-id"),
         async_get_webhook_secret=AsyncMock(return_value=TEST_SECRET),
     )
+    update_entry = AsyncMock()
+    monkeypatch.setattr(hass.config_entries, "async_update_entry", update_entry)
 
     result = await guesty_webhook.async_register_guesty_webhook(
         hass, entry, client, "local-id"
@@ -335,6 +337,7 @@ async def test_existing_remote_subscription_is_reused(hass, monkeypatch) -> None
     )
     client.async_get_webhook_secret.assert_not_awaited()
     assert entry.data[CONF_GUESTY_WEBHOOK_SECRET] == TEST_SECRET
+    update_entry.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ from .const import (
     DEFAULT_STALE_THRESHOLD_HOURS,
     DOMAIN,
     EVENT_OCCUPANCY_CHANGED,
+    INACTIVE_RESERVATION_STATUSES,
     SYNC_STATUS_DEGRADED,
     SYNC_STATUS_ERROR,
     SYNC_STATUS_OK,
@@ -68,6 +69,13 @@ _LOGGER = logging.getLogger(__name__)
 INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=5)
 _PIN_ENRICHMENT_RETRY_KEY = "pin_enrichment_retry_needed"
 _RECENT_WEBHOOK_RETENTION = timedelta(minutes=10)
+_WEBHOOK_QUEUE_KEY = "pending_reservation_webhooks"
+_WEBHOOK_QUEUE_MAX_ITEMS = 1000
+_WEBHOOK_FAST_RETRY_MINUTES = 5
+_WEBHOOK_QUEUE_RETENTION = timedelta(days=7)
+_WEBHOOK_REASON_NOT_VISIBLE = "reservation_not_visible"
+_WEBHOOK_REASON_API_UNAVAILABLE = "api_unavailable"
+_WEBHOOK_REASON_PIN_UNAVAILABLE = "pin_projection_unavailable"
 
 
 def _is_full_reservation_sync_due(last_full_sync: str | None) -> bool:
@@ -126,6 +134,12 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._recent_reservation_webhooks: dict[str, datetime] = {}
         self._webhook_batch_task: asyncio.Task[None] | None = None
         self._webhook_registration_task: asyncio.Task[None] | None = None
+        self._webhook_queue_changed = asyncio.Event()
+        self._last_webhook_received_at: str | None = None
+        self._last_webhook_processed_at: str | None = None
+        self._last_webhook_failure_reason: str | None = None
+        self._oldest_pending_webhook_at: str | None = None
+        self._pending_webhook_count = 0
         self._unloaded = False
         super().__init__(
             hass,
@@ -142,6 +156,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
 
     def set_webhook_active(self, active: bool) -> None:
         """Track whether Guesty webhooks are registered."""
+        if self._webhook_active == active:
+            return
         self._webhook_active = active
         if self.data:
             self._update_data_webhook_flag()
@@ -200,8 +216,8 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         )
 
     def async_start_webhook_registration_recovery(self, webhook_id: str) -> None:
-        """Retry a failed remote webhook registration with bounded backoff."""
-        if self._unloaded or self._webhook_active:
+        """Own periodic webhook registration recovery and health checks."""
+        if self._unloaded:
             return
         task = self._webhook_registration_task
         if task is not None and not task.done():
@@ -212,15 +228,20 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         )
 
     async def _async_recover_webhook_registration(self, webhook_id: str) -> None:
-        """Recover push delivery without requiring a config-entry reload."""
+        """Recover and periodically verify push delivery until unload."""
         from .webhook import async_register_guesty_webhook
 
-        delay = WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS
+        delay = (
+            WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS
+            if self._webhook_active
+            else WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS
+        )
         try:
-            while not self._unloaded and not self._webhook_active:
+            while not self._unloaded:
                 await asyncio.sleep(delay)
                 if self._unloaded:
                     return
+                was_active = self._webhook_active
                 try:
                     guesty_webhook_id = await async_register_guesty_webhook(
                         self.hass,
@@ -237,11 +258,17 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                     guesty_webhook_id = None
                 if guesty_webhook_id is not None:
                     self.set_webhook_active(True)
-                    return
-                delay = min(
-                    delay * 2,
-                    WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS,
-                )
+                    delay = WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS
+                else:
+                    self.set_webhook_active(False)
+                    delay = (
+                        WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS
+                        if was_active
+                        else min(
+                            max(delay, WEBHOOK_REGISTRATION_RETRY_BASE_SECONDS) * 2,
+                            WEBHOOK_REGISTRATION_RETRY_MAX_SECONDS,
+                        )
+                    )
         finally:
             self._webhook_registration_task = None
 
@@ -249,6 +276,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         """Fetch data from Guesty and merge with cache."""
         async with self._refresh_lock:
             cache = await self._storage.async_load()
+            self._restore_webhook_queue_state(cache)
             last_full_sync = cache.get("last_full_reservation_sync")
             full_reservation_sync = bool(
                 cache.get(_PIN_ENRICHMENT_RETRY_KEY)
@@ -448,6 +476,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
     async def async_load_cached_data(self) -> GuestyCoordinatorData | None:
         """Load cached data for fast startup."""
         cache = await self._storage.async_load()
+        self._restore_webhook_queue_state(cache)
         if not self.config_entry.options.get(
             CONF_EXPOSE_GUEST_DETAILS,
             DEFAULT_EXPOSE_GUEST_DETAILS,
@@ -507,8 +536,22 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 for item_id, received_at in self._recent_reservation_webhooks.items()
                 if received_at >= cutoff
             }
+            inactive_hint = (
+                self._reservation_status_from_webhook(payload)
+                in INACTIVE_RESERVATION_STATUSES
+            )
+            await self._async_persist_reservation_webhook(
+                reservation_id,
+                now,
+                inactive_hint=inactive_hint,
+            )
             self._recent_reservation_webhooks[reservation_id] = now
             self._pending_reservation_ids.add(reservation_id)
+            if inactive_hint:
+                # A signed inactive status is sufficient to revoke local
+                # access immediately. The durable queue still confirms the
+                # final Guesty state and cannot lose cleanup on restart.
+                await self._async_remove_reservation_from_cache(reservation_id)
         else:
             listing_id = self._listing_id_from_webhook(payload)
             key = listing_id if is_safe_resource_id(listing_id) else "unknown"
@@ -539,16 +582,234 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 "guesty_process_webhook_batch",
             )
 
-    async def _async_process_webhook_batches(self) -> None:
-        """Collapse webhook bursts without losing changes that arrive mid-sync."""
-        try:
-            while not self._unloaded and (
-                self._pending_reservation_ids or self._pending_listing_payloads
+    @staticmethod
+    def _reservation_status_from_webhook(payload: dict[str, Any]) -> str | None:
+        """Extract one normalized reservation status from supported payloads."""
+        candidates: list[Any] = [payload]
+        data = payload.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+            nested = data.get("reservation")
+            if isinstance(nested, dict):
+                candidates.append(nested)
+        reservation = payload.get("reservation")
+        if isinstance(reservation, dict):
+            candidates.append(reservation)
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            status = candidate.get("status")
+            if isinstance(status, str) and status.strip():
+                return status.strip().lower().replace(" ", "_")
+        return None
+
+    @staticmethod
+    def _webhook_queue(cache: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return a defensively validated persistent reservation queue."""
+        raw_queue = cache.get(_WEBHOOK_QUEUE_KEY)
+        if not isinstance(raw_queue, dict):
+            return {}
+        queue: dict[str, dict[str, Any]] = {}
+        for reservation_id, raw_record in raw_queue.items():
+            if not is_safe_resource_id(reservation_id) or not isinstance(
+                raw_record, dict
             ):
+                continue
+            received_at = raw_record.get("received_at")
+            next_attempt_at = raw_record.get("next_attempt_at")
+            if not isinstance(received_at, str) or not isinstance(next_attempt_at, str):
+                continue
+            try:
+                received = dt_util.parse_datetime(received_at)
+                next_attempt = dt_util.parse_datetime(next_attempt_at)
+            except (TypeError, ValueError):
+                continue
+            if (
+                received is None
+                or next_attempt is None
+                or received.utcoffset() is None
+                or next_attempt.utcoffset() is None
+            ):
+                continue
+            attempt_count = raw_record.get("attempt_count", 0)
+            if not isinstance(attempt_count, int) or isinstance(attempt_count, bool):
+                attempt_count = 0
+            generation = raw_record.get("generation", 1)
+            if not isinstance(generation, int) or isinstance(generation, bool):
+                generation = 1
+            record: dict[str, Any] = {
+                "received_at": received.isoformat(),
+                "next_attempt_at": next_attempt.isoformat(),
+                "attempt_count": max(0, min(attempt_count, 100000)),
+                "generation": max(1, min(generation, 1000000000)),
+                "inactive_hint": bool(raw_record.get("inactive_hint", False)),
+            }
+            reason = raw_record.get("last_reason")
+            if reason in {
+                _WEBHOOK_REASON_NOT_VISIBLE,
+                _WEBHOOK_REASON_API_UNAVAILABLE,
+                _WEBHOOK_REASON_PIN_UNAVAILABLE,
+            }:
+                record["last_reason"] = reason
+            queue[reservation_id] = record
+        return queue
+
+    def _sync_webhook_queue_diagnostics(
+        self,
+        cache: dict[str, Any],
+        queue: dict[str, dict[str, Any]],
+    ) -> None:
+        """Update privacy-safe queue diagnostics from private state."""
+        self._pending_webhook_count = len(queue)
+        received_values = sorted(
+            record["received_at"]
+            for record in queue.values()
+            if isinstance(record.get("received_at"), str)
+        )
+        self._oldest_pending_webhook_at = (
+            received_values[0] if received_values else None
+        )
+        for cache_key, attribute in (
+            ("last_webhook_received_at", "_last_webhook_received_at"),
+            ("last_webhook_processed_at", "_last_webhook_processed_at"),
+            ("last_webhook_failure_reason", "_last_webhook_failure_reason"),
+        ):
+            value = cache.get(cache_key)
+            setattr(self, attribute, value if isinstance(value, str) else None)
+
+    def _restore_webhook_queue_state(self, cache: dict[str, Any]) -> None:
+        """Restore durable webhook work and start its owned worker."""
+        queue = self._webhook_queue(cache)
+        self._sync_webhook_queue_diagnostics(cache, queue)
+        if queue and not self._unloaded:
+            now = dt_util.utcnow()
+            cutoff = now - _RECENT_WEBHOOK_RETENTION
+            for reservation_id, record in queue.items():
+                received_at = dt_util.parse_datetime(record["received_at"])
+                if (
+                    received_at is not None
+                    and received_at.utcoffset() is not None
+                    and cutoff <= received_at <= now
+                ):
+                    self._recent_reservation_webhooks[reservation_id] = received_at
+            self._pending_reservation_ids.update(queue)
+            self._ensure_webhook_batch_task()
+
+    async def _async_persist_reservation_webhook(
+        self,
+        reservation_id: str,
+        received_at: datetime,
+        *,
+        inactive_hint: bool,
+    ) -> None:
+        """Persist a verified reservation event before acknowledging it."""
+        async with self._refresh_lock:
+            cache = await self._storage.async_load()
+            queue = self._webhook_queue(cache)
+            existing = queue.get(reservation_id)
+            if existing is None and len(queue) >= _WEBHOOK_QUEUE_MAX_ITEMS:
+                # Preserve the oldest work. Guesty will retry this newly
+                # rejected handoff because the exception prevents HTTP 202.
+                raise RuntimeError("Guesty webhook queue is full")
+            first_received = (
+                existing.get("received_at") if isinstance(existing, dict) else None
+            )
+            previous_generation = (
+                int(existing.get("generation", 1)) if isinstance(existing, dict) else 0
+            )
+            queue[reservation_id] = {
+                "received_at": (
+                    first_received
+                    if isinstance(first_received, str)
+                    else received_at.isoformat()
+                ),
+                "next_attempt_at": received_at.isoformat(),
+                "attempt_count": 0,
+                "generation": previous_generation + 1,
+                "inactive_hint": bool(
+                    inactive_hint or (existing or {}).get("inactive_hint", False)
+                ),
+            }
+            cache[_WEBHOOK_QUEUE_KEY] = queue
+            cache["last_webhook_received_at"] = received_at.isoformat()
+            await self._storage.async_save(cache)
+            self._sync_webhook_queue_diagnostics(cache, queue)
+            self._webhook_queue_changed.set()
+
+    def _next_webhook_retry_at(
+        self,
+        record: dict[str, Any],
+        now: datetime,
+    ) -> datetime:
+        """Return the next bounded eventual-consistency retry."""
+        attempts = int(record.get("attempt_count", 0))
+        received_at = dt_util.parse_datetime(str(record.get("received_at", "")))
+        if received_at is not None and attempts <= _WEBHOOK_FAST_RETRY_MINUTES:
+            boundary = received_at + timedelta(minutes=max(attempts, 1))
+            if boundary > now:
+                return boundary
+        normal_seconds = int(
+            self.config_entry.options.get(
+                CONF_SCAN_INTERVAL,
+                self.config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            )
+        )
+        return now + timedelta(seconds=max(normal_seconds, 60))
+
+    async def _async_update_webhook_queue_result(
+        self,
+        reservation_id: str,
+        *,
+        expected_generation: int,
+        success: bool,
+        reason: str | None,
+    ) -> None:
+        """Atomically complete or reschedule one webhook item."""
+        async with self._refresh_lock:
+            cache = await self._storage.async_load()
+            queue = self._webhook_queue(cache)
+            record = queue.get(reservation_id)
+            if record is None:
+                self._sync_webhook_queue_diagnostics(cache, queue)
+                return
+            if int(record.get("generation", 1)) != expected_generation:
+                # A newer verified event arrived while this targeted read was
+                # in flight. Its generation owns the queue item and must be
+                # replayed immediately instead of being completed or delayed
+                # by the older result.
+                self._sync_webhook_queue_diagnostics(cache, queue)
+                return
+            now = dt_util.utcnow()
+            if success:
+                queue.pop(reservation_id, None)
+                cache["last_webhook_processed_at"] = now.isoformat()
+                cache.pop("last_webhook_failure_reason", None)
+            else:
+                record["attempt_count"] = int(record.get("attempt_count", 0)) + 1
+                record["next_attempt_at"] = self._next_webhook_retry_at(
+                    record,
+                    now,
+                ).isoformat()
+                if reason in {
+                    _WEBHOOK_REASON_NOT_VISIBLE,
+                    _WEBHOOK_REASON_API_UNAVAILABLE,
+                    _WEBHOOK_REASON_PIN_UNAVAILABLE,
+                }:
+                    record["last_reason"] = reason
+                    cache["last_webhook_failure_reason"] = reason
+            if queue:
+                cache[_WEBHOOK_QUEUE_KEY] = queue
+            else:
+                cache.pop(_WEBHOOK_QUEUE_KEY, None)
+            await self._storage.async_save(cache)
+            self._sync_webhook_queue_diagnostics(cache, queue)
+
+    async def _async_process_webhook_batches(self) -> None:
+        """Drain durable webhook work without losing bursts or restarts."""
+        try:
+            while not self._unloaded:
                 await asyncio.sleep(WEBHOOK_DEBOUNCE_SECONDS)
-                reservation_ids = set(self._pending_reservation_ids)
                 listing_payloads = list(self._pending_listing_payloads.values())
-                self._pending_reservation_ids.clear()
                 self._pending_listing_payloads.clear()
 
                 if listing_payloads:
@@ -561,12 +822,106 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         )
                         await self.async_refresh()
 
-                if len(reservation_ids) == 1:
-                    await self._async_apply_reservation_webhook(reservation_ids.pop())
-                elif reservation_ids:
-                    # One filtered incremental query is cheaper than one request per
-                    # reservation during bulk edits or Guesty retry bursts.
-                    await self.async_refresh()
+                cache = await self._storage.async_load()
+                queue = self._webhook_queue(cache)
+                self._sync_webhook_queue_diagnostics(cache, queue)
+                if not queue:
+                    self._pending_reservation_ids.clear()
+                    if not self._pending_listing_payloads:
+                        return
+                    continue
+
+                now = dt_util.utcnow()
+                expired_ids: list[str] = []
+                due: list[tuple[bool, datetime, str, int]] = []
+                next_due: datetime | None = None
+                for reservation_id, record in queue.items():
+                    received_at = dt_util.parse_datetime(record["received_at"])
+                    attempt_at = dt_util.parse_datetime(record["next_attempt_at"])
+                    if received_at is None or attempt_at is None:
+                        expired_ids.append(reservation_id)
+                        continue
+                    if received_at < now - _WEBHOOK_QUEUE_RETENTION:
+                        expired_ids.append(reservation_id)
+                        continue
+                    if attempt_at <= now:
+                        due.append(
+                            (
+                                not bool(record.get("inactive_hint", False)),
+                                received_at,
+                                reservation_id,
+                                int(record.get("generation", 1)),
+                            )
+                        )
+                    elif next_due is None or attempt_at < next_due:
+                        next_due = attempt_at
+
+                for reservation_id in expired_ids:
+                    await self._async_update_webhook_queue_result(
+                        reservation_id,
+                        expected_generation=int(
+                            queue[reservation_id].get("generation", 1)
+                        ),
+                        success=True,
+                        reason=None,
+                    )
+                    self._pending_reservation_ids.discard(reservation_id)
+
+                if due:
+                    # Inactive hints first, then the oldest verified handoff.
+                    # Every reservation keeps its targeted read; bursts never
+                    # collapse into an incremental query that can miss it.
+                    due.sort()
+                    for (
+                        _active_sort,
+                        _received,
+                        reservation_id,
+                        generation,
+                    ) in due:
+                        if self._unloaded:
+                            return
+                        try:
+                            (
+                                success,
+                                reason,
+                            ) = await self._async_apply_reservation_webhook(
+                                reservation_id
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:  # Defensive background-task boundary.
+                            _LOGGER.exception(
+                                "Unexpected targeted Guesty webhook refresh failure"
+                            )
+                            success = False
+                            reason = _WEBHOOK_REASON_API_UNAVAILABLE
+                        await self._async_update_webhook_queue_result(
+                            reservation_id,
+                            expected_generation=generation,
+                            success=success,
+                            reason=reason,
+                        )
+                        if success:
+                            self._pending_reservation_ids.discard(reservation_id)
+                    continue
+
+                if self._pending_listing_payloads:
+                    continue
+                if next_due is None:
+                    return
+                # A newly persisted webhook wakes this shared waiter
+                # immediately. The timeout keeps unload and time-based retry
+                # boundaries responsive without a waiter per reservation.
+                delay = max(0.0, min((next_due - now).total_seconds(), 60.0))
+                try:
+                    await asyncio.wait_for(
+                        self._webhook_queue_changed.wait(),
+                        timeout=delay,
+                    )
+                except TimeoutError:
+                    pass
+                finally:
+                    self._webhook_queue_changed.clear()
         finally:
             self._webhook_batch_task = None
             # Close the race where a payload arrives after the loop checks its
@@ -580,6 +935,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         self._pending_reservation_ids.clear()
         self._pending_listing_payloads.clear()
         self._recent_reservation_webhooks.clear()
+        self._webhook_queue_changed.set()
         for task in (
             self._webhook_batch_task,
             self._webhook_registration_task,
@@ -746,8 +1102,11 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
             await self._storage.async_save(cache)
             self._async_set_targeted_data_from_cache(cache)
 
-    async def _async_apply_reservation_webhook(self, reservation_id: str) -> None:
-        """Refresh a single reservation from a webhook event."""
+    async def _async_apply_reservation_webhook(
+        self, reservation_id: str
+    ) -> tuple[bool, str | None]:
+        """Refresh one webhook reservation and report durable queue outcome."""
+        pin_observation_incomplete = False
         try:
             reservation = await self._client.async_get_reservation(reservation_id)
             if reservation is not None:
@@ -769,6 +1128,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                             ),
                         )
                     except (GuestyApiError, GuestyAuthError) as err:
+                        pin_observation_incomplete = True
                         if self.config_entry.options.get(
                             CONF_PIN_NATIVE_ENABLED,
                             DEFAULT_PIN_NATIVE_ENABLED,
@@ -788,6 +1148,7 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                         if enriched is not None:
                             reservation = enriched
                         else:
+                            pin_observation_incomplete = True
                             if self.config_entry.options.get(
                                 CONF_PIN_NATIVE_ENABLED,
                                 DEFAULT_PIN_NATIVE_ENABLED,
@@ -798,21 +1159,20 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                                 DEFAULT_PIN_CUSTOM_ENABLED,
                             ):
                                 reservation.custom_fields_read_failed = True
-                await self._async_try_enrich_native_keycodes([reservation])
+                if not await self._async_try_enrich_native_keycodes([reservation]):
+                    pin_observation_incomplete = True
         except (GuestyApiError, GuestyAuthError) as err:
             _LOGGER.warning(
-                "Webhook reservation refresh failed; running incremental sync: %s",
+                "Webhook reservation refresh failed; scheduling targeted retry: %s",
                 err,
             )
-            await self.async_refresh()
-            return
+            return False, _WEBHOOK_REASON_API_UNAVAILABLE
 
         if reservation is None:
-            await self._async_remove_reservation_from_cache(reservation_id)
-            # A 404 can mean a deletion or a short Guesty consistency delay.
-            # An immediate incremental pass safely covers both cases.
-            await self.async_refresh()
-            return
+            # A new reservation can remain unreadable for several minutes.
+            # Preserve any prior safe snapshot unless the signed payload
+            # already supplied an inactive status hint.
+            return False, _WEBHOOK_REASON_NOT_VISIBLE
 
         async with self._refresh_lock:
             cache = await self._storage.async_load()
@@ -840,6 +1200,27 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
                 cache,
                 reservation_overrides={reservation.id: reservation},
             )
+        incomplete_sources = bool(
+            pin_observation_incomplete
+            or reservation.key_code_read_failed
+            or (
+                reservation.custom_fields_read_failed
+                and not reservation.custom_fields_projection_omitted
+            )
+        )
+        if reservation.is_active_status() and incomplete_sources:
+            return False, _WEBHOOK_REASON_PIN_UNAVAILABLE
+        return True, None
+
+    def webhook_diagnostics(self) -> dict[str, Any]:
+        """Return privacy-safe durable webhook queue diagnostics."""
+        return {
+            "pending_reservations": self._pending_webhook_count,
+            "oldest_pending_received_at": self._oldest_pending_webhook_at,
+            "last_received_at": self._last_webhook_received_at,
+            "last_processed_at": self._last_webhook_processed_at,
+            "last_failure_reason": self._last_webhook_failure_reason,
+        }
 
     def _pin_provider_listing_ids(self) -> set[str]:
         """Return listings mapped to either PIN delivery provider."""

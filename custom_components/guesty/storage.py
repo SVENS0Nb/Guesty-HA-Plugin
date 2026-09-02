@@ -56,6 +56,10 @@ class GuestyStorage:
             "last_full_reservation_sync": None,
             "last_incremental_sync": None,
             "last_error": None,
+            "pending_reservation_webhooks": {},
+            "last_webhook_received_at": None,
+            "last_webhook_processed_at": None,
+            "last_webhook_failure_reason": None,
         }
 
     async def async_save(self, cache: dict[str, Any]) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import hashlib
 from types import SimpleNamespace
@@ -166,6 +167,60 @@ async def test_refresh_rotates_tokens_and_snapshot(monkeypatch) -> None:
     assert client.token_snapshot()["access_token"] == "rotated-access"
     assert client.token_snapshot()["refresh_token"] == "rotated-refresh"
     assert client.token_snapshot()["token_expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_rotated_token_is_persisted_at_refresh_boundary(monkeypatch) -> None:
+    """A later provider error cannot strand an already rotated refresh token."""
+    persist = AsyncMock()
+    client = TTLockApiClient(
+        object(),
+        region="eu",
+        client_id="client",
+        client_secret="secret",
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_updated=persist,
+    )
+    monkeypatch.setattr(
+        client,
+        "_async_token_request",
+        AsyncMock(
+            return_value={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 7776000,
+            }
+        ),
+    )
+
+    await client.async_refresh_access_token()
+
+    persist.assert_awaited_once()
+    assert persist.await_args.args[0]["access_token"] == "new-access"
+    assert persist.await_args.args[0]["refresh_token"] == "new-refresh"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expiry_checks_mint_one_ttlock_token(monkeypatch) -> None:
+    """The token lock rechecks freshness and avoids sequential double refresh."""
+    client = _client()
+    client.token_expires_at = "2020-01-01T00:00:00+00:00"
+    request = AsyncMock(
+        return_value={
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 7776000,
+        }
+    )
+    monkeypatch.setattr(client, "_async_token_request", request)
+
+    await asyncio.gather(
+        client.async_refresh_access_token(force=False),
+        client.async_refresh_access_token(force=False),
+    )
+
+    request.assert_awaited_once()
 
 
 @pytest.mark.asyncio

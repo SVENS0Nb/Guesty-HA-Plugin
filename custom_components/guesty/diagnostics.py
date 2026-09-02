@@ -126,6 +126,7 @@ async def async_get_config_entry_diagnostics(
             "webhook_active": data.webhook_active,
             "listings_count": len(data.listings),
             "reservations_count": len(data.reservations),
+            "webhook_queue": coordinator.webhook_diagnostics(),
         }
         diagnostics["listings"] = [
             {

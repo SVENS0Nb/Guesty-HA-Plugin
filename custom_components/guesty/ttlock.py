@@ -520,19 +520,12 @@ class GuestyTTLockManager:
                             end,
                         )
                     except TTLockCodeConflictError:
-                        try:
-                            await self._async_delete_all(record, marker)
-                        except TTLockApiError as err:
-                            self._record_retry_failure(record, now)
-                            record["last_error"] = self._error_reason(err)
-                            errors.append(record["last_error"])
-                        else:
-                            # Once Guesty confirms a PIN, a provider collision
-                            # must never rewrite it. Fail closed and wait for a
-                            # manual Guesty edit to supply the next code.
-                            self._record_retry_failure(record, now)
-                            record["last_error"] = "code_conflict"
-                            errors.append("code_conflict")
+                        # Once Guesty confirms a PIN, a provider collision must
+                        # never rewrite it. Keep independently synchronized
+                        # locks usable and retry only the failed delivery.
+                        self._record_retry_failure(record, now)
+                        record["last_error"] = "code_conflict"
+                        errors.append("code_conflict")
                     except TTLockOperationPendingError as err:
                         record["retry_at"] = (now + _REMOTE_PENDING_RETRY).isoformat()
                         record["last_error"] = self._error_reason(err)
@@ -569,7 +562,44 @@ class GuestyTTLockManager:
         start: datetime,
         end: datetime,
     ) -> None:
-        """Create or update the passcode on every mapped lock."""
+        """Create or update each mapped lock without cross-lock blocking."""
+        first_error: TTLockApiError | None = None
+        locks = record.setdefault("locks", {})
+        if not isinstance(locks, dict):
+            locks = record["locks"] = {}
+        for lock_id in lock_ids:
+            try:
+                await self._async_ensure_lock(
+                    reservation,
+                    record,
+                    lock_id,
+                    code,
+                    start,
+                    end,
+                )
+            except TTLockApiError as err:
+                state = locks.setdefault(str(lock_id), {})
+                if isinstance(state, dict):
+                    state["last_error"] = self._error_reason(err)
+                if first_error is None:
+                    first_error = err
+            else:
+                state = locks.get(str(lock_id))
+                if isinstance(state, dict):
+                    state.pop("last_error", None)
+        if first_error is not None:
+            raise first_error
+
+    async def _async_ensure_lock(
+        self,
+        reservation: GuestyReservation,
+        record: dict[str, Any],
+        lock_id: int,
+        code: str,
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        """Create or update one mapped lock passcode."""
         client = self._current_client()
         marker = self._passcode_name(reservation.id)
         now = dt_util.utcnow()
@@ -580,7 +610,7 @@ class GuestyTTLockManager:
         desired_window_fingerprint = self._window_fingerprint(start, end)
         record[_DESIRED_WINDOW_FINGERPRINT_KEY] = desired_window_fingerprint
 
-        for lock_id in lock_ids:
+        for lock_id in (lock_id,):
             state = locks.setdefault(str(lock_id), {})
             if not isinstance(state, dict):
                 state = locks[str(lock_id)] = {}
@@ -956,11 +986,16 @@ class GuestyTTLockManager:
         self, account: Mapping[str, Any], *, use_stored_tokens: bool
     ) -> TTLockApiClient:
         """Build a client from validated private account data."""
+        account_key = self._account_key(account)
         tokens = self._data.get("tokens", {}) if use_stored_tokens else {}
         if not isinstance(tokens, dict):
             tokens = {}
-        if tokens.get(_TOKEN_ACCOUNT_KEY) != self._account_key(account):
+        if tokens.get(_TOKEN_ACCOUNT_KEY) != account_key:
             tokens = {}
+
+        async def _token_updated(snapshot: dict[str, str]) -> None:
+            await self._async_persist_token_update(account_key, snapshot)
+
         return TTLockApiClient.from_hass(
             self.hass,
             region=str(account[CONF_TTLOCK_REGION]),
@@ -979,7 +1014,32 @@ class GuestyTTLockManager:
                 tokens.get(CONF_TTLOCK_TOKEN_EXPIRES_AT)
                 or account.get(CONF_TTLOCK_TOKEN_EXPIRES_AT, "")
             ),
+            token_updated=_token_updated,
         )
+
+    async def _async_persist_token_update(
+        self,
+        account_key: str,
+        tokens: Mapping[str, str],
+    ) -> None:
+        """Persist rotated TTLock credentials at the refresh boundary."""
+        snapshot = {
+            CONF_TTLOCK_ACCESS_TOKEN: str(tokens.get(CONF_TTLOCK_ACCESS_TOKEN, "")),
+            CONF_TTLOCK_REFRESH_TOKEN: str(tokens.get(CONF_TTLOCK_REFRESH_TOKEN, "")),
+            CONF_TTLOCK_TOKEN_EXPIRES_AT: str(
+                tokens.get(CONF_TTLOCK_TOKEN_EXPIRES_AT, "")
+            ),
+        }
+        if account_key == self._account_key(self._account):
+            self._data["tokens"] = {**snapshot, _TOKEN_ACCOUNT_KEY: account_key}
+        for record in self._records.values():
+            account_snapshot = record.get(_ACCOUNT_SNAPSHOT_KEY)
+            if (
+                isinstance(account_snapshot, dict)
+                and self._account_key(account_snapshot) == account_key
+            ):
+                account_snapshot.update(snapshot)
+        await self._storage.async_save(self._data)
 
     async def _persist_tokens(self) -> None:
         """Persist refreshed tokens privately without reloading Home Assistant."""
@@ -1224,11 +1284,11 @@ class GuestyTTLockManager:
             snapshot["error_reason"] = last_error
         if cleanup_pending or record.get("retired"):
             snapshot["ttlock_status"] = "cleanup_pending"
+        elif last_error == "operation_pending":
+            snapshot["ttlock_status"] = "pending"
         elif ready and ready < len(lock_ids):
             snapshot["ttlock_status"] = "partial"
         elif last_error == "guesty_pin_pending":
-            snapshot["ttlock_status"] = "pending"
-        elif last_error == "operation_pending":
             snapshot["ttlock_status"] = "pending"
         elif last_error == "gateway_unavailable":
             snapshot["ttlock_status"] = "gateway_offline"

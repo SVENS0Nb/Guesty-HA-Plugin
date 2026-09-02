@@ -633,6 +633,55 @@ async def test_pagination_detects_repeated_pages(monkeypatch) -> None:
         await client._async_paginate("/reservations")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"results": "not-a-list"},
+        {"results": ["invalid", None]},
+    ],
+)
+async def test_pagination_rejects_structurally_invalid_http_200(
+    monkeypatch, payload
+) -> None:
+    """A malformed success payload cannot masquerade as an empty account."""
+    client = _client()
+    monkeypatch.setattr(client, "_async_request", AsyncMock(return_value=payload))
+
+    with pytest.raises(GuestyApiError, match="invalid|no valid objects"):
+        await client._async_paginate("/reservations")
+
+
+@pytest.mark.asyncio
+async def test_invalid_reservation_row_does_not_discard_valid_sibling(
+    monkeypatch,
+) -> None:
+    """One malformed Guesty object is isolated inside a valid page."""
+    client = _client()
+    valid_id = "507f1f77bcf86cd799439011"
+    monkeypatch.setattr(
+        client,
+        "_async_paginate",
+        AsyncMock(
+            return_value=[
+                {"_id": "invalid-without-listing"},
+                {
+                    "_id": valid_id,
+                    "listingId": "listing-1",
+                    "status": "confirmed",
+                    "checkIn": "2026-08-10T15:00:00Z",
+                    "checkOut": "2026-08-11T11:00:00Z",
+                },
+            ]
+        ),
+    )
+
+    reservations = await client.async_get_reservations(30, 365)
+
+    assert [item.id for item in reservations] == [valid_id]
+
+
 def test_resource_ids_are_restricted_to_safe_path_segments() -> None:
     """Webhook-controlled IDs cannot alter an API URL path."""
     assert is_safe_resource_id("65f19af19824d7e6ff848f11")
@@ -939,6 +988,7 @@ async def test_sparse_per_reservation_pin_projection_is_classified_by_source(
     assert reservation.key_code_read_failed is False
     assert reservation.custom_fields_observed is False
     assert reservation.custom_fields_read_failed is True
+    assert reservation.custom_fields_projection_omitted is True
 
 
 @pytest.mark.asyncio
@@ -975,6 +1025,7 @@ async def test_optional_v2_pin_read_failure_keeps_fresh_reservations(
     assert [reservation.id for reservation in reservations] == [reservation_id]
     assert reservations[0].key_code_read_failed is True
     assert reservations[0].custom_fields_read_failed is True
+    assert reservations[0].custom_fields_projection_omitted is False
 
 
 @pytest.mark.asyncio
@@ -1148,6 +1199,7 @@ async def test_targeted_sparse_pin_projection_does_not_fan_out(monkeypatch) -> N
     assert reservation.key_code_read_failed is False
     assert reservation.custom_fields_observed is False
     assert reservation.custom_fields_read_failed is True
+    assert reservation.custom_fields_projection_omitted is True
     assert request.await_count == 1
 
 

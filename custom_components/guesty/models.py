@@ -197,6 +197,7 @@ class GuestyReservation:
     custom_fields: dict[str, Any] = field(default_factory=dict)
     custom_fields_observed: bool = False
     custom_fields_read_failed: bool = False
+    custom_fields_projection_omitted: bool = False
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> GuestyReservation | None:
@@ -416,6 +417,7 @@ class GuestyReservation:
             custom_fields={},
             custom_fields_observed=False,
             custom_fields_read_failed=False,
+            custom_fields_projection_omitted=False,
         )
 
 

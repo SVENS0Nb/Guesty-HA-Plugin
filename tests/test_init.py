@@ -220,12 +220,9 @@ async def test_setup_reuses_and_then_removes_transient_token(
     coordinator.set_webhook_active.assert_called_once_with(
         remote_webhook_id is not None
     )
-    if remote_webhook_id is None:
-        coordinator.async_start_webhook_registration_recovery.assert_called_once_with(
-            "local-webhook"
-        )
-    else:
-        coordinator.async_start_webhook_registration_recovery.assert_not_called()
+    coordinator.async_start_webhook_registration_recovery.assert_called_once_with(
+        "local-webhook"
+    )
 
 
 @pytest.mark.asyncio

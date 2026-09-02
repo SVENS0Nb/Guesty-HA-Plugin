@@ -694,7 +694,7 @@ class GuestySyncStatusSensor(
         data = self.coordinator.data
         if not data:
             return {}
-        return {
+        attributes = {
             "last_sync": data.last_sync,
             "last_listing_sync": data.last_listing_sync,
             "last_reservation_sync": data.last_reservation_sync,
@@ -707,6 +707,14 @@ class GuestySyncStatusSensor(
             "listings_count": len(data.listings),
             "reservations_count": len(data.reservations),
         }
+        attributes.update(
+            {
+                f"webhook_{key}": value
+                for key, value in self.coordinator.webhook_diagnostics().items()
+                if value is not None
+            }
+        )
+        return attributes
 
     @property
     def device_info(self) -> dict:
