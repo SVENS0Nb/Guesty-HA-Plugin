@@ -17,7 +17,7 @@ the discrepancy and update all affected artifacts together.
 - Last project-wide implementation review: 2026-07-29
 - Project-wide implementation baseline: integration version 2.2.10 working tree
 - Last knowledge-base consistency review: 2026-08-14
-- Knowledge-base baseline: integration version 2.4.6
+- Knowledge-base baseline: integration version 2.4.7
 - Consistency-review scope: all entry IDs, metadata, cross-references, evidence
   paths and explicit test names, plus affected current code, README, AGENTS.md,
   and official Guesty API documentation
@@ -92,6 +92,7 @@ requires them.
   `tests/test_init.py::test_partial_setup_failure_rolls_back_started_resources`,
   `tests/test_init.py::test_first_refresh_failure_shuts_down_coordinator`,
   `tests/test_init.py::test_remove_entry_cleans_every_private_and_remote_resource`,
+  `tests/test_coordinator.py::test_webhook_registration_health_check_does_not_block_startup`,
   `tests/test_scheduler.py::test_shutdown_cancels_transition_already_in_flight`,
   provider unload tests in `tests/test_loxone.py` and `tests/test_ttlock.py`
 
@@ -102,7 +103,9 @@ owned tasks; no worker may survive its config entry. The exact occupancy
 transition is tracked as an owned task and canceled even when unload overlaps
 an already-fired timer. Loxone and TTLock clear pending follow-up work and task
 ownership during unload; their debounced loops retain a late pending signal
-until another owned pass can consume it.
+until another owned pass can consume it. Lifetime workers such as the hourly
+webhook health check must use Home Assistant's config-entry background-task API
+so they remain lifecycle-owned without blocking startup completion.
 
 <a id="kb-arch-003"></a>
 
@@ -539,6 +542,7 @@ and repair notices that survive after Guesty access has actually recovered.
   `tests/test_webhook.py::test_failed_webhook_handoff_can_be_retried`,
   `tests/test_webhook.py::test_existing_remote_subscription_is_reused`,
   `tests/test_coordinator.py::test_webhook_registration_recovers_with_bounded_backoff`,
+  `tests/test_coordinator.py::test_webhook_registration_health_check_does_not_block_startup`,
   `tests/test_coordinator.py::test_shutdown_cancels_webhook_registration_recovery`
 
 Before accepting work, the Home Assistant endpoint enforces the Guesty/Standard
@@ -550,8 +554,10 @@ delete/create loop. A transient registration or secret-lookup failure starts one
 owned retry task with exponential backoff capped at one hour. Once active, the
 same task verifies the remote subscription hourly. An unchanged health check
 does not rewrite the Home Assistant config entry or trigger a reload; a failed
-check returns to bounded recovery. Success restores push delivery automatically
-and config-entry unload cancels the task.
+check returns to bounded recovery. This lifetime task is registered through the
+config entry as a background task, so Home Assistant neither waits for its
+hourly sleep during startup nor loses unload ownership. Success restores push
+delivery automatically and config-entry unload cancels the task.
 
 <a id="kb-guesty-008"></a>
 

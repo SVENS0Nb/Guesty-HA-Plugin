@@ -222,9 +222,12 @@ class GuestyDataUpdateCoordinator(DataUpdateCoordinator[GuestyCoordinatorData]):
         task = self._webhook_registration_task
         if task is not None and not task.done():
             return
-        self._webhook_registration_task = self.hass.async_create_task(
-            self._async_recover_webhook_registration(webhook_id),
-            "guesty_recover_webhook_registration",
+        self._webhook_registration_task = (
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self._async_recover_webhook_registration(webhook_id),
+                "guesty_recover_webhook_registration",
+            )
         )
 
     async def _async_recover_webhook_registration(self, webhook_id: str) -> None:

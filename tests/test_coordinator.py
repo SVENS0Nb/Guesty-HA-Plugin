@@ -764,6 +764,42 @@ async def test_webhook_registration_recovers_with_bounded_backoff(
 
 
 @pytest.mark.asyncio
+async def test_webhook_registration_health_check_does_not_block_startup(
+    hass, monkeypatch
+) -> None:
+    """The lifetime health check is a config-entry background task."""
+    instance = _coordinator(hass)
+    sleep_started = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def _wait_forever(delay: float) -> None:
+        if delay == 3600:
+            sleep_started.set()
+            await asyncio.Event().wait()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(
+        "custom_components.guesty.coordinator.asyncio.sleep",
+        _wait_forever,
+    )
+
+    instance.set_webhook_active(True)
+    instance.async_start_webhook_registration_recovery("local-webhook")
+    await sleep_started.wait()
+
+    task = instance._webhook_registration_task
+    assert task is not None
+    assert task in hass._background_tasks
+    assert task not in hass._tasks
+    assert task in instance.config_entry._background_tasks
+
+    await instance.async_shutdown()
+    await real_sleep(0)
+    assert instance._webhook_registration_task is None
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_webhook_registration_recovery(
     hass, monkeypatch
 ) -> None:
