@@ -2,7 +2,7 @@ aiohttp>=3.9,<4.0
 bandit>=1.8,<2.0
 pip-audit>=2.9,<3.0
 pytest>=8.0,<10.0
-pytest-asyncio>=0.24,<2.0
+pytest-asyncio>=1.4.0,<2.0
 # This upstream harness pins matching Home Assistant and pytest versions
 # exactly. Upgrade the harness as a unit; overriding either transitive pin
 # creates an invalid environment and is caught by `pip check`.
