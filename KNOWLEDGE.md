@@ -17,7 +17,7 @@ the discrepancy and update all affected artifacts together.
 - Last project-wide implementation review: 2026-07-29
 - Project-wide implementation baseline: integration version 2.2.10 working tree
 - Last knowledge-base consistency review: 2026-08-14
-- Knowledge-base baseline: integration version 2.4.7
+- Knowledge-base baseline: integration version 2.4.8
 - Consistency-review scope: all entry IDs, metadata, cross-references, evidence
   paths and explicit test names, plus affected current code, README, AGENTS.md,
   and official Guesty API documentation
@@ -1244,6 +1244,14 @@ The Guesty Keycode may exist far in advance, but the Loxone user is created
 only within the configured provisioning lead, default six hours before allowed
 access. It uses the shared early/late validity window, timespan state, and
 remote auto-delete.
+
+Validated correction (2026-11-13; full release CI on Python 3.13 and 3.14): unresolved
+Loxone delivery and cleanup retries keep reconciliation `partial`, including
+passes that defer all provider calls and passes after a manager restart.
+Diagnostics report only retry counts and the earliest retry timestamp. The
+correction must not reset retry state, rotate confirmed PINs, or initiate extra
+Guesty writes. Regression coverage: `test_loxone_backoff_stays_partial_after_restart`
+and `test_deferred_loxone_cleanup_stays_partial` in `tests/test_loxone.py`.
 
 <a id="kb-loxone-002"></a>
 

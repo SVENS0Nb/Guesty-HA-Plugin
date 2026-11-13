@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
@@ -63,6 +64,71 @@ from custom_components.guesty.models import GuestyListing, GuestyReservation
 
 NOW = datetime.fromisoformat("2026-07-14T12:00:00+00:00")
 PIN_FIELD_ID = "65fab102a5284d73c6206db0"
+
+
+@pytest.mark.asyncio
+async def test_loxone_backoff_stays_partial_after_restart(hass, monkeypatch) -> None:
+    """Deferred failures must not appear healthy or change confirmed PINs."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(hours=1),
+        check_out=NOW + timedelta(days=2),
+        key_code="713456",
+    )
+    manager, _, guesty, remote = _manager(hass, monkeypatch, reservation)
+    remote.async_add_or_update_user.side_effect = LoxoneApiError("unreachable")
+    await manager.async_reconcile()
+    assert manager.diagnostics()["last_reconcile_result"] == "partial"
+    assert manager.diagnostics()["loxone_retry_records"] == 1
+    persisted = deepcopy(manager._data)
+    retry_at = datetime.fromisoformat(
+        manager._records[reservation.id]["loxone_retry_at"]
+    )
+    await manager.async_reconcile()
+    assert manager.diagnostics()["last_reconcile_result"] == "partial"
+    assert remote.async_add_or_update_user.await_count == 1
+    guesty.async_update_reservation_key_code.assert_not_awaited()
+    guesty.async_update_reservation_custom_field.assert_not_awaited()
+
+    restarted, _, guesty, remote = _manager(hass, monkeypatch, reservation)
+    restarted._data = persisted
+    await restarted.async_reconcile()
+    assert restarted.diagnostics()["last_reconcile_result"] == "partial"
+    assert restarted.diagnostics()["next_loxone_retry_at"] == retry_at.isoformat()
+    remote.async_add_or_update_user.assert_not_awaited()
+    assert restarted._records[reservation.id]["code"] == "713456"
+    monkeypatch.setattr(
+        loxone.dt_util, "utcnow", lambda: retry_at + timedelta(seconds=1)
+    )
+    await restarted.async_reconcile()
+    assert restarted.diagnostics()["last_reconcile_result"] == "ok"
+    assert restarted.diagnostics()["loxone_retry_records"] == 0
+    assert restarted.diagnostics()["next_loxone_retry_at"] is None
+    assert restarted._records[reservation.id]["code"] == "713456"
+    remote.async_set_access_code.assert_awaited_once()
+    guesty.async_update_reservation_key_code.assert_not_awaited()
+    guesty.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deferred_loxone_cleanup_stays_partial(hass, monkeypatch) -> None:
+    """A code-free cleanup tombstone remains visible throughout backoff."""
+    reservation = _reservation(
+        check_in=NOW - timedelta(hours=1),
+        check_out=NOW + timedelta(days=2),
+        key_code="713456",
+    )
+    manager, coordinator, guesty, remote = _manager(hass, monkeypatch, reservation)
+    await manager.async_reconcile()
+    coordinator.data.reservations = []
+    remote.async_delete_user.side_effect = LoxoneApiError("unreachable")
+    await manager.async_reconcile()
+    await manager.async_reconcile()
+    assert manager.diagnostics()["last_reconcile_result"] == "partial"
+    assert manager.diagnostics()["loxone_cleanup_retry_records"] == 1
+    assert manager._records[reservation.id].get("code") is None
+    remote.async_delete_user.assert_awaited_once()
+    guesty.async_update_reservation_key_code.assert_not_awaited()
+    guesty.async_update_reservation_custom_field.assert_not_awaited()
 
 
 def _listing() -> GuestyListing:
