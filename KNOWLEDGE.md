@@ -1245,8 +1245,8 @@ only within the configured provisioning lead, default six hours before allowed
 access. It uses the shared early/late validity window, timespan state, and
 remote auto-delete.
 
-Prepared correction (2026-11-13; full integration validation pending): unresolved
-Loxone delivery and cleanup retries must keep reconciliation `partial`, including
+Validated correction (2026-11-13; full release CI on Python 3.13 and 3.14): unresolved
+Loxone delivery and cleanup retries keep reconciliation `partial`, including
 passes that defer all provider calls and passes after a manager restart.
 Diagnostics report only retry counts and the earliest retry timestamp. The
 correction must not reset retry state, rotate confirmed PINs, or initiate extra
