@@ -863,6 +863,11 @@ python -m pytest
   Buchungszeitfenster hin; `unknown_token` stößt höchstens einmal in fünf
   Minuten einen begrenzten Abgleich der aktuell laufenden Guesty-Links an.
 - **Diagnostics** – Integration → ⋮ → Diagnose-Daten herunterladen
+- **Loxone wartet nach einem Fehler** – ausstehende Zustellungs- und
+  Löschwiederholungen bleiben im Gesamtergebnis als `partial` sichtbar.
+  `loxone_retry_records`, `loxone_cleanup_retry_records` und
+  `next_loxone_retry_at` zeigen Anzahl und nächsten Versuch, auch während
+  einer Wartezeit. Bereits bestätigte PINs bleiben unverändert.
 - **Ausführliche Logs** – folgende Konfiguration in `configuration.yaml`
   eintragen und Home Assistant neu starten:
 

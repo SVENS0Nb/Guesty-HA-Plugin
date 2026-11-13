@@ -1049,6 +1049,13 @@ class GuestyLoxoneManager:
                 if cleanup_retry_at:
                     next_run = self._earlier(next_run, cleanup_retry_at)
 
+            # A deferred provider attempt is still an unresolved failure. This
+            # also covers persisted cleanup tombstones and manager restarts.
+            provider_retries, _ = self._loxone_retry_summary()
+            if provider_retries["loxone"]:
+                errors.append("loxone_retry_pending")
+            if provider_retries["cleanup"]:
+                errors.append("loxone_cleanup_retry_pending")
             await self._storage.async_save(self._data)
             self._schedule_at(next_run)
             self._last_reconcile_at = now.isoformat()
@@ -3240,10 +3247,25 @@ class GuestyLoxoneManager:
         )
         return hashlib.sha256(value.encode()).hexdigest()
 
+    def _loxone_retry_summary(self) -> tuple[dict[str, int], datetime | None]:
+        """Summarize unresolved delivery/cleanup without exposing record data."""
+        counts = {"loxone": 0, "cleanup": 0}
+        next_retry: datetime | None = None
+        for record in self._records.values():
+            if not isinstance(record, dict):
+                continue
+            for operation in counts:
+                retry_at = self._retry_at(record, operation)
+                if retry_at is not None:
+                    counts[operation] += 1
+                    next_retry = self._earlier(next_retry, retry_at)
+        return counts, next_retry
+
     def diagnostics(self) -> dict[str, Any]:
         """Return a privacy-safe operational summary without PINs or names."""
         records = self._records
         retry_counts, next_retry = self._guesty_retry_summary()
+        provider_retries, provider_retry_at = self._loxone_retry_summary()
         queued_at_values = sorted(
             value
             for record in records.values()
@@ -3279,6 +3301,11 @@ class GuestyLoxoneManager:
             "last_reconcile_result": self._last_result,
             "has_last_error": self._last_error is not None,
             "last_error": self._last_error,
+            "loxone_retry_records": provider_retries["loxone"],
+            "loxone_cleanup_retry_records": provider_retries["cleanup"],
+            "next_loxone_retry_at": (
+                provider_retry_at.isoformat() if provider_retry_at else None
+            ),
             "generated_during_last_reconcile": self._last_generated,
             "rotated_during_last_reconcile": self._last_rotated,
             "provisioned_during_last_reconcile": self._last_provisioned,
