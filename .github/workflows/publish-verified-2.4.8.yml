@@ -1,0 +1,36 @@
+name: Publish verified Guesty 2.4.8
+on:
+  push:
+    branches: [release/verified-guesty-2.4.8]
+    paths: [.github/workflows/publish-verified-2.4.8.yml]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.repository == 'SVENS0Nb/Guesty-HA-Plugin'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: SVENS0Nb/Guesty-HA-Plugin
+      TARGET: 42c08ada87a0ca2329827fc72efc581a50b81c43
+    steps:
+      - name: Verify exact source and successful main-branch checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/custom_components/guesty/manifest.json?ref=$TARGET" --jq .content | base64 --decode > manifest.json
+          python -c 'import json; assert json.load(open("manifest.json"))["version"] == "2.4.8"'
+          gh api "repos/$REPO/actions/runs?head_sha=$TARGET&per_page=100" > runs.json
+          python -c 'import json; runs=json.load(open("runs.json"))["workflow_runs"]; assert any(r["name"]=="Validate" and r["event"]=="push" and r["conclusion"]=="success" for r in runs); assert any(r["name"]=="Push on main" and r["conclusion"]=="success" for r in runs); assert all(r["status"]=="completed" and r["conclusion"] in ("success","skipped") for r in runs)'
+          gh api "repos/$REPO/git/matching-refs/tags/v2.4.8" > matching-tags.json
+          python -c 'import json,os; tags=[t for t in json.load(open("matching-tags.json")) if t["ref"]=="refs/tags/v2.4.8"]; assert len(tags)<=1; assert not tags or tags[0]["object"]["sha"]==os.environ["TARGET"]'
+      - name: Publish exact tested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view v2.4.8 --repo "$REPO" >/dev/null 2>&1; then
+            gh release create v2.4.8 --repo "$REPO" --target "$TARGET" --title "v2.4.8 — Reliable Loxone retry status" --notes "Loxone delivery and cleanup failures remain visible during retry backoff, including after a restart. Diagnostics now show retry counts and the next attempt. Confirmed PINs, private stores, provider ownership and retry scheduling are unchanged. Full release validation passed on Python 3.13 and 3.14 (522 tests), plus the main-branch security checks."
+          fi
+          gh api "repos/$REPO/git/ref/tags/v2.4.8" --jq .object.sha | grep -Fx "$TARGET"
