@@ -150,7 +150,7 @@ class LoxoneApiClient:
                 return None
         raise LoxoneApiError("Loxone could not verify whether the user exists", code)
 
-    async def _async_user_uuids(self) -> list[str]:
+    async def _async_user_list(self) -> list[dict[str, Any]]:
         """Require a complete bounded user list, never a partial/truncated scan."""
         users, _code = await self._async_request("getuserlist2")
         if not isinstance(users, list) or len(users) > 1000:
@@ -161,7 +161,11 @@ class LoxoneApiClient:
             if not isinstance(uuid, str) or not uuid or uuid in uuids:
                 raise LoxoneApiError("Loxone returned an invalid user list")
             uuids.append(uuid)
-        return uuids
+        return users
+
+    async def _async_user_uuids(self) -> list[str]:
+        """Keep every user in authoritative absence checks, including admins."""
+        return [user["uuid"] for user in await self._async_user_list()]
 
     @staticmethod
     def _matches_user_id(user: dict[str, Any], user_id: str) -> bool:
@@ -192,12 +196,22 @@ class LoxoneApiClient:
             return details
         # Older versions wrote the NFC Code Touch ID, which checkuserid does
         # not search. Scan completely before adopting; two matches are unsafe.
-        uuids = await self._async_user_uuids()
-        if len(uuids) > 128:
+        users = await self._async_user_list()
+        if len(users) > 128:
             raise LoxoneApiError("Loxone legacy recovery exceeds the safe scan limit")
         matches = []
-        for uuid in uuids:
-            details = await self.async_get_user(uuid)
+        for user in users:
+            # User managers cannot read administrator details. An administrator
+            # cannot be a valid managed guest; never request or adopt one.
+            if user.get("isAdmin") is True:
+                if user.get("uniqueUserId") == user_id:
+                    raise LoxoneApiError(
+                        "Loxone managed user has unexpected privileges"
+                    )
+                continue
+            if user.get("isAdmin") is not False:
+                raise LoxoneApiError("Loxone user list lacks explicit privilege state")
+            details = await self.async_get_user(user["uuid"])
             if details is not None and self._matches_user_id(details, user_id):
                 matches.append(details)
         if len(matches) > 1:

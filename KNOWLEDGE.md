@@ -1283,7 +1283,11 @@ updates verify ownership, set the unique marker and omit the NFC field so its
 current value is preserved. Healthy existing users are not mass-rewritten on
 upgrade. Empty unique lookups fall back to a complete bounded legacy scan
 (at most 128 users); any failed read, conflicting marker, privileged match,
-oversized scan or duplicate match fails closed. Never infer absence from a
+oversized scan or duplicate match fails closed. User managers cannot read admin
+details: legacy recovery excludes explicitly flagged administrators without
+requesting their records, but an admin with the requested unique ID fails closed.
+Missing role metadata also fails closed. Absence verification still includes all
+UUIDs, including administrators. Never infer absence from a
 truncated scan, malformed success or generic HTTP 404/500.
 
 An absent-user response is corroborated by the complete validated user list.
