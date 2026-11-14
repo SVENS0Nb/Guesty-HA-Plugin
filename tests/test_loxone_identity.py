@@ -52,7 +52,7 @@ async def test_empty_lookup_requires_successful_full_legacy_scan(monkeypatch):
         AsyncMock(
             side_effect=[
                 ({}, 200),
-                ([{"uuid": "a"}], 200),
+                ([{"uuid": "a", "isAdmin": False}], 200),
                 LoxoneApiError("read failed"),
             ]
         ),
@@ -89,12 +89,50 @@ def client():
 
 
 @pytest.mark.asyncio
+async def test_legacy_scan_does_not_read_administrator_details(monkeypatch):
+    api = client()
+    request = AsyncMock(
+        side_effect=[
+            ({"uuid": ""}, 200),
+            (
+                [
+                    {"uuid": "admin", "isAdmin": True},
+                    {"uuid": "guest", "isAdmin": False},
+                ],
+                200,
+            ),
+            ({"uuid": "guest", "userid": "guesty-test", "uniqueUserId": ""}, 200),
+        ]
+    )
+    monkeypatch.setattr(api, "_async_request", request)
+    assert (await api.async_find_user_by_userid("guesty-test"))["uuid"] == "guest"
+    assert all(c.args[0] != "getuser/admin" for c in request.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"uuid": "unknown"},
+        {"uuid": "admin", "isAdmin": True, "uniqueUserId": "guesty-test"},
+    ],
+)
+async def test_legacy_scan_rejects_unknown_role_or_admin_collision(monkeypatch, row):
+    api = client()
+    monkeypatch.setattr(
+        api, "_async_request", AsyncMock(side_effect=[({}, 200), ([row], 200)])
+    )
+    with pytest.raises(LoxoneApiError):
+        await api.async_find_user_by_userid("guesty-test")
+
+
+@pytest.mark.asyncio
 async def test_legacy_recovery_enumerates_after_empty_unique_lookup(monkeypatch):
     api = client()
     request = AsyncMock(
         side_effect=[
             ({"uuid": "", "name": ""}, 200),
-            ([{"uuid": "legacy"}], 200),
+            ([{"uuid": "legacy", "isAdmin": False}], 200),
             ({"uuid": "legacy", "userid": "guesty-test", "uniqueUserId": ""}, 200),
         ]
     )
@@ -110,7 +148,7 @@ async def test_recovery_rejects_duplicate_legacy_markers(monkeypatch):
     request = AsyncMock(
         side_effect=[
             ({"uuid": ""}, 200),
-            ([{"uuid": "a"}, {"uuid": "b"}], 200),
+            ([{"uuid": "a", "isAdmin": False}, {"uuid": "b", "isAdmin": False}], 200),
             ({"uuid": "a", "userid": "guesty-test"}, 200),
             ({"uuid": "b", "userid": "guesty-test"}, 200),
         ]
