@@ -132,6 +132,7 @@ async def test_setup_refreshes_privacy_stripped_pin_sources(
         "async_setup_webhook",
         AsyncMock(return_value=None),
     )
+
     async def forward_with_ready_hub(current_entry, platforms):
         assert current_entry.runtime_data.hub_device_id
 
