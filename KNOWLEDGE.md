@@ -17,7 +17,7 @@ the discrepancy and update all affected artifacts together.
 - Last project-wide implementation review: 2026-07-29
 - Project-wide implementation baseline: integration version 2.2.10 working tree
 - Last knowledge-base consistency review: 2026-08-14
-- Knowledge-base baseline: integration version 2.4.8
+- Knowledge-base baseline: integration version 2.4.9
 - Consistency-review scope: all entry IDs, metadata, cross-references, evidence
   paths and explicit test names, plus affected current code, README, AGENTS.md,
   and official Guesty API documentation
@@ -1258,8 +1258,12 @@ and `test_deferred_loxone_cleanup_stays_partial` in `tests/test_loxone.py`.
 ### KB-LOXONE-002 — Existing users are updated, not replaced
 
 - Status: Validated
-- Last validated: 2026-07-28
-- Evidence: `custom_components/guesty/loxone.py`, `tests/test_loxone.py`
+- Last validated: 2026-11-13
+- Evidence: `custom_components/guesty/loxone.py`, `tests/test_loxone.py`,
+  `custom_components/guesty/loxone_api.py`, `tests/test_loxone_identity.py`,
+  [Loxone Usermanagement V17](https://www.loxone.com/enen/wp-content/uploads/sites/3/2026/04/1700_Usermanagement.pdf)
+- External status: current
+- Last externally checked: 2026-11-13
 
 The reservation-derived user UUID and confirmed PIN remain stable across time
 changes. Validity, label, and groups update in place. Moving outside the lead
@@ -1271,6 +1275,24 @@ ID is the label.
 Loxone collision results `201` and `409` are not success. Tentative users are
 deleted, the confirmed Guesty PIN remains unchanged, and a persistent conflict
 waits for a manual Guesty edit.
+
+Loxone `uniqueUserId` is the unique User ID searched by `checkuserid`; legacy
+`userid` is the NFC Code Touch ID. Versions before 2.4.9 wrote only the latter.
+New users receive both markers for NFC compatibility. Existing UUID-addressed
+updates verify ownership, set the unique marker and omit the NFC field so its
+current value is preserved. Healthy existing users are not mass-rewritten on
+upgrade. Empty unique lookups fall back to a complete bounded legacy scan
+(at most 128 users); any failed read, conflicting marker, privileged match,
+oversized scan or duplicate match fails closed. Never infer absence from a
+truncated scan, malformed success or generic HTTP 404/500.
+
+An absent-user response is corroborated by the complete validated user list.
+Cleanup checks before deleting and verifies absence afterwards; a generic
+server error retains the tombstone. HTTP 400/404/500 error envelopes are decoded
+only for exact getuser/deleteuser commands, not globally accepted as success.
+Unknown old server bindings are never redirected to another configured server.
+The provider retry-state version requeues known-target Loxone/cleanup retries
+once, preserving PINs, UUIDs, counters, snapshots and Guesty/TTLock state.
 
 ## TTLock
 

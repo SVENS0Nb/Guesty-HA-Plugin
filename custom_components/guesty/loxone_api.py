@@ -137,37 +137,72 @@ class LoxoneApiClient:
 
     async def async_get_user(self, user_uuid: str) -> dict[str, Any] | None:
         """Return a full Loxone user record, or None when it no longer exists."""
-        try:
-            value, code = await self._async_request(
-                f"getuser/{quote(user_uuid, safe='')}",
-                accepted_codes={200, 400, 404, 500},
-            )
-        except LoxoneApiError as err:
-            if getattr(err, "code", None) in {400, 404}:
-                return None
-            raise
+        value, code = await self._async_request(
+            f"getuser/{quote(user_uuid, safe='')}",
+            accepted_codes={200, 400, 404, 500},
+        )
         if code == 200:
-            return value if isinstance(value, dict) else None
+            if not isinstance(value, dict) or value.get("uuid") != user_uuid:
+                raise LoxoneApiError("Loxone returned an invalid user record")
+            return value
         if code in {400, 404} or (code == 500 and self._is_not_found(value)):
-            return None
+            if user_uuid not in await self._async_user_uuids():
+                return None
         raise LoxoneApiError("Loxone could not verify whether the user exists", code)
+
+    async def _async_user_uuids(self) -> list[str]:
+        """Require a complete bounded user list, never a partial/truncated scan."""
+        users, _code = await self._async_request("getuserlist2")
+        if not isinstance(users, list) or len(users) > 1000:
+            raise LoxoneApiError("Loxone returned an invalid user list")
+        uuids = []
+        for user in users:
+            uuid = user.get("uuid") if isinstance(user, dict) else None
+            if not isinstance(uuid, str) or not uuid or uuid in uuids:
+                raise LoxoneApiError("Loxone returned an invalid user list")
+            uuids.append(uuid)
+        return uuids
+
+    @staticmethod
+    def _matches_user_id(user: dict[str, Any], user_id: str) -> bool:
+        """Honor the unique ID while accepting unambiguous pre-2.4.9 markers."""
+        unique = user.get("uniqueUserId")
+        legacy = user.get("userid")
+        if unique not in (None, "", user_id) and legacy == user_id:
+            raise LoxoneApiError("Loxone user identity is ambiguous")
+        matches = unique == user_id or (unique in (None, "") and legacy == user_id)
+        if matches and user.get("isAdmin"):
+            raise LoxoneApiError("Loxone managed user has unexpected privileges")
+        return matches
 
     async def async_find_user_by_userid(self, user_id: str) -> dict[str, Any] | None:
         """Recover a user after an ambiguous create response or interrupted save."""
         value, _code = await self._async_request(
             f"checkuserid/{quote(user_id, safe='')}"
         )
-        if value in ({}, None, ""):
-            return None
-        if not isinstance(value, dict):
+        if value not in (None, "") and not isinstance(value, dict):
             raise LoxoneApiError("Loxone returned an invalid userid lookup")
-        user_uuid = value.get("uuid")
-        if not isinstance(user_uuid, str) or not user_uuid:
-            return None
-        details = await self.async_get_user(user_uuid)
-        if details is None:
-            return None
-        return details if details.get("userid") == user_id else None
+        user_uuid = value.get("uuid") if isinstance(value, dict) else None
+        if user_uuid:
+            if not isinstance(user_uuid, str):
+                raise LoxoneApiError("Loxone returned an invalid userid lookup")
+            details = await self.async_get_user(user_uuid)
+            if details is None or not self._matches_user_id(details, user_id):
+                raise LoxoneApiError("Loxone user identity is ambiguous")
+            return details
+        # Older versions wrote the NFC Code Touch ID, which checkuserid does
+        # not search. Scan completely before adopting; two matches are unsafe.
+        uuids = await self._async_user_uuids()
+        if len(uuids) > 128:
+            raise LoxoneApiError("Loxone legacy recovery exceeds the safe scan limit")
+        matches = []
+        for uuid in uuids:
+            details = await self.async_get_user(uuid)
+            if details is not None and self._matches_user_id(details, user_id):
+                matches.append(details)
+        if len(matches) > 1:
+            raise LoxoneApiError("Loxone user identity is ambiguous")
+        return matches[0] if matches else None
 
     async def async_add_or_update_user(
         self,
@@ -182,7 +217,7 @@ class LoxoneApiClient:
         """Create or update one time-limited Loxone user and return its UUID."""
         payload: dict[str, Any] = {
             "name": name,
-            "userid": user_id,
+            "uniqueUserId": user_id,
             "changePassword": False,
             "userState": LOXONE_USER_STATE_TIMESPAN,
             "validFrom": loxone_timestamp(valid_from),
@@ -191,7 +226,16 @@ class LoxoneApiClient:
             "usergroups": group_uuids,
         }
         if user_uuid:
+            current = await self.async_get_user(user_uuid)
+            if current is None:
+                raise LoxoneApiError("Loxone user not found", 500)
+            if not self._matches_user_id(current, user_id):
+                raise LoxoneApiError("Loxone user identity is ambiguous")
             payload["uuid"] = user_uuid
+        else:
+            # Preserve the previous NFC identity contract for newly made users.
+            # Existing NFC IDs are never overwritten during an update.
+            payload["userid"] = user_id
         encoded = quote(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             safe="",
@@ -205,6 +249,8 @@ class LoxoneApiClient:
         returned_uuid = value.get("uuid") if isinstance(value, dict) else value
         if not isinstance(returned_uuid, str) or not returned_uuid:
             raise LoxoneApiError("Loxone did not return the user UUID")
+        if user_uuid and returned_uuid != user_uuid:
+            raise LoxoneApiError("Loxone returned a different user UUID")
         return returned_uuid
 
     async def async_set_access_code(self, user_uuid: str, code: str) -> None:
@@ -222,20 +268,15 @@ class LoxoneApiClient:
 
     async def async_delete_user(self, user_uuid: str) -> None:
         """Delete a managed Loxone user, ignoring an already absent user."""
-        try:
-            value, code = await self._async_request(
-                f"deleteuser/{quote(user_uuid, safe='')}",
-                accepted_codes={200, 400, 404, 500},
-            )
-        except LoxoneApiError as err:
-            if getattr(err, "code", None) in {400, 404}:
-                return
-            raise
-        if code == 200 or code in {400, 404}:
+        if await self.async_get_user(user_uuid) is None:
             return
-        if code == 500 and self._is_not_found(value):
+        _value, _code = await self._async_request(
+            f"deleteuser/{quote(user_uuid, safe='')}",
+            accepted_codes={200, 400, 404, 500},
+        )
+        if await self.async_get_user(user_uuid) is None:
             return
-        raise LoxoneApiError("Loxone did not confirm deletion of the user", code)
+        raise LoxoneApiError("Loxone did not confirm deletion of the user")
 
     @staticmethod
     def _is_not_found(value: Any) -> bool:
@@ -281,6 +322,17 @@ class LoxoneApiClient:
                         raise LoxoneAuthError(
                             "Loxone rejected the service account or its user-management rights"
                         )
+                    # Some Miniservers wrap an absent user in HTTP 500. Only
+                    # the two exact read/delete endpoints may decode that error;
+                    # callers still verify absence against the full user list.
+                    if response.status in {400, 404, 500} and command.startswith(
+                        ("getuser/", "deleteuser/")
+                    ):
+                        value, code = self._decode_response(body)
+                        if code in {400, 404} or (
+                            code == 500 and self._is_not_found(value)
+                        ):
+                            return value, code
                     if response.status >= 500:
                         raise aiohttp.ClientResponseError(
                             response.request_info,

@@ -238,6 +238,15 @@ Schloss-Entity und Ergebnis, aber weder Gastnamen noch Zugriffstoken.
 
 ## Loxone Reservierungs-PINs
 
+Ab Version 2.4.9 verwendet die Wiedererkennung die eindeutige Loxone-User-ID.
+Bereits vorhandene Benutzer älterer Versionen werden auch über ihre bisherige
+Kennung erkannt. Bestehende PINs und Benutzer-UUIDs bleiben erhalten; das Update
+schreibt gesunde Benutzer nicht pauschal neu. Mehrdeutige Treffer stoppen die
+Synchronisierung, statt weitere Benutzer anzulegen. Bereits automatisch gelöschte
+Benutzer werden nach bestätigter Abwesenheit als bereinigt erkannt. Verbindungs-
+und Berechtigungsfehler sowie veraltete Serverzuordnungen bleiben sichtbar und
+dürfen nicht durch Löschen der privaten Datenbank umgangen werden.
+
 Optional kann die Integration zusätzlich für jede aktive Guesty-Reservierung
 einen sechsstelligen Zahlencode verwalten. Der Code wird beim ersten Erkennen
 der Reservierung erzeugt und redundant in Guestys nativem Reservierungsfeld

@@ -67,6 +67,86 @@ PIN_FIELD_ID = "65fab102a5284d73c6206db0"
 
 
 @pytest.mark.asyncio
+async def test_provider_retry_upgrade_preserves_pin_and_unknown_binding(
+    hass, monkeypatch
+):
+    """A 2.4.8 store requeues only configured provider targets once."""
+    reservation = _reservation(
+        check_in=NOW, check_out=NOW + timedelta(days=1), key_code="713456"
+    )
+    manager, _, _, _ = _manager(hass, monkeypatch, reservation)
+    later = (NOW + timedelta(hours=4)).isoformat()
+    manager._data = {
+        "records": {
+            "active": {
+                "server_id": "server-1",
+                "code": "713456",
+                "user_uuid": "existing",
+                "code_set": True,
+                "loxone_retry_at": later,
+                "loxone_retry_count": 7,
+            },
+            "retired": {
+                "server_id": "removed",
+                "retired": True,
+                "user_uuid": "old",
+                "cleanup_retry_at": later,
+            },
+        }
+    }
+    before = deepcopy(manager._data)
+    assert manager._migrate_loxone_retry_state()
+    assert manager._records["active"]["loxone_retry_at"] == NOW.isoformat()
+    for key in ("code", "user_uuid", "code_set", "loxone_retry_count"):
+        assert manager._records["active"][key] == before["records"]["active"][key]
+    assert manager._records["retired"] == before["records"]["retired"]
+    assert not manager._migrate_loxone_retry_state()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_create_recovers_after_restart_without_replacement(
+    hass, monkeypatch
+):
+    """A recovered UUID retains the confirmed PIN and never creates a duplicate."""
+    reservation = _reservation(
+        check_in=NOW, check_out=NOW + timedelta(days=1), key_code="713456"
+    )
+    manager, _, _, remote = _manager(hass, monkeypatch, reservation)
+    remote.async_add_or_update_user.side_effect = LoxoneApiError("connection lost")
+    await manager.async_reconcile()
+    persisted = deepcopy(manager._data)
+    assert persisted["records"][reservation.id]["create_started"]
+    restarted, _, guesty, remote = _manager(hass, monkeypatch, reservation)
+    restarted._data = persisted
+    remote.async_find_user_by_userid.return_value = {"uuid": "recovered"}
+    remote.async_add_or_update_user.return_value = "recovered"
+    restarted._migrate_loxone_retry_state()
+    await restarted.async_reconcile()
+    assert remote.async_add_or_update_user.await_args.kwargs["user_uuid"] == "recovered"
+    assert restarted._records[reservation.id]["code"] == "713456"
+    guesty.async_update_reservation_key_code.assert_not_awaited()
+    guesty.async_update_reservation_custom_field.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generic_update_500_retains_uuid_and_pin(hass, monkeypatch):
+    reservation = _reservation(
+        check_in=NOW, check_out=NOW + timedelta(days=1), key_code="713456"
+    )
+    manager, _, _, remote = _manager(hass, monkeypatch, reservation)
+    await manager.async_reconcile()
+    remote.async_add_or_update_user.side_effect = LoxoneApiError("backend failure", 500)
+    remote.async_get_user = AsyncMock(return_value={"uuid": "user-uuid"})
+    reservation.planned_arrival = "13:00"
+    reservation.last_updated_at = NOW.isoformat()
+    manager._records[reservation.id]["fingerprint"] = "requires-update"
+    await manager.async_reconcile()
+    assert manager._records[reservation.id]["user_uuid"] == "user-uuid"
+    assert manager._records[reservation.id]["code"] == "713456"
+    remote.async_find_user_by_userid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_loxone_backoff_stays_partial_after_restart(hass, monkeypatch) -> None:
     """Deferred failures must not appear healthy or change confirmed PINs."""
     reservation = _reservation(
