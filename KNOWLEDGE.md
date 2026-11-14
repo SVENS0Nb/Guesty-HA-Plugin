@@ -17,7 +17,7 @@ the discrepancy and update all affected artifacts together.
 - Last project-wide implementation review: 2026-07-29
 - Project-wide implementation baseline: integration version 2.2.10 working tree
 - Last knowledge-base consistency review: 2026-08-14
-- Knowledge-base baseline: integration version 2.4.9
+- Knowledge-base baseline: integration version 2.4.10
 - Consistency-review scope: all entry IDs, metadata, cross-references, evidence
   paths and explicit test names, plus affected current code, README, AGENTS.md,
   and official Guesty API documentation
@@ -856,9 +856,13 @@ exactly at check-in/check-out without another Guesty request.
 ### KB-RES-004 — Listing entities are dynamic and privacy-aware
 
 - Status: Validated
-- Last validated: 2026-07-28
+- Last validated: 2026-11-14
 - Evidence: `custom_components/guesty/sensor.py`,
-  `custom_components/guesty/calendar.py`, `tests/test_entities.py`
+  `custom_components/guesty/calendar.py`, `custom_components/guesty/devices.py`,
+  `tests/test_entities.py::test_all_listing_entity_types_use_modern_parent_id`,
+  `tests/test_devices.py`, `tests/test_init.py`
+- External status: current
+- Last externally checked: 2026-11-14
 
 Every discovered listing gets an occupancy sensor and reservation calendar.
 Applicable diagnostic sensors expose Guesty Keycode, Loxone, TTLock, access
@@ -866,6 +870,20 @@ link, and sync status. Newly discovered listings are added once and removed
 listings are pruned from runtime and the entity registry. Current-guest and
 door-link sensors are disabled by default. Guest names and confirmation codes
 are available only after explicit privacy opt-in.
+
+The entry-owned integration hub is registered before forwarding either entity
+platform. Listing entities retain their existing identifiers and link through
+the returned registry ID when DeviceInfo supports `via_device_id`. Only older
+HA versions lacking that field use the legacy identifier tuple. A modern entity
+cannot attach before its hub is initialized. DeviceInfo is constructed with
+keyword arguments, compatible with both historical TypedDict and current
+dataclass implementations; no registry-ID migration or private-store change is
+needed. Existing hub IDs and user-assigned names are preserved on reload.
+
+Official contracts: [device-registry migration](https://contributors.home-assistant.io/blog/2026/08/24/device-registry-follow-up-changes/)
+and [DeviceInfo dataclass compatibility](https://contributors.home-assistant.io/blog/2026/10/13/device-info-class/).
+The legacy `via_device` field is removed from modern HA in2027.8; it must not be
+passed on the modern branch even if a compatibility shim still accepts it.
 
 ## Shared PIN lifecycle
 

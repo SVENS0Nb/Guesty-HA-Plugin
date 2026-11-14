@@ -35,6 +35,7 @@ from .const import (
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry, GuestyRuntimeData
+from .devices import async_setup_hub_device
 from .loxone import GuestyLoxoneManager, async_remove_stored_loxone_users
 from .scheduler import GuestyTransitionScheduler
 from .storage import GuestyStorage
@@ -171,6 +172,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestyConfigEntry) -> bo
             coordinator.set_webhook_active(guesty_webhook_id is not None)
             coordinator.async_start_webhook_registration_recovery(webhook_id)
 
+        async_setup_hub_device(hass, entry)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
         def _on_coordinator_update() -> None:

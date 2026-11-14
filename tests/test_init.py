@@ -132,10 +132,14 @@ async def test_setup_refreshes_privacy_stripped_pin_sources(
         "async_setup_webhook",
         AsyncMock(return_value=None),
     )
+
+    async def forward_with_ready_hub(current_entry, platforms):
+        assert current_entry.runtime_data.hub_device_id
+
     monkeypatch.setattr(
         hass.config_entries,
         "async_forward_entry_setups",
-        AsyncMock(),
+        AsyncMock(side_effect=forward_with_ready_hub),
     )
 
     assert await async_setup_entry(hass, entry)

@@ -90,6 +90,7 @@ def _coordinator(
     entry = SimpleNamespace(
         entry_id="entry-id",
         options={CONF_EXPOSE_GUEST_DETAILS: expose_details},
+        runtime_data=SimpleNamespace(hub_device_id="owned-hub-id"),
     )
     return SimpleNamespace(
         data=data,
@@ -358,6 +359,37 @@ def test_new_listings_create_entities_once_during_runtime() -> None:
     assert len(add_sensors.call_args.args[0]) == 5
     assert entry.runtime_data.sensor_listing_ids == {"listing-1"}
     assert entry.runtime_data.calendar_listing_ids == {"listing-1"}
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda c: GuestyOccupancySensor(c, "listing-1"),
+        lambda c: GuestyCurrentGuestSensor(c, "listing-1"),
+        lambda c: GuestyAccessLinkSensor(c, _access_manager(), "listing-1"),
+        lambda c: GuestyKeycodeStatusSensor(c, _loxone_manager(), "listing-1"),
+        lambda c: GuestyLoxonePinStatusSensor(c, _loxone_manager(), "listing-1"),
+        lambda c: GuestyTTLockPinStatusSensor(c, _loxone_manager(), "listing-1"),
+        lambda c: GuestyReservationCalendar(c, "listing-1"),
+    ],
+)
+def test_all_listing_entity_types_use_modern_parent_id(monkeypatch, factory):
+    """Both reported platforms and disabled entities must drop the old field."""
+    from custom_components.guesty import devices
+
+    class CurrentDeviceInfo:
+        __annotations__ = {"via_device_id": str}
+
+        def __init__(self, *, identifiers, name, manufacturer, model, via_device_id):
+            self.identifiers = identifiers
+            self.via_device_id = via_device_id
+
+    monkeypatch.setattr(devices.dr, "DeviceInfo", CurrentDeviceInfo)
+    entity = factory(_coordinator())
+    info = entity.device_info
+    assert info.identifiers == {("guesty", "listing-1")}
+    assert info.via_device_id == "owned-hub-id"
+    assert not hasattr(info, "via_device")
 
 
 def test_removed_listing_entities_become_unavailable() -> None:

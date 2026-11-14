@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -19,7 +20,6 @@ from .const import (
     CONF_STALE_THRESHOLD_HOURS,
     DEFAULT_EXPOSE_GUEST_DETAILS,
     DEFAULT_STALE_THRESHOLD_HOURS,
-    DOMAIN,
     SENSOR_ACCESS_LINK,
     SENSOR_CURRENT_GUEST,
     SENSOR_GUESTY_KEYCODE_STATUS,
@@ -30,6 +30,7 @@ from .const import (
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
+from .devices import hub_device_info, listing_device_info
 from .models import ListingOccupancy
 
 _LOGGER = logging.getLogger(__name__)
@@ -272,7 +273,7 @@ class GuestyOccupancySensor(
         )
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Return device information."""
         listing = (
             self.coordinator.data.listings.get(self._listing_id)
@@ -280,13 +281,9 @@ class GuestyOccupancySensor(
             else None
         )
         listing_name = listing.display_name if listing else self._listing_id
-        return {
-            "identifiers": {(DOMAIN, self._listing_id)},
-            "name": listing_name,
-            "manufacturer": "Guesty",
-            "model": "Listing",
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
-        }
+        return listing_device_info(
+            self.coordinator.config_entry, self._listing_id, listing_name
+        )
 
     @property
     def available(self) -> bool:
@@ -348,7 +345,7 @@ class GuestyCurrentGuestSensor(
         )
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Return device information."""
         listing = (
             self.coordinator.data.listings.get(self._listing_id)
@@ -356,13 +353,9 @@ class GuestyCurrentGuestSensor(
             else None
         )
         listing_name = listing.display_name if listing else self._listing_id
-        return {
-            "identifiers": {(DOMAIN, self._listing_id)},
-            "name": listing_name,
-            "manufacturer": "Guesty",
-            "model": "Listing",
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
-        }
+        return listing_device_info(
+            self.coordinator.config_entry, self._listing_id, listing_name
+        )
 
     @property
     def available(self) -> bool:
@@ -472,7 +465,7 @@ class GuestyAccessLinkSensor(
         )
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Attach the sensor to its Guesty listing device."""
         listing = (
             self.coordinator.data.listings.get(self._listing_id)
@@ -480,13 +473,9 @@ class GuestyAccessLinkSensor(
             else None
         )
         listing_name = listing.display_name if listing else self._listing_id
-        return {
-            "identifiers": {(DOMAIN, self._listing_id)},
-            "name": listing_name,
-            "manufacturer": "Guesty",
-            "model": "Listing",
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
-        }
+        return listing_device_info(
+            self.coordinator.config_entry, self._listing_id, listing_name
+        )
 
     @property
     def available(self) -> bool:
@@ -584,7 +573,7 @@ class _GuestyLoxoneStatusSensor(
         return attributes
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Attach the sensor to its Guesty listing device."""
         listing = (
             self.coordinator.data.listings.get(self._listing_id)
@@ -592,13 +581,9 @@ class _GuestyLoxoneStatusSensor(
             else None
         )
         listing_name = listing.display_name if listing else self._listing_id
-        return {
-            "identifiers": {(DOMAIN, self._listing_id)},
-            "name": listing_name,
-            "manufacturer": "Guesty",
-            "model": "Listing",
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
-        }
+        return listing_device_info(
+            self.coordinator.config_entry, self._listing_id, listing_name
+        )
 
     @property
     def available(self) -> bool:
@@ -717,11 +702,6 @@ class GuestySyncStatusSensor(
         return attributes
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self.coordinator.config_entry.entry_id)},
-            "name": "Guesty",
-            "manufacturer": "Guesty",
-            "model": "Open API",
-        }
+        return hub_device_info(self.coordinator.config_entry.entry_id)
