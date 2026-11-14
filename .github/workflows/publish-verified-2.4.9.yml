@@ -1,0 +1,36 @@
+name: Publish verified Guesty 2.4.9
+on:
+  push:
+    branches: [release/verified-guesty-2.4.9]
+    paths: [.github/workflows/publish-verified-2.4.9.yml]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.repository == 'SVENS0Nb/Guesty-HA-Plugin'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: SVENS0Nb/Guesty-HA-Plugin
+      TARGET: b800028669befdfec781e58bf2ba5d019138d0f4
+    steps:
+      - name: Verify exact source and successful main-branch checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/custom_components/guesty/manifest.json?ref=$TARGET" --jq .content | base64 --decode > manifest.json
+          python -c 'import json; assert json.load(open("manifest.json"))["version"] == "2.4.9"'
+          gh api "repos/$REPO/actions/runs?head_sha=$TARGET&per_page=100" > runs.json
+          python -c 'import json; runs=json.load(open("runs.json"))["workflow_runs"]; assert any(r["name"]=="Validate" and r["event"]=="push" and r["conclusion"]=="success" for r in runs); assert any(r["name"]=="Push on main" and r["conclusion"]=="success" for r in runs); assert all(r["status"]=="completed" and r["conclusion"] in ("success","skipped") for r in runs)'
+          gh api "repos/$REPO/git/matching-refs/tags/v2.4.9" > matching-tags.json
+          python -c 'import json,os; tags=[t for t in json.load(open("matching-tags.json")) if t["ref"]=="refs/tags/v2.4.9"]; assert len(tags)<=1; assert not tags or tags[0]["object"]["sha"]==os.environ["TARGET"]'
+      - name: Publish exact tested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view v2.4.9 --repo "$REPO" >/dev/null 2>&1; then
+            gh release create v2.4.9 --repo "$REPO" --target "$TARGET" --title "v2.4.9 — Safe Loxone identity recovery and cleanup" --notes "Loxone recovery distinguishes unique User IDs from legacy NFC IDs, validates ownership, and safely recovers legacy users without reading administrator-only details. Already-absent cleanup is corroborated by the complete user list, and generic errors cannot discard a valid user UUID. Persisted retries for configured servers are resumed once after upgrade. Existing PINs, Guesty and TTLock data, user permissions and NFC values remain preserved. No bulk rewrite of existing identities occurs. Validation passed on Python 3.13 and 3.14 (544 tests, 84.92% coverage), plus main-branch security checks. Read-only live recovery matched both current users. Production rollout remains a separate maintenance action."
+          fi
+          gh api "repos/$REPO/git/ref/tags/v2.4.9" --jq .object.sha | grep -Fx "$TARGET"
