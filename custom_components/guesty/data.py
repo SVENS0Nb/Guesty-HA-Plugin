@@ -27,6 +27,7 @@ class GuestyRuntimeData:
     access_manager: GuestyAccessManager
     loxone_manager: GuestyLoxoneManager
     ttlock_manager: GuestyTTLockManager | None
+    hub_device_id: str | None = None
     sensor_listing_ids: set[str] = field(default_factory=set)
     calendar_listing_ids: set[str] = field(default_factory=set)
     sensor_listing_entities: dict[str, list[Any]] = field(default_factory=dict)

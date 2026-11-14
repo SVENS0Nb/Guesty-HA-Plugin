@@ -9,16 +9,17 @@ import logging
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     CONF_EXPOSE_GUEST_DETAILS,
     DEFAULT_EXPOSE_GUEST_DETAILS,
-    DOMAIN,
 )
 from .coordinator import GuestyDataUpdateCoordinator
 from .data import GuestyConfigEntry
+from .devices import listing_device_info
 from .models import (
     GuestyListing,
     GuestyReservation,
@@ -242,17 +243,13 @@ class GuestyReservationCalendar(
         super()._handle_coordinator_update()
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         """Return device information."""
         listing = self.listing
         listing_name = listing.display_name if listing else self._listing_id
-        return {
-            "identifiers": {(DOMAIN, self._listing_id)},
-            "name": listing_name,
-            "manufacturer": "Guesty",
-            "model": "Listing",
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
-        }
+        return listing_device_info(
+            self.coordinator.config_entry, self._listing_id, listing_name
+        )
 
     @property
     def available(self) -> bool:
