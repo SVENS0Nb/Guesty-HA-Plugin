@@ -110,6 +110,8 @@ _PIN_STATE_SCHEMA_VERSION = 2
 _RESOLVED_PIN_FIELD_KEY = "resolved_pin_field"
 _GUESTY_RETRY_STATE_VERSION_KEY = "guesty_retry_state_version"
 _GUESTY_RETRY_STATE_VERSION = 4
+_LOXONE_RETRY_STATE_VERSION_KEY = "loxone_retry_state_version"
+_LOXONE_RETRY_STATE_VERSION = 1
 _GUESTY_CLIENT_FINGERPRINT_KEY = "guesty_client_fingerprint"
 _LEGACY_CUSTOM_FIELD_ERRORS = {
     "custom_field_unavailable",
@@ -323,6 +325,7 @@ class GuestyLoxoneManager:
         """Load private state and start one reconciliation pass."""
         self._data = await self._storage.async_load()
         recovered_retries, state_changed = self._migrate_guesty_retry_state()
+        state_changed = self._migrate_loxone_retry_state() or state_changed
         state_changed = self._migrate_dual_source_state() or state_changed
         state_changed = self._clear_disabled_pin_source_state() or state_changed
         if state_changed:
@@ -336,6 +339,21 @@ class GuestyLoxoneManager:
         else:
             self._log_persisted_guesty_retry_summary()
         self.async_schedule_reconcile()
+
+    def _migrate_loxone_retry_state(self) -> bool:
+        """Requeue corrected provider failures once without touching PIN state."""
+        version = self._data.get(_LOXONE_RETRY_STATE_VERSION_KEY, 0)
+        if isinstance(version, int) and version >= _LOXONE_RETRY_STATE_VERSION:
+            return False
+        for record in self._records.values():
+            # An unknown old binding must never be redirected automatically.
+            if record.get("server_id") not in self._servers:
+                continue
+            for operation in ("loxone", "cleanup"):
+                if self._retry_at(record, operation) is not None:
+                    record[f"{operation}_retry_at"] = dt_util.utcnow().isoformat()
+        self._data[_LOXONE_RETRY_STATE_VERSION_KEY] = _LOXONE_RETRY_STATE_VERSION
+        return True
 
     def _migrate_dual_source_state(self) -> bool:
         """Upgrade one-source PIN records without rotating confirmed codes."""
@@ -2661,6 +2679,10 @@ class GuestyLoxoneManager:
                 # updated reservation arrives. Recover by stable userid before
                 # creating a replacement without changing the current Guesty PIN.
                 if user_uuid is None or err.code != 500:
+                    raise
+                # A generic backend failure must never discard a still-valid
+                # UUID or authorize a replacement. Prove actual absence first.
+                if await client.async_get_user(user_uuid) is not None:
                     raise
                 record.pop("user_uuid", None)
                 record.pop("fingerprint", None)

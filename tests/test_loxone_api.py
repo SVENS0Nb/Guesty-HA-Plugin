@@ -152,41 +152,47 @@ async def test_get_user_distinguishes_absent_and_ambiguous_results(monkeypatch) 
     assert await client.async_get_user("user-1") == {"uuid": "user-1"}
 
     request.return_value = ("not-an-object", 200)
+    with pytest.raises(LoxoneApiError, match="invalid user record"):
+        await client.async_get_user("user-1")
+
+    request.side_effect = [({"error": "unknown user"}, 500), ([], 200)]
     assert await client.async_get_user("user-1") is None
 
-    request.return_value = ({"error": "unknown user"}, 500)
-    assert await client.async_get_user("user-1") is None
-
+    request.side_effect = None
     request.return_value = ({"error": "backend failed"}, 500)
     with pytest.raises(LoxoneApiError, match="verify whether"):
         await client.async_get_user("user-1")
 
     request.side_effect = LoxoneApiError("missing", 404)
-    assert await client.async_get_user("user-1") is None
+    with pytest.raises(LoxoneApiError):
+        await client.async_get_user("user-1")
 
 
 @pytest.mark.asyncio
 async def test_find_user_rejects_malformed_or_mismatched_lookup(monkeypatch) -> None:
     """Ambiguous-create recovery adopts only an exact stable userid match."""
     client = _client()
-    request = AsyncMock(return_value=(None, 200))
+    request = AsyncMock(side_effect=[(None, 200), ([], 200)])
     monkeypatch.setattr(client, "_async_request", request)
     assert await client.async_find_user_by_userid("guesty-1") is None
 
+    request.side_effect = None
     request.return_value = ("invalid", 200)
     with pytest.raises(LoxoneApiError, match="invalid userid lookup"):
         await client.async_find_user_by_userid("guesty-1")
 
-    request.return_value = ({"name": "missing uuid"}, 200)
+    request.side_effect = [({"name": "missing uuid"}, 200), ([], 200)]
     assert await client.async_find_user_by_userid("guesty-1") is None
 
+    request.side_effect = None
     request.return_value = ({"uuid": "user-1"}, 200)
     monkeypatch.setattr(
         client,
         "async_get_user",
         AsyncMock(return_value={"uuid": "user-1", "userid": "someone-else"}),
     )
-    assert await client.async_find_user_by_userid("guesty-1") is None
+    with pytest.raises(LoxoneApiError, match="ambiguous"):
+        await client.async_find_user_by_userid("guesty-1")
 
 
 @pytest.mark.asyncio
@@ -211,6 +217,8 @@ async def test_user_payload_contains_timespan_groups_and_auto_delete(
     command = request.await_args.args[0]
     payload = json.loads(unquote(command.split("/", 1)[1]))
     assert payload["userState"] == 4
+    assert payload["uniqueUserId"] == "guesty-123"
+    assert payload["userid"] == "guesty-123"
     assert payload["expirationAction"] == 1
     assert payload["usergroups"] == ["group-1", "group-2"]
     assert payload["validUntil"] > payload["validFrom"]
@@ -223,6 +231,17 @@ async def test_existing_user_update_can_retry_transport(monkeypatch) -> None:
     client = _client()
     request = AsyncMock(return_value=({"uuid": "user-uuid"}, 200))
     monkeypatch.setattr(client, "_async_request", request)
+    monkeypatch.setattr(
+        client,
+        "async_get_user",
+        AsyncMock(
+            return_value={
+                "uuid": "user-uuid",
+                "userid": "guesty-123",
+                "uniqueUserId": "",
+            }
+        ),
+    )
 
     await client.async_add_or_update_user(
         user_uuid="user-uuid",
@@ -305,6 +324,9 @@ async def test_delete_rejects_ambiguous_loxone_500(monkeypatch) -> None:
     """A generic result 500 cannot erase the local cleanup record."""
     client = _client()
     monkeypatch.setattr(
+        client, "async_get_user", AsyncMock(return_value={"uuid": "user-uuid"})
+    )
+    monkeypatch.setattr(
         client,
         "_async_request",
         AsyncMock(return_value=({"error": "internal failure"}, 500)),
@@ -318,6 +340,9 @@ async def test_delete_rejects_ambiguous_loxone_500(monkeypatch) -> None:
 async def test_delete_accepts_explicit_unknown_user(monkeypatch) -> None:
     """An explicit absent-user response keeps deletion idempotent."""
     client = _client()
+    monkeypatch.setattr(
+        client, "async_get_user", AsyncMock(side_effect=[{"uuid": "user-uuid"}, None])
+    )
     monkeypatch.setattr(
         client,
         "_async_request",
